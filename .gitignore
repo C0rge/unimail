@@ -44,3 +44,6 @@ dist/
 build/
 *.spec
 *.manifest
+
+# 本地构建备份（重打包前把旧 dist 移到这里，避免误删）
+_old_build/

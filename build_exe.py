@@ -94,7 +94,9 @@ def build(onedir: bool, clean: bool) -> Path:
     cmd += [
         "--name", "UniMail",
         "--noconfirm",
-        "--clean" if clean else "--noreuse-build-instance",
+        # `--clean` 会清掉 PyInstaller 的分析缓存，改一行代码也要全量重扫，
+        # 本地迭代时用 --no-clean 跳过它（CI / 发版仍建议带 --clean）。
+        "--clean" if clean else "--noconfirm",
         "--windowed",                    # 无控制台窗口（GUI 应用）
         "--onedir" if onedir else "--onefile",
         "--distpath", str(DIST),
