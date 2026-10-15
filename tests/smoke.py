@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -2538,6 +2539,12 @@ def test_ui_layer():
         acc.id, "qq",
         NormalizedMail(uid="1", subject="机密主题", from_addr="a@b.c",
                        body_text="机密正文内容", date=datetime.now(timezone.utc)))
+    # 屏蔽窗口的启动定时任务：真实同步会开后台线程去连 IMAP，
+    # 首启向导会弹模态框。这里只关心界面行为。
+    real_sync = mwmod.MainWindow._initial_sync
+    real_first = mwmod.MainWindow._maybe_first_run
+    mwmod.MainWindow._initial_sync = lambda self: None
+    mwmod.MainWindow._maybe_first_run = lambda self, auto=False: None
     win = MainWindow(ctx, setmod.UiSettings(theme_mode="dark"),
                      theme_mod.ThemeManager("dark"))
     win.resize(1000, 700)
@@ -2592,9 +2599,14 @@ def test_ui_layer():
     app.processEvents()
     check("空闲超时自动锁定",
           win._locked and win.lock_overlay.isVisible())
-    win._quitting = True
-    ctx.shutdown()
-    win.close()
+    # 走真实退出路径：停后台线程并摘掉装在应用 / 窗口上的全局事件
+    # 过滤器——否则解释器退出阶段 Qt 的销毁顺序不确定，会回调一个
+    # 已释放的过滤器对象（Linux + py3.10 实测会在断言全部通过后
+    # 以 `munmap_chunk(): invalid pointer` 崩掉，退出码 134）。
+    win.quit_app()
+    app.processEvents()
+    mwmod.MainWindow._initial_sync = real_sync
+    mwmod.MainWindow._maybe_first_run = real_first
 
 
 SUITES = [
@@ -2661,9 +2673,17 @@ def main() -> int:
     print("=" * 60)
     if failed:
         print("存在失败 ✗")
-        return 1
-    print("全部通过 ✓")
-    return 0
+        code = 1
+    else:
+        print("全部通过 ✓")
+        code = 0
+    # 到这里所有断言都已执行并输出。套件里建过 QApplication，解释器
+    # 退出阶段 Qt 对象的销毁顺序不受我们控制，个别平台（Linux + py3.10）
+    # 会在收尾阶段崩掉并吞掉真实退出码——因此冲刷缓冲后直接退出，
+    # 让退出码只反映测试结果本身。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 if __name__ == "__main__":

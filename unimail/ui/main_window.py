@@ -1038,10 +1038,24 @@ class MainWindow(QMainWindow):
             )
         if self.tray is not None:
             self.tray.hide()
+        self._detach_global_filters()
         event_loop = QApplication.instance()
         if event_loop is not None:
             event_loop.quit()
         self.close()
+
+    def _detach_global_filters(self) -> None:
+        """退出前摘掉装在应用 / 窗口上的全局事件过滤器。
+
+        过滤器对象的生命周期跟着窗口走，而 `QApplication` 在解释器退出时
+        才销毁——不摘掉的话，销毁顺序不确定会让 Qt 回调一个已释放的
+        过滤器对象（表现为退出阶段 `munmap_chunk(): invalid pointer`）。
+        """
+        event_loop = QApplication.instance()
+        if event_loop is not None and getattr(self, "_idle", None) is not None:
+            event_loop.removeEventFilter(self._idle)
+        if getattr(self, "lock_overlay", None) is not None:
+            self.removeEventFilter(self.lock_overlay)
 
     # ================================================================ 菜单动作
     def _on_settings(self) -> None:
