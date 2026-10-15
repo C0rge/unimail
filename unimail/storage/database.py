@@ -247,6 +247,11 @@ class Database:
         return self._db_key.hex()
 
     def _new_connection(self):
+        # sqlcipher3 与 sqlite3 是两套互不继承的 C 扩展（见本文件顶部导入处的说明），
+        # 同一个 conn 变量会先后拿到两种 Connection。装了 sqlcipher3 类型桩的环境
+        # （CI 的 ubuntu runner、本机 .venv）能看到两者是不同类，会报 assignment 冲突，
+        # 故此处显式标注 Any。
+        conn: Any
         if self._encrypted:
             conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
             conn.execute(f"PRAGMA key = \"x'{self._key_hex}'\"")
@@ -611,6 +616,8 @@ class Database:
     def _verify_migrated_file(self, path: Path, key: bytes | None,
                               expect_rows: int, encrypted: bool) -> None:
         """替换前校验迁移结果：可打开、可读、行数一致。"""
+        # 同 `_new_connection`：两种驱动的 Connection 无共同基类，显式 Any。
+        conn: Any
         if encrypted:
             if key is None:
                 raise DatabaseError("内部错误：校验加密库时缺少密钥")
