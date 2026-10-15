@@ -1,19 +1,28 @@
 """加密数据库：优先 SQLCipher，缺失时降级为 SQLite + 字段级加密。
 
-降级说明：
-    若环境中没有 sqlcipher3，则使用标准 sqlite3 建库，此时**整库不加密**，
-    但账号密码仍在 credentials 表中以 Fernet 密文存储（字段级加密）。
-    程序启动时会明确提示当前加密等级，避免用户误以为已全库加密。
+加密等级是**确定性行为**而不是「取决于可选依赖」：
+    - 库文件由哪种驱动创建，记录在 sidecar（`*.meta.json` 的 driver 字段）
+      与库内 `meta.driver` 两处；打开时以 sidecar 为准决定是否下发 `PRAGMA key`，
+      从而避免「明文库被当成加密库打开」→ `file is not a database` → 应用打不开。
+    - 环境缺少 SQLCipher 但库是加密库时**快速失败**并给出可操作提示，
+      而不是抛出难懂的底层错误。
+    - 幂等的迁移入口：`migrate_to_encrypted()` / `migrate_to_plaintext()`。
+
+并发：
+    每个线程一条连接（thread-local），写入路径由 `_write_lock` 串行化；
+    `transaction()` 会持有同一把锁，保证事务边界不被其它线程的 autocommit 打断。
+    连接注册表保证退出时能回收**所有**线程的连接。
 """
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..config import DB_VERSION
+from ..config import DB_BUSY_TIMEOUT_MS, DB_CACHE_KIB, DB_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +33,15 @@ try:  # pragma: no cover - 依赖环境
     _SQLCIPHER_AVAILABLE = True
 except ImportError:
     sqlcipher_db = None  # type: ignore
+
+SQLCIPHER_AVAILABLE = _SQLCIPHER_AVAILABLE
+
+DRIVER_SQLCIPHER = "sqlcipher"
+DRIVER_SQLITE3 = "sqlite3"
+
+
+class DatabaseError(RuntimeError):
+    """数据库无法打开或状态异常（面向用户的可读错误）。"""
 
 
 SCHEMA = """
@@ -72,6 +90,7 @@ CREATE TABLE IF NOT EXISTS mails (
     platform        TEXT NOT NULL,
     folder          TEXT NOT NULL DEFAULT 'INBOX',
     uid             TEXT NOT NULL,
+    uid_validity    INTEGER NOT NULL DEFAULT 0,
     message_id      TEXT,
     subject         TEXT,
     from_name       TEXT,
@@ -100,12 +119,17 @@ CREATE TABLE IF NOT EXISTS attachments (
     part_index   TEXT,
     FOREIGN KEY(mail_id) REFERENCES mails(id) ON DELETE CASCADE
 );
+"""
 
+# 索引与表分开：老库在迁移补齐列之前，引用新列的索引是无法建立的，
+# 因此索引必须**在所有迁移完成之后**再创建。
+INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_mails_date     ON mails(date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_account  ON mails(account_id, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_platform ON mails(platform, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_read     ON mails(is_read);
 CREATE INDEX IF NOT EXISTS idx_mails_folder   ON mails(account_id, folder, uid);
+CREATE INDEX IF NOT EXISTS idx_mails_validity ON mails(account_id, folder, uid_validity);
 CREATE INDEX IF NOT EXISTS idx_attach_mail    ON attachments(mail_id);
 """
 
@@ -116,43 +140,78 @@ class Database:
     每次操作从线程本地连接取连接，避免跨线程共享 sqlite 连接。
     """
 
-    def __init__(self, path: Path, db_key: bytes | None = None) -> None:
+    def __init__(self, path: Path, db_key: bytes | None = None,
+                 encrypted: bool | None = None) -> None:
+        """打开数据库。
+
+        encrypted=None 时按历史行为推断（装有 SQLCipher 且有密钥即加密）。
+        显式传入 encrypted 可精确控制——这是打通「降级/升级路径」的关键：
+        明文库必须以明文方式打开，否则 `PRAGMA key` 会让整个库变成
+        `file is not a database`，用户彻底打不开应用。
+        """
         self.path = Path(path)
         self._db_key = db_key
         self._local = threading.local()
         self._write_lock = threading.RLock()
-        self.encrypted = _SQLCIPHER_AVAILABLE and db_key is not None
+        self._conns: list[Any] = []
+        self._conns_lock = threading.Lock()
+        self._closed = False
+
+        if encrypted is None:
+            encrypted = _SQLCIPHER_AVAILABLE and db_key is not None
+        if encrypted and not _SQLCIPHER_AVAILABLE:
+            raise DatabaseError(
+                "该数据库使用 SQLCipher 整库加密，但当前环境未安装 sqlcipher3。\n"
+                "请先安装依赖后重新启动：pip install sqlcipher3-binary\n"
+                "（切勿删除数据库文件，安装依赖后即可正常打开。）"
+            )
+        if encrypted and db_key is None:
+            raise DatabaseError("数据库为加密库，但未提供解锁密钥")
+
+        self._encrypted = bool(encrypted)
+        self.encrypted = self._encrypted
         self._init_connection()
 
     # ------------------------------------------------------------ 连接
     @property
+    def driver_name(self) -> str:
+        """创建/打开本库所使用的驱动标识，用于写入 sidecar 与 meta。"""
+        return DRIVER_SQLCIPHER if self._encrypted else DRIVER_SQLITE3
+
+    @property
     def encryption_level(self) -> str:
-        if self.encrypted:
+        if self._encrypted:
             return "整库加密 (SQLCipher AES-256)"
         if _SQLCIPHER_AVAILABLE:
-            return "未提供密钥"
+            return "字段级加密（数据库为明文，可迁移为整库加密）"
         return "字段级加密（未安装 SQLCipher，整库为明文）"
 
     @property
     def rekey_supported(self) -> bool:
-        """是否支持整库重加密（仅 SQLCipher 支持 PRAGMA rekey）。"""
-        return _SQLCIPHER_AVAILABLE
+        """是否支持整库重加密（仅以加密方式打开的库支持）。"""
+        return self._encrypted
 
     def _new_connection(self):
-        if _SQLCIPHER_AVAILABLE:
+        if self._encrypted:
             conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
-            if self._db_key is not None:
-                key_hex = self._db_key.hex()
-                conn.execute(f"PRAGMA key = \"x'{key_hex}'\"")
-                conn.execute("PRAGMA cipher_memory_security = ON")
+            conn.execute(f"PRAGMA key = \"x'{self._db_key.hex()}'\"")
+            conn.execute("PRAGMA cipher_memory_security = ON")
         else:
             conn = sqlite3.connect(str(self.path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_MS)}")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute(f"PRAGMA cache_size = {-abs(int(DB_CACHE_KIB))}")
+        with self._conns_lock:
+            self._conns.append(conn)
         return conn
 
     def _conn(self):
+        if self._closed:
+            raise DatabaseError("数据库连接已关闭")
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._new_connection()
@@ -161,6 +220,12 @@ class Database:
 
     def _init_connection(self) -> None:
         conn = self._conn()
+        try:
+            # 触发一次真实读，尽早暴露「密钥错误 / 驱动不匹配 / 文件损坏」
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(self._open_error_hint(exc)) from exc
+
         conn.executescript(SCHEMA)
         conn.commit()
         row = self.query_one("SELECT value FROM meta WHERE key = 'db_version'")
@@ -170,7 +235,19 @@ class Database:
             )
         else:
             self._migrate(int(row["value"] or 1))
+        # 列已补齐，此时创建索引才不会撞上老库缺列的 schema
+        conn.executescript(INDEXES)
+        conn.commit()
         self.set_registered_driver()
+
+    def _open_error_hint(self, exc: Exception) -> str:
+        mode = "SQLCipher 加密" if self._encrypted else "明文 SQLite"
+        return (
+            f"无法以「{mode}」方式打开数据库 {self.path.name}：{exc}\n"
+            "数据库文件可能不是该加密模式的库，或已被损坏。\n"
+            "请检查 *.meta.json 中的 driver 字段是否与实际库文件一致；"
+            "不要删除文件，可先备份后联系维护者协助恢复。"
+        )
 
     def _migrate(self, from_version: int) -> None:
         """按版本依次升级表结构。"""
@@ -179,6 +256,18 @@ class Database:
             self._add_column_if_missing("attachments", "part_index", "TEXT")
             current = 2
             log.info("数据库已从 v%d 迁移到 v2（新增 attachments.part_index）", from_version)
+        if current < 3:
+            # 记录每封邮件所属的 UIDVALIDITY：服务器端邮箱重建后 UID 会复用，
+            # 只有带上该维度才能识别「本地副本已全部失效」并正确清理。
+            self._add_column_if_missing("mails", "uid_validity", "INTEGER NOT NULL DEFAULT 0")
+            self.execute(
+                "UPDATE mails SET uid_validity = COALESCE(("
+                "    SELECT s.uid_validity FROM sync_cursors s"
+                "    WHERE s.account_id = mails.account_id AND s.folder = mails.folder"
+                "), 0) WHERE uid_validity IS NULL OR uid_validity = 0"
+            )
+            current = 3
+            log.info("数据库已从 v%d 迁移到 v3（新增 mails.uid_validity）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
 
@@ -187,35 +276,61 @@ class Database:
         if column not in cols:
             self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
+    def registered_driver(self) -> str | None:
+        """库内记录的驱动（供 sidecar 缺失时交叉校验）。"""
+        try:
+            return self.get_meta("driver")
+        except DatabaseError:
+            return None
+
     def set_registered_driver(self) -> None:
-        self.execute(
-            "INSERT INTO meta(key, value) VALUES('driver', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            ("sqlcipher" if _SQLCIPHER_AVAILABLE else "sqlite3",),
-        )
+        self.set_meta("driver", self.driver_name)
 
     def close(self) -> None:
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
+        """关闭**所有线程**的数据库连接（退出前调用）。
+
+        历史实现只关掉当前线程的连接，后台同步线程的连接会一直挂着，
+        长会话下句柄与内存持续累积。
+        """
+        with self._conns_lock:
+            conns = self._conns
+            self._conns = []
+        for conn in conns:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:  # noqa: BLE001 - 关闭路径尽力而为
+                pass
             try:
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._local.conn = None
+        self._local.conn = None
+        self._closed = True
+
+    def open_count(self) -> int:
+        """当前登记的连接数（用于诊断与测试）。"""
+        with self._conns_lock:
+            return len(self._conns)
 
     # ------------------------------------------------------------ 查询
+    def _tx_depth(self) -> int:
+        return int(getattr(self._local, "tx_depth", 0))
+
     def execute(self, sql: str, params: Iterable[Any] = ()) -> Any:
         with self._write_lock:
             conn = self._conn()
             cur = conn.execute(sql, tuple(params))
-            conn.commit()
+            # 处于显式事务中时不要擅自提交，否则会破坏事务边界
+            if self._tx_depth() == 0:
+                conn.commit()
             return cur
 
     def executemany(self, sql: str, seq: Iterable[Iterable[Any]]) -> None:
         with self._write_lock:
             conn = self._conn()
             conn.executemany(sql, [tuple(p) for p in seq])
-            conn.commit()
+            if self._tx_depth() == 0:
+                conn.commit()
 
     def query_all(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
         conn = self._conn()
@@ -236,20 +351,40 @@ class Database:
 
     # ------------------------------------------------------------ 事务
     def transaction(self):
-        """上下文管理器：批量写入时使用（注意：非跨线程事务）。"""
+        """上下文管理器：批量写入时使用。
+
+        会持有写锁直到事务结束，避免与其它线程的 autocommit 写入交错，
+        也避免同线程内的 `execute()` 提前 commit 破坏事务边界。
+        """
         outer = self
 
         class _Tx:
             def __enter__(self_inner):
-                self_inner.conn = outer._conn()
-                self_inner.conn.execute("BEGIN")
+                self_inner._lock = outer._write_lock
+                self_inner._lock.acquire()
+                depth = outer._tx_depth()
+                outer._local.tx_depth = depth + 1
+                try:
+                    self_inner.conn = outer._conn()
+                    if depth == 0:
+                        self_inner.conn.execute("BEGIN")
+                except Exception:
+                    outer._local.tx_depth = depth
+                    self_inner._lock.release()
+                    raise
                 return self_inner.conn
 
             def __exit__(self_inner, exc_type, exc, tb):
-                if exc_type is None:
-                    self_inner.conn.commit()
-                else:
-                    self_inner.conn.rollback()
+                depth = outer._tx_depth()
+                try:
+                    if depth <= 1:
+                        if exc_type is None:
+                            self_inner.conn.commit()
+                        else:
+                            self_inner.conn.rollback()
+                finally:
+                    outer._local.tx_depth = max(depth - 1, 0)
+                    self_inner._lock.release()
                 return False
 
         return _Tx()
@@ -266,15 +401,152 @@ class Database:
         )
 
     def rekey(self, new_key: bytes) -> None:
-        """更换整库加密密钥（仅 SQLCipher 支持）。
-
-        降级模式下数据库未加密，调用方应先用 rekey_supported 判断，
-        不要依赖本方法静默改内存变量的行为。
-        """
-        if not _SQLCIPHER_AVAILABLE:
-            raise RuntimeError("当前未安装 SQLCipher，不支持整库重加密（rekey）")
+        """更换整库加密密钥（仅加密库支持）。"""
+        if not self._encrypted:
+            raise DatabaseError("当前数据库未整库加密，不支持 rekey")
         conn = self._conn()
         conn.execute(f"PRAGMA rekey = \"x'{new_key.hex()}'\"")
         conn.commit()
         self._db_key = new_key
+
+    # ------------------------------------------------------------ 加密迁移
+    def migrate_to_encrypted(self, new_key: bytes) -> None:
+        """明文库 → SQLCipher 加密库（官方 sqlcipher_export 配方 + 原子替换）。
+
+        迁移前会保留 `*.plaintext.bak`；迁移后的文件会先校验（能否用新密钥打开、
+        行数是否一致）再替换，任一步失败都保持原库不变。
+        """
+        if not _SQLCIPHER_AVAILABLE:
+            raise DatabaseError("未安装 sqlcipher3，无法启用整库加密")
+        if self._encrypted:
+            return
+        src = self.path
+        if not src.exists():
+            raise DatabaseError("数据库文件不存在，无法迁移")
+
+        expect = self.scalar("SELECT COUNT(*) FROM mails") or 0
+        self.close()
+        self._remove_sidecar_files(src)
+
+        tmp = src.with_name(src.name + ".enc-tmp")
+        if tmp.exists():
+            tmp.unlink()
+
+        conn = sqlcipher_db.connect(str(src))
+        try:
+            conn.execute("PRAGMA key = ''")   # 以明文方式打开源库
+            conn.execute(
+                f"ATTACH DATABASE ? AS encrypted KEY \"x'{new_key.hex()}'\"", (str(tmp),)
+            )
+            conn.execute("SELECT sqlcipher_export('encrypted')")
+            conn.execute("DETACH DATABASE encrypted")
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            if tmp.exists():
+                tmp.unlink()
+            self._reopen()
+            raise DatabaseError(f"整库加密失败，数据库保持原状：{exc}") from exc
+        finally:
+            conn.close()
+
+        self._verify_migrated_file(tmp, new_key, expect, encrypted=True)
+
+        backup = src.with_name(src.name + ".plaintext.bak")
+        if backup.exists():
+            backup.unlink()
+        os.replace(src, backup)
+        os.replace(tmp, src)
+
+        self._db_key = new_key
+        self._encrypted = True
         self.encrypted = True
+        self._reopen()
+        log.info("数据库已迁移为整库加密（原明文库备份为 %s）", backup.name)
+
+    def migrate_to_plaintext(self) -> None:
+        """SQLCipher 加密库 → 明文库（官方配方 + 原子替换）。
+
+        迁移前保留 `*.encrypted.bak`。明文落盘会失去整库加密保护，
+        仅供排障或用户明确要求时使用。
+        """
+        if not _SQLCIPHER_AVAILABLE:
+            raise DatabaseError("未安装 sqlcipher3，无法解析加密库")
+        if not self._encrypted:
+            return
+        src = self.path
+        if not src.exists():
+            raise DatabaseError("数据库文件不存在，无法迁移")
+
+        old_key = self._db_key
+        expect = self.scalar("SELECT COUNT(*) FROM mails") or 0
+        self.close()
+        self._remove_sidecar_files(src)
+
+        tmp = src.with_name(src.name + ".plain-tmp")
+        if tmp.exists():
+            tmp.unlink()
+
+        conn = sqlcipher_db.connect(str(src))
+        try:
+            conn.execute(f"PRAGMA key = \"x'{old_key.hex()}'\"")
+            conn.execute("ATTACH DATABASE ? AS plaintext KEY ''", (str(tmp),))
+            conn.execute("SELECT sqlcipher_export('plaintext')")
+            conn.execute("DETACH DATABASE plaintext")
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            if tmp.exists():
+                tmp.unlink()
+            self._reopen()
+            raise DatabaseError(f"解除整库加密失败，数据库保持原状：{exc}") from exc
+        finally:
+            conn.close()
+
+        self._verify_migrated_file(tmp, None, expect, encrypted=False)
+
+        backup = src.with_name(src.name + ".encrypted.bak")
+        if backup.exists():
+            backup.unlink()
+        os.replace(src, backup)
+        os.replace(tmp, src)
+
+        self._encrypted = False
+        self.encrypted = False
+        self._reopen()
+        log.info("数据库已解除整库加密（原加密库备份为 %s）", backup.name)
+
+    @staticmethod
+    def _remove_sidecar_files(src: Path) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            p = Path(str(src) + suffix)
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    log.warning("无法删除 %s", p)
+
+    def _verify_migrated_file(self, path: Path, key: bytes | None,
+                              expect_rows: int, encrypted: bool) -> None:
+        """替换前校验迁移结果：可打开、可读、行数一致。"""
+        if encrypted:
+            conn = sqlcipher_db.connect(str(path))
+            conn.execute(f"PRAGMA key = \"x'{key.hex()}'\"")
+        else:
+            conn = sqlite3.connect(str(path))
+        try:
+            rows = conn.execute("SELECT COUNT(*) FROM mails").fetchone()[0]
+        except Exception as exc:  # noqa: BLE001
+            conn.close()
+            path.unlink(missing_ok=True)
+            raise DatabaseError(f"迁移结果校验失败（无法读取新库）：{exc}") from exc
+        conn.close()
+        if int(rows) != int(expect_rows):
+            path.unlink(missing_ok=True)
+            raise DatabaseError(
+                f"迁移结果校验失败：邮件行数不一致（原 {expect_rows}，新 {rows}），已放弃迁移"
+            )
+
+    def _reopen(self) -> None:
+        """迁移后重建连接（原连接已随 close() 一起释放）。"""
+        self._closed = False
+        self._local.conn = None
+        self._init_connection()

@@ -7,17 +7,38 @@ from __future__ import annotations
 
 import imaplib
 import logging
+import ssl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import timedelta
 
-from ..config import FETCH_TIMEOUT, PLATFORMS, PlatformConfig
+from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
 from ..core.models import Account, NormalizedMail
 from . import parser
 
 log = logging.getLogger(__name__)
 
 imaplib._MAXLINE = 10_000_000  # type: ignore[attr-defined]  # 大邮件头
+
+
+def tls_context(allow_invalid: bool = False) -> ssl.SSLContext:
+    """构造 IMAP 的 TLS 上下文。
+
+    默认**强制校验**服务器证书与主机名。若不显式传入上下文，`imaplib.IMAP4_SSL`
+    会退回 `ssl._create_stdlib_context()`（`verify_mode=CERT_NONE`），
+    等于对任何中间人敞开——授权码可被直接截获。
+
+    allow_invalid=True 仅供自建服务器使用自签证书的极端场景，需显式开启。
+    """
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+    if allow_invalid:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
 
 
 class ImapError(Exception):
@@ -45,16 +66,35 @@ class ImapAdapter(ABC):
         if not host:
             raise ImapError("未配置 IMAP 服务器地址")
 
+        # 默认强制校验证书；仅由环境变量显式放行时才允许不校验
+        allow_invalid = ALLOW_INVALID_TLS_CERT or bool(
+            getattr(account, "allow_invalid_cert", False)
+        )
+        ctx = tls_context(allow_invalid)
+
         try:
             if account.use_ssl:
-                imap = imaplib.IMAP4_SSL(host, port, timeout=FETCH_TIMEOUT)
+                imap = imaplib.IMAP4_SSL(host, port, timeout=FETCH_TIMEOUT,
+                                         ssl_context=ctx)
             else:
                 imap = imaplib.IMAP4(host, port, timeout=FETCH_TIMEOUT)
                 if port == 143:
                     try:
-                        imap.starttls()
-                    except (imaplib.IMAP4.error, OSError):
-                        pass
+                        imap.starttls(ssl_context=ctx)
+                    except ssl.SSLCertVerificationError as exc:
+                        raise ImapError(self._cert_error_hint(host, exc)) from exc
+                    except (imaplib.IMAP4.error, ssl.SSLError, OSError) as exc:
+                        # 不再静默降级为明文：用户配置的是 STARTTLS 端口，
+                        # 握手失败说明无法建立可信通道。
+                        raise ImapError(
+                            f"与 {host}:{port} 的 STARTTLS 握手失败：{exc}\n"
+                            "为避免明文传输凭据，已中止连接。若该服务器仅支持明文 IMAP，"
+                            "请在账号中改用对应端口并关闭 SSL。"
+                        ) from exc
+        except ssl.SSLCertVerificationError as exc:
+            raise ImapError(self._cert_error_hint(host, exc)) from exc
+        except ssl.SSLError as exc:
+            raise ImapError(f"与 {host}:{port} 的 TLS 握手失败：{exc}") from exc
         except OSError as exc:
             raise ImapError(f"无法连接 {host}:{port} — {exc}") from exc
         except imaplib.IMAP4.error as exc:
@@ -73,6 +113,17 @@ class ImapAdapter(ABC):
             pass
         self.post_login(imap)
         return imap
+
+    @staticmethod
+    def _cert_error_hint(host: str, exc: Exception) -> str:
+        detail = getattr(exc, "verify_message", None) or str(exc)
+        return (
+            f"无法验证 {host} 的服务器证书，已中止连接。\n"
+            f"失败原因：{detail}\n"
+            "这通常意味着网络被劫持、存在代理中间设备，或对方使用了自签证书。\n"
+            "如确认是企业自建服务器且使用自签证书，可设置环境变量 "
+            "UNIMAIL_ALLOW_INVALID_CERT=1 后重启（会失去中间人防护，请谨慎）。"
+        )
 
     def _login_error_hint(self, exc: Exception) -> str:
         return (f"登录被拒绝：{exc}\n提示：{self.config.auth_hint}")
@@ -128,7 +179,12 @@ class ImapAdapter(ABC):
     # ------------------------------------------------------------ 邮件
     def search_new_uids(self, imap: imaplib.IMAP4, since_uid: int,
                         limit: int = 200) -> list[str]:
-        """查询 UID > since_uid 的邮件，返回升序 UID 列表（最多 limit 条）。"""
+        """查询 UID > since_uid 的邮件，返回**升序** UID 列表（最多 limit 条）。
+
+        返回的是**最旧的一批**（UID 最小者优先），而不是最新的一批。
+        调用方按页循环推进游标，才能保证「已抓取区间」连续、不丢中间的邮件；
+        若返回最新 N 条，游标会被直接推到邮箱末尾，中间的邮件将永久不再拉取。
+        """
         try:
             imap.select("INBOX", readonly=True)
             if since_uid > 0:
@@ -141,7 +197,7 @@ class ImapAdapter(ABC):
             return []
         uids = sorted(int(u) for u in data[0].split())
         uids = [u for u in uids if u > since_uid]
-        return [str(u) for u in uids[-limit:]]
+        return [str(u) for u in uids[:limit]]
 
     def fetch_raw(self, imap: imaplib.IMAP4, uid: str,
                   headers_only: bool = False) -> bytes:

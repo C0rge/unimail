@@ -1,5 +1,9 @@
 """存储层包。"""
-from .database import Database
+from .database import (
+    SQLCIPHER_AVAILABLE,
+    Database,
+    DatabaseError,
+)
 from .repositories import (
     AccountRepository,
     AttachmentRepository,
@@ -9,6 +13,8 @@ from .repositories import (
 
 __all__ = [
     "Database",
+    "DatabaseError",
+    "SQLCIPHER_AVAILABLE",
     "AccountRepository",
     "MailRepository",
     "AttachmentRepository",

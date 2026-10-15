@@ -12,6 +12,9 @@ from .storage.repositories import utcnow_iso
 
 log = logging.getLogger(__name__)
 
+# 演示模式固定主密码：仅在 --seed 时使用，真实使用请走登录对话框
+DEMO_PASSWORD = "unimail-demo"
+
 _DEMO_ACCOUNTS = [
     ("qq", "zhangsan@qq.com", "工作邮箱", "demo-qq-pass"),
     ("163", "zhangsan@163.com", "个人邮箱", "demo-163-pass"),
@@ -108,11 +111,10 @@ def seed_demo_data(ctx) -> None:
             attachments=attachments,
             raw_size=len(body.encode("utf-8")) + 2048,
         )
-        mail_id = ctx.mails.mails.insert_mail(account_id, platform, mail)
+        mail_id = ctx.mails.mails.insert_mail(account_id, platform, mail, uid_validity=1)
         if mail_id:
             inserted += 1
             if is_read:
-                from .storage.repositories import MailRepository
                 ctx.mails.mails.set_read(mail_id, True)
             # 写同步游标，避免 seed 后立刻触发全量拉取
             ctx.accounts.cursors.upsert(account_id, "INBOX",
@@ -123,4 +125,4 @@ def seed_demo_data(ctx) -> None:
 
     log.info("已注入演示数据：%d 个账号，%d 封邮件", len(account_map), inserted)
     print(f"[演示模式] 已注入 {len(account_map)} 个账号、{inserted} 封邮件")
-    print("[演示模式] 主密码为：unimail-demo")
+    print(f"[演示模式] 主密码为：{DEMO_PASSWORD}")

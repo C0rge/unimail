@@ -128,6 +128,14 @@ class MainWindow(QMainWindow):
         act_pwd.triggered.connect(self._on_change_password)
         m_file.addAction(act_pwd)
 
+        act_recovery = QAction("导出恢复包…", self)
+        act_recovery.triggered.connect(self._on_export_recovery)
+        m_file.addAction(act_recovery)
+
+        act_encrypt = QAction("数据库加密设置…", self)
+        act_encrypt.triggered.connect(self._on_encryption_settings)
+        m_file.addAction(act_encrypt)
+
         act_lock = QAction("立即锁定", self)
         act_lock.setShortcut("Ctrl+L")
         act_lock.triggered.connect(self._on_lock)
@@ -419,6 +427,73 @@ class MainWindow(QMainWindow):
     def _on_about(self) -> None:
         level = self.ctx.db.encryption_level if self.ctx.db else "未知"
         AboutDialog(level, self).exec()
+
+    def _on_export_recovery(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        default = str(self.ctx._sidecar.with_name("unimail-recovery.json"))  # noqa: SLF001
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出恢复包", default, "JSON 文件 (*.json)"
+        )
+        if not path:
+            return
+        try:
+            dest = self.ctx.export_recovery_bundle(path)
+        except (SecurityError, OSError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(
+            self, "恢复包已导出",
+            f"已导出到：\n{dest}\n\n"
+            "该文件只含 salt / 迭代次数 / 算法标识，不含密码或任何密文。\n"
+            "请离线保存：侧车文件损坏时靠它重建密钥派生参数。",
+        )
+
+    def _on_encryption_settings(self) -> None:
+        from ..storage import SQLCIPHER_AVAILABLE
+        db = self.ctx.db
+        if db is None:
+            return
+        if not SQLCIPHER_AVAILABLE:
+            QMessageBox.information(
+                self, "数据库加密",
+                f"当前加密等级：{db.encryption_level}\n\n"
+                "环境未安装 sqlcipher3，无法启用整库加密。\n"
+                "安装依赖后重启即可在启动时选择迁移：\n"
+                "    pip install sqlcipher3-binary",
+            )
+            return
+
+        if db.encrypted:
+            ret = QMessageBox.question(
+                self, "数据库加密",
+                f"当前加密等级：{db.encryption_level}\n\n"
+                "是否解除整库加密（迁移为明文）？\n"
+                "明文库的主题、正文、发件人可被本机其它程序读取，"
+                "且会保留 *.encrypted.bak 备份。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            target = "plaintext"
+        else:
+            ret = QMessageBox.question(
+                self, "数据库加密",
+                f"当前加密等级：{db.encryption_level}\n\n"
+                "是否立即启用整库加密（SQLCipher AES-256）？\n"
+                "原库会备份为 *.plaintext.bak，迁移失败不会改动原库。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            target = "encrypted"
+        if ret != QMessageBox.Yes:
+            return
+
+        try:
+            driver = self.ctx.migrate_encryption(target)
+        except (SecurityError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "迁移失败", f"数据库保持原状。\n\n{exc}")
+            return
+
+        level = self.ctx.db.encryption_level if self.ctx.db else driver
+        self.encryption_label.setText(f"🔒 {level}")
+        QMessageBox.information(self, "迁移完成", f"当前加密等级：{level}")
 
     def _on_change_password(self) -> None:
         from PySide6.QtWidgets import QInputDialog

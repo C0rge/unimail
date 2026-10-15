@@ -4,22 +4,67 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
-from ..config import DB_PATH
+from ..config import APP_VERSION, DB_PATH, KDF_ALGORITHM, sidecar_path
 from ..core.events import EventBus
 from ..core.security import KdfParams, SecurityError, SecurityService
 from ..core.services import AccountService, MailService
 from ..storage import (
+    SQLCIPHER_AVAILABLE,
     AccountRepository,
     AttachmentRepository,
     CursorRepository,
     Database,
+    DatabaseError,
     MailRepository,
 )
 from ..sync import BodyFetchPool, Scheduler, WorkerPool
 
 log = logging.getLogger(__name__)
+
+
+def _fsync_file(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """原子写 JSON：临时文件 fsync → 旧文件备份为 .bak → `os.replace` 原子替换。
+
+    侧车文件一旦半截损坏，salt 即丢失、加密数据库**永久无法解密**。
+    因此绝不允许直接 `write_text` 覆盖。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    if path.exists():
+        backup = path.with_name(path.name + ".bak")
+        try:
+            shutil.copy2(path, backup)
+            _fsync_file(backup)
+        except OSError:
+            log.warning("安全元数据备份失败（继续写入主文件）", exc_info=True)
+
+    os.replace(tmp, path)
+    _fsync_file(path)
 
 
 @dataclass
@@ -45,52 +90,188 @@ class AppContext:
 
     # ------------------------------------------------------------ 元数据
     @property
-    def _sidecar(self):
-        return DB_PATH.with_suffix(".meta.json")
+    def _sidecar(self) -> Path:
+        return sidecar_path(DB_PATH)
 
-    def _read_security_meta(self) -> tuple[KdfParams, str]:
-        """读取 KDF 参数与校验块。
+    def _read_security_meta(self) -> tuple[KdfParams, str, str | None]:
+        """读取 KDF 参数、校验块与创建该库的驱动。
 
         salt 与迭代次数本身不是秘密（秘密是主密码），verifier 是密文，
         因此可安全地存放在明文 sidecar 中——这样在解锁前就能拿到派生参数。
+        主文件不可用时自动回退到 `.bak`，并尝试自愈。
         """
-        if not self._sidecar.exists():
-            raise SecurityError("找不到安全元数据文件，数据库可能已损坏")
-        try:
-            data = json.loads(self._sidecar.read_text("utf-8"))
-            params = KdfParams(
-                salt=base64.b64decode(data["salt"]),
-                iterations=int(data["iterations"]),
-            )
-            return params, str(data["verifier"])
-        except (KeyError, ValueError) as exc:
-            raise SecurityError("安全元数据格式错误") from exc
+        primary = self._sidecar
+        backup = primary.with_name(primary.name + ".bak")
+        failed: list[str] = []
 
-    def _write_security_meta(self, params: KdfParams, verifier: str) -> None:
-        self._sidecar.write_text(json.dumps({
+        for path in (primary, backup):
+            if not path.exists():
+                failed.append(f"{path.name}（不存在）")
+                continue
+            try:
+                data = json.loads(path.read_text("utf-8"))
+                params = KdfParams(
+                    salt=base64.b64decode(data["salt"]),
+                    iterations=int(data["iterations"]),
+                )
+                verifier = str(data["verifier"])
+                if not verifier:
+                    raise ValueError("verifier 为空")
+            except (KeyError, ValueError, TypeError, OSError) as exc:
+                failed.append(f"{path.name}（{exc}）")
+                log.error("安全元数据 %s 不可用：%s", path.name, exc)
+                continue
+
+            if path is not backup:
+                return params, verifier, (data.get("driver") or None)
+
+            # 主文件损坏 → 用备份自愈，避免下次启动又走一遍回退
+            log.warning("主安全元数据不可用，已回退到备份 %s", backup.name)
+            try:
+                atomic_write_json(primary, data)
+            except OSError:
+                log.warning("备份自愈失败（不影响本次解锁）", exc_info=True)
+            return params, verifier, (data.get("driver") or None)
+
+        raise SecurityError(
+            "无法读取安全元数据（salt / 校验块），主文件与备份均不可用。\n"
+            f"目录：{primary.parent}\n"
+            f"已尝试：{'; '.join(failed) or '未找到任何侧车文件'}\n"
+            "如果你导出过「恢复包」，可将其中的 salt 与 iterations 手工写回 "
+            f"{primary.name} 后重试。请勿删除数据库文件。"
+        )
+
+    def _write_security_meta(self, params: KdfParams, verifier: str,
+                             driver: str | None = None) -> None:
+        atomic_write_json(self._sidecar, {
             "salt": base64.b64encode(params.salt).decode(),
             "iterations": params.iterations,
             "verifier": verifier,
-        }, indent=2), "utf-8")
+            "driver": driver or (self.db.driver_name if self.db else ""),
+            "app_version": APP_VERSION,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def export_recovery_bundle(self, target: str | Path | None = None) -> Path:
+        """导出恢复包：salt / 迭代次数 / 算法标识 / 驱动，**不含任何密文**。
+
+        侧车文件损坏时，用恢复包里的参数即可重新派生数据库密钥，
+        避免「换块硬盘就与数据永久失联」。
+        """
+        params, _verifier, driver = self._read_security_meta()
+        dest = Path(target) if target else DB_PATH.with_name("unimail-recovery.json")
+        atomic_write_json(dest, {
+            "format": "unimail-recovery-bundle",
+            "version": 1,
+            "app_version": APP_VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "kdf": {
+                "algorithm": KDF_ALGORITHM,
+                "iterations": params.iterations,
+                "salt": base64.b64encode(params.salt).decode(),
+            },
+            "driver": driver or (self.db.driver_name if self.db else "unknown"),
+            "database_file": DB_PATH.name,
+            "note": "本文件不含密码或任何密文。恢复时把 kdf.salt / kdf.iterations "
+                    "填回 *.meta.json 即可重新派生密钥。",
+        })
+        log.info("恢复包已导出：%s", dest)
+        return dest
 
     # ------------------------------------------------------------ 生命周期
     def bootstrap_new(self, password: str) -> None:
         """首次运行：生成 salt、设置主密码、建库。"""
         params = SecurityService.new_kdf_params()
         db_key = self.security.setup(password, params)
-        self.db = Database(DB_PATH, db_key)
+        # 环境具备 SQLCipher 时，首次建库就直接建成整库加密（确定性行为）
+        self.db = Database(DB_PATH, db_key, encrypted=SQLCIPHER_AVAILABLE)
         verifier = SecurityService.make_verifier(self.security._master_key)  # noqa: SLF001
-        self._write_security_meta(params, verifier)
+        self._write_security_meta(params, verifier, driver=self.db.driver_name)
         self._wire()
         log.info("已初始化新数据库，加密等级：%s", self.db.encryption_level)
 
     def unlock(self, password: str) -> None:
         """后续启动：校验主密码并解锁。"""
-        params, verifier = self._read_security_meta()
+        params, verifier, driver = self._read_security_meta()
         db_key = self.security.unlock(password, params, verifier)
-        self.db = Database(DB_PATH, db_key)
+        self.db = self._open_database(db_key, driver)
+        # 驱动记录缺失或与实际情况不符时自愈，避免每次启动都要回退探测
+        self._write_security_meta(params, verifier, driver=self.db.driver_name)
         self._wire()
         log.info("数据库已解锁，加密等级：%s", self.db.encryption_level)
+
+    def _open_database(self, db_key: bytes, driver: str | None) -> Database:
+        """按 sidecar 记录的驱动打开数据库；记录缺失时双向回退探测。
+
+        这是「降级/升级路径打通」的核心：明文库绝不能被当成加密库打开，
+        否则 `PRAGMA key` 会让整个库报 `file is not a database`。
+        """
+        if driver == "sqlcipher":
+            return Database(DB_PATH, db_key, encrypted=True)
+        if driver == "sqlite3":
+            return Database(DB_PATH, db_key, encrypted=False)
+
+        # 旧版 sidecar 没有 driver 字段：先按推断试一次，失败再试另一种模式
+        log.warning("安全元数据缺少 driver 字段，正在自动探测数据库加密模式")
+        errors: list[str] = []
+        for encrypted in (SQLCIPHER_AVAILABLE, not SQLCIPHER_AVAILABLE):
+            try:
+                db = Database(DB_PATH, db_key, encrypted=encrypted)
+            except DatabaseError as exc:
+                mode = "加密" if encrypted else "明文"
+                log.warning("以 %s 模式打开失败：%s", mode, exc)
+                errors.append(f"· 按{mode}模式打开：{exc.splitlines()[0]}")
+                continue
+            log.info("已探测到数据库实际模式：%s", db.driver_name)
+            return db
+        raise SecurityError(
+            "数据库既无法以明文方式也无法以加密方式打开。\n"
+            + "\n".join(errors) + "\n"
+            "若其中提示缺少 sqlcipher3，请安装依赖后重试；"
+            "请勿删除数据库文件，可先备份数据目录。"
+        )
+
+    def migrate_encryption(self, target: str) -> str:
+        """在「明文」与「整库加密」之间迁移数据库，返回迁移后的驱动标识。"""
+        if self.db is None:
+            raise SecurityError("应用尚未初始化")
+        if target not in ("encrypted", "plaintext"):
+            raise ValueError(f"未知的迁移目标：{target}")
+        if (target == "encrypted") == self.db.encrypted:
+            return self.db.driver_name
+
+        resume = self._quiesce()
+        try:
+            key = self.security.db_key()
+            if target == "encrypted":
+                self.db.migrate_to_encrypted(key)
+            else:
+                self.db.migrate_to_plaintext()
+        finally:
+            self._resume(resume)
+
+        params, verifier, _driver = self._read_security_meta()
+        self._write_security_meta(params, verifier, driver=self.db.driver_name)
+        log.info("数据库加密模式已切换为：%s", self.db.encryption_level)
+        return self.db.driver_name
+
+    def _quiesce(self) -> bool:
+        """迁移/改密码前停止后台同步并排空线程，避免旧连接中途写入。
+
+        返回「调度器原本是否在运行」，供 `_resume()` 恢复。
+        """
+        resume = bool(self.scheduler and self.scheduler.enabled)
+        if self.scheduler:
+            self.scheduler.stop()
+        if self.pool:
+            self.pool.stop_all()
+        if self.body_pool:
+            self.body_pool.stop_all()
+        return resume
+
+    def _resume(self, resume: bool) -> None:
+        if resume and self.scheduler:
+            self.scheduler.start()
 
     def change_password(self, old: str, new: str) -> ChangePasswordResult:
         """修改主密码：重加密数据库 + 用新密钥重新加密所有邮箱凭据。
@@ -107,8 +288,24 @@ class AppContext:
         if self.db is None or self.accounts is None:
             raise SecurityError("应用尚未初始化")
 
-        params, verifier = self._read_security_meta()
+        params, verifier, _driver = self._read_security_meta()
 
+        # ---- 步骤 0：暂停后台同步，避免旧密钥建立的连接与 rekey 竞态
+        # 调度器必须在步骤 5 之后才恢复：否则 worker 会拿着还没重新加密的凭据去登录。
+        resume = self._quiesce()
+        succeeded = False
+        try:
+            result = self._change_password_locked(old, new, params, verifier)
+            succeeded = True
+            return result
+        finally:
+            # 成功、或失败但会话仍解锁（例如原密码输错）时恢复调度；
+            # 若失败已导致 security.lock()，则保持停止，避免刷出一堆解密失败。
+            if succeeded or self.security.is_unlocked:
+                self._resume(resume)
+
+    def _change_password_locked(self, old: str, new: str, params: KdfParams,
+                                verifier: str) -> ChangePasswordResult:
         # ---- 步骤 1：先用旧密钥把明文凭据全部取出（内存中暂存）
         # 先校验旧密码，避免把明文凭据取出来之后才发现密码错
         plain_secrets: dict[str, str] = {}
@@ -152,7 +349,7 @@ class AppContext:
             plain_secrets.clear()
 
         # ---- 步骤 5：写入新元数据
-        self._write_security_meta(new_params, new_verifier)
+        self._write_security_meta(new_params, new_verifier, driver=self.db.driver_name)
         log.info("主密码已更新，%d 个账号凭据已重新加密", rotated)
 
         return ChangePasswordResult(

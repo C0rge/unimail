@@ -143,15 +143,60 @@ class MailRepository:
         )
         return row is not None
 
-    def existing_uids(self, account_id: str, folder: str = "INBOX") -> set[str]:
-        rows = self.db.query_all(
-            "SELECT uid FROM mails WHERE account_id = ? AND folder = ?",
-            (account_id, folder),
-        )
+    def existing_uids(self, account_id: str, folder: str = "INBOX",
+                      uid_validity: int | None = None) -> set[str]:
+        """该文件夹下已入库的 UID 集合（可按 UIDVALIDITY 维度过滤）。
+
+        用于同步前一次性取回已知集合、在内存里去重，避免逐封 `exists()` 查询。
+        """
+        if uid_validity is None:
+            rows = self.db.query_all(
+                "SELECT uid FROM mails WHERE account_id = ? AND folder = ?",
+                (account_id, folder),
+            )
+        else:
+            rows = self.db.query_all(
+                "SELECT uid FROM mails WHERE account_id = ? AND folder = ? "
+                "AND uid_validity = ?",
+                (account_id, folder, int(uid_validity)),
+            )
         return {str(r["uid"]) for r in rows}
 
+    def folder_uid_validities(self, account_id: str, folder: str = "INBOX") -> set[int]:
+        """本地已入库邮件记录的 UIDVALIDITY 集合。
+
+        与服务端当前值不一致即说明邮箱已被重建，本地副本全部失效。
+        """
+        rows = self.db.query_all(
+            "SELECT DISTINCT uid_validity FROM mails WHERE account_id = ? AND folder = ?",
+            (account_id, folder),
+        )
+        return {int(r["uid_validity"] or 0) for r in rows}
+
+    def purge_folder(self, account_id: str, folder: str = "INBOX") -> int:
+        """删除某账号某文件夹的全部本地副本（UIDVALIDITY 变化时调用）。
+
+        返回被删除的邮件行数。附件行随事务一并清理。
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM mails WHERE account_id = ? AND folder = ?",
+                (account_id, folder),
+            ).fetchone()
+            removed = int(row[0] if row else 0)
+            conn.execute(
+                "DELETE FROM attachments WHERE mail_id IN "
+                "(SELECT id FROM mails WHERE account_id = ? AND folder = ?)",
+                (account_id, folder),
+            )
+            conn.execute(
+                "DELETE FROM mails WHERE account_id = ? AND folder = ?",
+                (account_id, folder),
+            )
+        return removed
+
     def insert_mail(self, account_id: str, platform: str,
-                    mail: NormalizedMail) -> str | None:
+                    mail: NormalizedMail, uid_validity: int | None = None) -> str | None:
         """写入一封邮件（含附件元数据），返回 mail_id；已存在则返回 None。"""
         if self.exists(account_id, mail.folder, mail.uid):
             return None
@@ -159,12 +204,13 @@ class MailRepository:
         with self.db.transaction() as conn:
             conn.execute(
                 """INSERT INTO mails
-                   (id, account_id, platform, folder, uid, message_id, subject,
-                    from_name, from_addr, to_addrs, date, preview, body_text, body_html,
-                    has_attachments, is_read, is_starred, raw_size, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (id, account_id, platform, folder, uid, uid_validity, message_id,
+                    subject, from_name, from_addr, to_addrs, date, preview, body_text,
+                    body_html, has_attachments, is_read, is_starred, raw_size, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     mail_id, account_id, platform, mail.folder, mail.uid,
+                    int(uid_validity or 0),
                     mail.message_id, mail.subject, mail.from_name, mail.from_addr,
                     json.dumps(mail.to_addrs, ensure_ascii=False),
                     (mail.date or datetime.now(timezone.utc)).isoformat(),

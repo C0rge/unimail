@@ -6,14 +6,22 @@
     3. 【回归】改主密码后凭据仍可解密（v1.0.0 严重 bug）
     4. 【回归】IMAP part 编号正确（v1.0.0 用 walk() 序号，取错附件）
     5. 【回归】附件下载返回真实字节流（v1.0.0 是占位文本）
-    6. 数据库迁移：v1 → v2 自动补列
+    6. 数据库迁移：v1 → v3 自动补列
+    7. TLS 证书校验（v1.2.0：修复 IMAP 不校验证书）
+    8. 【回归】同步游标语义与 UIDVALIDITY 清理（v1.2.0：修复静默丢邮件）
+    9. 侧车原子写 / 备份回退 / 恢复包（v1.2.0）
+   10. 数据清理路径（--reset 覆盖真正的侧车文件名）
+   11. 数据库并发三件套 + 加密模式 fail-closed（v1.2.0）
 
 运行：python tests/smoke.py
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -333,7 +341,7 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
 
 # ============================================================ 6. 数据库迁移
 def test_migration():
-    """v1 库（无 part_index 列）应能自动迁移到 v2。"""
+    """v1 库（无 part_index / uid_validity 列）应能自动迁移到 v3。"""
     import sqlite3
     tmp, cfg, ctxmod, _svc = setup_env("mig_")
 
@@ -356,8 +364,13 @@ def test_migration():
             from_addr TEXT, to_addrs TEXT, date TEXT, preview TEXT, body_text TEXT,
             body_html TEXT, has_attachments INTEGER, is_read INTEGER,
             is_starred INTEGER, raw_size INTEGER, created_at TEXT);
-        INSERT INTO meta(key, value) VALUES('db_version', '1');
     """)
+    conn.execute("INSERT INTO sync_cursors(account_id, folder, last_uid, uid_validity) "
+                 "VALUES('acc1','INBOX',104,77)")
+    conn.execute("INSERT INTO mails(id, account_id, platform, folder, uid, subject, "
+                 "date, created_at) VALUES('m1','acc1','qq','INBOX','100','hi',"
+                 "'2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')")
+    conn.execute("INSERT INTO meta(key, value) VALUES('db_version', '1')")
     conn.commit()
     conn.close()
 
@@ -370,14 +383,444 @@ def test_migration():
 
     cols = {r["name"] for r in db.query_all("PRAGMA table_info(attachments)")}
     check("迁移后新增 part_index 列", "part_index" in cols, f"实际列: {sorted(cols)}")
-    check("db_version 升到 2", db.get_meta("db_version") == "2",
+    mail_cols = {r["name"] for r in db.query_all("PRAGMA table_info(mails)")}
+    check("迁移后新增 uid_validity 列", "uid_validity" in mail_cols,
+          f"实际列: {sorted(mail_cols)}")
+    check("历史行按游标回填 uid_validity",
+          int(db.query_one("SELECT uid_validity FROM mails WHERE id = 'm1'")["uid_validity"]) == 77)
+    check("db_version 升到 3", db.get_meta("db_version") == "3",
           f"实际 {db.get_meta('db_version')}")
 
     db.close()
     db2 = Database(cfg.DB_PATH, None)
-    check("重复迁移幂等", "part_index" in
-          {r["name"] for r in db2.query_all("PRAGMA table_info(attachments)")})
+    check("重复迁移幂等", "uid_validity" in
+          {r["name"] for r in db2.query_all("PRAGMA table_info(mails)")})
     db2.close()
+
+
+# ============================================================ 7. TLS 证书校验
+def test_tls_certificate_verification():
+    """【回归】v1.1.0 的 IMAP4_SSL 未传 ssl_context → verify_mode=CERT_NONE。"""
+    import imaplib
+    import ssl
+
+    from unimail.core.models import Account
+    from unimail.platforms import get_adapter
+    from unimail.platforms.base import tls_context
+
+    ctx = tls_context()
+    check("默认强制校验证书", ctx.verify_mode == ssl.CERT_REQUIRED, f"实际 {ctx.verify_mode}")
+    check("默认校验主机名", ctx.check_hostname is True)
+    check("最低 TLS 版本不低于 1.2",
+          ctx.minimum_version >= ssl.TLSVersion.TLSv1_2)
+
+    lax = tls_context(True)
+    check("仅显式放行时才关闭校验",
+          lax.verify_mode == ssl.CERT_NONE and not lax.check_hostname)
+
+    captured: dict = {}
+
+    class FakeSSL:
+        def __init__(self, host, port, timeout=None, ssl_context=None):
+            captured["ssl_context"] = ssl_context
+            captured["host"] = host
+            raise OSError("stop-here")
+
+    acct = Account(id="x", platform="custom", email="a@b.c",
+                   imap_host="imap.example.com", imap_port=993, username="a@b.c")
+    original = imaplib.IMAP4_SSL
+    imaplib.IMAP4_SSL = FakeSSL  # type: ignore[assignment]
+    try:
+        try:
+            get_adapter("custom").connect(acct, "pw")
+        except Exception:  # noqa: BLE001 - 只关心传参
+            pass
+    finally:
+        imaplib.IMAP4_SSL = original  # type: ignore[assignment]
+
+    got = captured.get("ssl_context")
+    check("connect() 传入加固的 TLS 上下文", got is not None)
+    check("connect() 的上下文强制校验证书",
+          got is not None and got.verify_mode == ssl.CERT_REQUIRED)
+
+    # 证书校验失败必须映射为可读的 ImapError，而不是裸 ssl 异常
+    from unimail.platforms.base import ImapError
+
+    class CertFailingSSL:
+        def __init__(self, *a, **k):
+            raise ssl.SSLCertVerificationError(1, "self-signed certificate")
+
+    imaplib.IMAP4_SSL = CertFailingSSL  # type: ignore[assignment]
+    try:
+        try:
+            get_adapter("custom").connect(acct, "pw")
+            check("证书校验失败被拦截", False, "竟然没有抛错")
+        except ImapError as exc:
+            check("证书校验失败给出可读提示", "证书" in str(exc), f"实际 {exc}")
+        except Exception as exc:  # noqa: BLE001
+            check("证书校验失败给出可读提示", False, f"抛出了 {type(exc).__name__}")
+    finally:
+        imaplib.IMAP4_SSL = original  # type: ignore[assignment]
+
+
+# ============================================================ 8. 同步语义
+class _FakeImap:
+    def select(self, *a, **k):
+        return ("OK", [b""])
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
+class _FakeAdapter:
+    """可编排的 IMAP 适配器：模拟分页、UIDVALIDITY 变化与单封失败。"""
+
+    def __init__(self, uids, validity: int = 100):
+        self.uids = sorted(int(u) for u in uids)
+        self.validity = validity
+        self.fail_uids: set[int] = set()
+        self.searches: list[tuple[int, int]] = []
+        self.body_fetches: list[int] = []
+
+    def connect(self, account, password):
+        return _FakeImap()
+
+    def disconnect(self, imap):
+        pass
+
+    def uid_validity(self, imap):
+        return self.validity
+
+    def search_new_uids(self, imap, since_uid, limit=200):
+        self.searches.append((int(since_uid), int(limit)))
+        avail = [u for u in self.uids if u > since_uid]
+        return [str(u) for u in avail[:limit]]
+
+    def fetch_headers(self, imap, uid, folder="INBOX"):
+        from unimail.core.models import NormalizedMail
+        from unimail.platforms.base import ImapError
+        if int(uid) in self.fail_uids:
+            raise ImapError(f"模拟拉取失败 {uid}")
+        return NormalizedMail(uid=str(uid), subject=f"mail {uid}",
+                              from_addr="sender@example.com",
+                              date=datetime.now(timezone.utc))
+
+    def fetch_message(self, imap, uid, folder="INBOX"):
+        from unimail.core.models import NormalizedMail
+        self.body_fetches.append(int(uid))
+        return NormalizedMail(uid=str(uid), body_text=f"body {uid}",
+                              body_html=f"<p>body {uid}</p>")
+
+
+def _make_sync_ctx(prefix):
+    _tmp, cfg, _ctxmod, _svc = setup_env(prefix)
+    from unimail.core.models import AccountDraft
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-123456")
+    account = ctx.accounts.add(AccountDraft(platform="qq", email="sync@qq.com",
+                                            password="code"))
+    return cfg, ctx, account
+
+
+def _run_sync(ctx, account, adapter):
+    from unimail.sync.worker import SyncWorker
+    worker = SyncWorker(account, ctx.accounts, ctx.mails.mails,
+                        ctx.accounts.cursors, ctx.security, ctx.bus)
+    with patch("unimail.sync.worker.get_adapter", return_value=adapter):
+        worker.run()
+    return worker
+
+
+def test_search_new_uids_order():
+    """【回归】旧实现返回 uids[-limit:]，即「最新」一批 → 游标跳到末尾丢邮件。"""
+    from unimail.platforms.base import ImapAdapter
+
+    class _Imap:
+        def select(self, *a, **k):
+            return ("OK", [b""])
+
+        def uid(self, command, *args):
+            return ("OK", [b" ".join(str(u).encode() for u in range(1, 1001))])
+
+    class _Adapter(ImapAdapter):
+        platform = "custom"
+
+    uids = _Adapter().search_new_uids(_Imap(), 0, limit=200)
+    check("返回最旧的一批（UID 最小者优先）",
+          len(uids) == 200 and uids[0] == "1" and uids[-1] == "200",
+          f"len={len(uids)} first={uids[0] if uids else None} last={uids[-1] if uids else None}")
+
+
+def test_sync_pagination_and_uidvalidity():
+    """【回归】首同步必须分页追平（不再只入库最新 200 封），UIDVALIDITY 变化时清理旧副本。"""
+    from unimail.core.models import MailFilter
+
+    cfg, ctx, account = _make_sync_ctx("sync_")
+    mails = ctx.mails.mails
+
+    # ---- 场景 A：450 封邮件，页大小 100 → 必须全部入库且游标推进到 450
+    adapter = _FakeAdapter(range(1, 451), validity=100)
+    _run_sync(ctx, account, adapter)
+
+    count = len(mails.query(MailFilter(account_id=account.id, limit=10000)))
+    check("首同步全量入库（不再只取最新一批）", count == 450, f"实际 {count}")
+    last_uid, validity = ctx.accounts.cursors.get(account.id, "INBOX")
+    check("游标推进到连续已抓取区间的最大 UID", last_uid == 450, f"实际 {last_uid}")
+    check("游标记录 UIDVALIDITY", validity == 100, f"实际 {validity}")
+    check("确实发生了分页", len(adapter.searches) >= 4, f"实际 {len(adapter.searches)} 页")
+
+    # ---- 场景 B：UIDVALIDITY 变化 + UID 复用 → 旧副本必须被清理，新邮件不得被静默丢弃
+    adapter.uids = [1, 2, 3, 4, 5]
+    adapter.validity = 999
+    _run_sync(ctx, account, adapter)
+
+    rows = mails.query(MailFilter(account_id=account.id, limit=10000))
+    check("UIDVALIDITY 变化后旧副本被清理", len(rows) == 5, f"实际 {len(rows)}")
+    stored = {int(r["uid_validity"]) for r in
+              ctx.db.query_all("SELECT uid_validity FROM mails WHERE account_id = ?",
+                               (account.id,))}
+    check("清理后仅保留新 UIDVALIDITY 的记录", stored == {999}, f"实际 {stored}")
+    last_uid, validity = ctx.accounts.cursors.get(account.id, "INBOX")
+    check("UIDVALIDITY 变化后游标重置并重新推进",
+          last_uid == 5 and validity == 999, f"实际 {last_uid}/{validity}")
+
+    # ---- 场景 C：中途单封失败 → 游标停在该封之前，下次同步能续上
+    cfg2, ctx2, account2 = _make_sync_ctx("sync2_")
+    mails2 = ctx2.mails.mails
+    adapter2 = _FakeAdapter(range(1, 11), validity=100)
+    adapter2.fail_uids = {4}
+    _run_sync(ctx2, account2, adapter2)
+    last_uid, _ = ctx2.accounts.cursors.get(account2.id, "INBOX")
+    check("单封失败时游标不越过该封", last_uid == 3, f"实际 {last_uid}")
+
+    adapter2.fail_uids = set()
+    _run_sync(ctx2, account2, adapter2)
+    count2 = len(mails2.query(MailFilter(account_id=account2.id, limit=10000)))
+    check("恢复后补齐剩余邮件", count2 == 10, f"实际 {count2}")
+    last_uid, _ = ctx2.accounts.cursors.get(account2.id, "INBOX")
+    check("恢复后游标追平", last_uid == 10, f"实际 {last_uid}")
+
+    ctx.db.close()
+    ctx2.db.close()
+
+
+# ============================================================ 9. 侧车原子性
+def test_sidecar_atomicity_and_recovery():
+    tmp, cfg, _ctxmod, _svc = setup_env("side_")
+    from unimail.core.security import SecurityError
+    from unimail.ui.context import AppContext
+
+    meta = cfg.DB_PATH.with_suffix(".meta.json")
+    bak = meta.with_name(meta.name + ".bak")
+    tmpfile = meta.with_name(meta.name + ".tmp")
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-123456")
+    check("首次建库后写入侧车", meta.exists())
+    check("侧车记录数据库驱动",
+          json.loads(meta.read_text("utf-8")).get("driver") == ctx.db.driver_name)
+    check("侧车不含明文密码", "pw-123456" not in meta.read_text("utf-8"))
+    ctx.db.close()
+
+    ctx = AppContext()
+    ctx.unlock("pw-123456")            # 第二次写入 → 产生 .bak
+    check("旧侧车已备份为 .bak", bak.exists())
+    check("写入后无 .tmp 残留", not tmpfile.exists())
+
+    # 模拟写入过程中崩溃：主侧车半截 JSON
+    meta.write_text('{"salt": "AA', "utf-8")
+    ctx.db.close()
+    ctx2 = AppContext()
+    ctx2.is_first_run = False
+    ctx2.unlock("pw-123456")
+    check("主侧车损坏时自动回退备份", ctx2.security.is_unlocked)
+    healed = json.loads(meta.read_text("utf-8"))
+    check("回退后主侧车已自愈", bool(healed.get("verifier")))
+
+    # 恢复包
+    dest = tmp / "recovery.json"
+    ctx2.export_recovery_bundle(dest)
+    bundle = json.loads(dest.read_text("utf-8"))
+    check("恢复包含 salt 与迭代次数",
+          bool(bundle["kdf"]["salt"]) and int(bundle["kdf"]["iterations"]) > 0)
+    blob = json.dumps(bundle)
+    check("恢复包不含任何密文", "verifier" not in blob and "ciphertext" not in blob)
+    ctx2.db.close()
+
+    # 主备全坏 → 必须是可操作的错误，而不是"格式错误"
+    meta.write_text("{broken", "utf-8")
+    bak.write_text("{broken", "utf-8")
+    ctx3 = AppContext()
+    ctx3.is_first_run = False
+    try:
+        ctx3.unlock("pw-123456")
+        check("主备均损坏时拒绝解锁", False, "竟然解锁成功")
+    except SecurityError as exc:
+        check("主备均损坏时给出可操作提示",
+              "恢复包" in str(exc) and str(meta.name) in str(exc), f"实际 {exc}")
+
+
+# ============================================================ 10. 数据清理路径
+def test_reset_data_paths():
+    """【回归】旧 reset_data 删的是 unimail.db.meta.json，真正的侧车从未被清理。"""
+    tmp, cfg, _ctxmod, _svc = setup_env("reset_")
+    import main as mainmod
+
+    db = cfg.DB_PATH
+    meta = db.with_suffix(".meta.json")
+    att = tmp / "attachments"
+    att.mkdir(parents=True, exist_ok=True)
+    (att / "a.bin").write_bytes(b"x")
+
+    db.write_bytes(b"db")
+    Path(str(db) + "-wal").write_bytes(b"wal")
+    meta.write_text("{}", "utf-8")
+    meta.with_name(meta.name + ".bak").write_text("{}", "utf-8")
+    meta.with_name(meta.name + ".tmp").write_text("{}", "utf-8")
+
+    with patch.object(mainmod, "DB_PATH", db), \
+            patch.object(mainmod, "ATTACHMENT_DIR", att):
+        mainmod.reset_data()
+
+    check("清掉真正的侧车文件", not meta.exists())
+    check("清掉侧车备份", not meta.with_name(meta.name + ".bak").exists())
+    check("清掉侧车临时文件", not meta.with_name(meta.name + ".tmp").exists())
+    check("清掉 WAL", not Path(str(db) + "-wal").exists())
+    check("清掉主库文件", not db.exists())
+    check("清空附件目录", not any(att.iterdir()))
+
+
+# ============================================================ 11. 数据库并发与加密模式
+def test_database_concurrency_and_mode():
+    from unimail.core.security import SecurityService
+    from unimail.storage import Database, DatabaseError, SQLCIPHER_AVAILABLE
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("conc_")
+    sec = SecurityService()
+    params = SecurityService.new_kdf_params()
+
+    db = Database(tmp / "c.db", sec.setup("pw123456", params), encrypted=False)
+
+    check("busy_timeout 已设置", int(db.scalar("PRAGMA busy_timeout")) == 5000,
+          f"实际 {db.scalar('PRAGMA busy_timeout')}")
+    check("journal_mode = wal",
+          str(db.scalar("PRAGMA journal_mode")).lower() == "wal")
+    check("synchronous = NORMAL", int(db.scalar("PRAGMA synchronous")) == 1)
+    check("外键约束开启", int(db.scalar("PRAGMA foreign_keys")) == 1)
+    check("temp_store = MEMORY", int(db.scalar("PRAGMA temp_store")) == 2)
+
+    # 线程本地连接会被登记，close() 必须回收全部
+    def _touch():
+        db.query_one("SELECT 1")
+
+    t = threading.Thread(target=_touch)
+    t.start()
+    t.join()
+    check("后台线程连接已登记", db.open_count() >= 2, f"实际 {db.open_count()}")
+    db.close()
+    check("close() 回收所有线程连接", db.open_count() == 0)
+    try:
+        db.query_one("SELECT 1")
+        check("关闭后拒绝继续使用", False, "竟然还能查询")
+    except DatabaseError:
+        check("关闭后拒绝继续使用", True)
+
+    # 事务持锁 + 事务内 execute 不提前提交
+    db2 = Database(tmp / "c2.db", sec.setup("pw123456", params), encrypted=False)
+    marks: dict[str, float] = {}
+
+    def _holder():
+        with db2.transaction() as conn:
+            time.sleep(0.3)
+            conn.execute("INSERT INTO meta(key, value) VALUES('a', '1')")
+            marks["a_commit"] = time.monotonic()
+
+    def _waiter():
+        db2.execute("INSERT INTO meta(key, value) VALUES('b', '1')")
+        marks["b_done"] = time.monotonic()
+
+    t1 = threading.Thread(target=_holder)
+    t1.start()
+    time.sleep(0.05)
+    t2 = threading.Thread(target=_waiter)
+    t2.start()
+    t1.join()
+    t2.join()
+    check("事务期间其它线程的写入被串行化",
+          marks.get("b_done", 0) >= marks.get("a_commit", 0),
+          f"{marks}")
+
+    try:
+        with db2.transaction() as conn:
+            db2.execute("INSERT INTO meta(key, value) VALUES('nested', '1')")
+            conn.execute("INSERT INTO meta(key, value) VALUES('plain', '1')")
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    check("事务内 execute 不提前提交（回滚后无残留）",
+          db2.get_meta("nested") is None and db2.get_meta("plain") is None)
+    db2.close()
+
+    # 加密模式 fail-closed
+    if not SQLCIPHER_AVAILABLE:
+        try:
+            Database(tmp / "x.db", b"0" * 32, encrypted=True)
+            check("缺少 SQLCipher 时拒绝打开加密库", False, "竟然打开了")
+        except DatabaseError as exc:
+            check("缺少 SQLCipher 时给出安装提示", "sqlcipher3" in str(exc))
+    else:  # pragma: no cover - 本机未安装
+        enc = Database(tmp / "x.db", sec.setup("pw123456", params), encrypted=True)
+        check("加密库以加密方式打开", enc.encrypted and enc.driver_name == "sqlcipher")
+        enc.close()
+
+
+def test_legacy_sidecar_and_driver_mismatch():
+    """旧版侧车没有 driver 字段；记录与实际不符时也必须给出可读结论。"""
+    tmp, cfg, _ctxmod, _svc = setup_env("legacy_")
+    from unimail.core.security import SecurityError
+    from unimail.storage import DatabaseError, SQLCIPHER_AVAILABLE
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-123456")
+    ctx.db.close()
+    meta = cfg.DB_PATH.with_suffix(".meta.json")
+
+    # 模拟 v1.1.0 的侧车：没有 driver 字段
+    data = json.loads(meta.read_text("utf-8"))
+    data.pop("driver", None)
+    meta.write_text(json.dumps(data), "utf-8")
+
+    ctx2 = AppContext()
+    ctx2.is_first_run = False
+    ctx2.unlock("pw-123456")
+    expected = "sqlcipher" if SQLCIPHER_AVAILABLE else "sqlite3"
+    check("旧侧车可自动探测出实际加密模式",
+          ctx2.db.driver_name == expected, f"实际 {ctx2.db.driver_name}")
+    check("探测结论已回写 sidecar（下次启动不再探测）",
+          json.loads(meta.read_text("utf-8")).get("driver") == expected)
+    check("解锁后库内 meta.driver 与 sidecar 一致",
+          ctx2.db.registered_driver() == expected)
+    ctx2.db.close()
+
+    # sidecar 声称是加密库，但（本机）并未安装 SQLCipher → 必须是可读错误，而不是打不开
+    data = json.loads(meta.read_text("utf-8"))
+    data["driver"] = "sqlcipher"
+    meta.write_text(json.dumps(data), "utf-8")
+    ctx3 = AppContext()
+    ctx3.is_first_run = False
+    try:
+        ctx3.unlock("pw-123456")
+        check("驱动记录与库不符时不静默失败", False, "竟然解锁成功")
+    except (DatabaseError, SecurityError) as exc:
+        text = str(exc)
+        check("驱动记录与库不符时给出可操作提示",
+              "sqlcipher3" in text or "加密" in text, f"实际 {text[:120]}")
 
 
 def main() -> int:
@@ -390,7 +833,13 @@ def main() -> int:
         ("【回归】改主密码后凭据可用性", test_change_password_regression),
         ("【回归】IMAP part 编号", test_imap_part_numbering),
         ("【回归】附件真实下载", test_attachment_download),
-        ("数据库迁移 v1→v2", test_migration),
+        ("数据库迁移 v1→v3", test_migration),
+        ("TLS 证书校验", test_tls_certificate_verification),
+        ("【回归】同步游标与 UIDVALIDITY", test_sync_pagination_and_uidvalidity),
+        ("侧车原子性与恢复包", test_sidecar_atomicity_and_recovery),
+        ("旧版侧车与驱动不一致", test_legacy_sidecar_and_driver_mismatch),
+        ("数据清理路径", test_reset_data_paths),
+        ("数据库并发与加密模式", test_database_concurrency_and_mode),
     ]
     failed = 0
     for title, fn in suites:

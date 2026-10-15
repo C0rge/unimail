@@ -38,7 +38,11 @@ python main.py
 
 > 演示模式主密码为 `unimail-demo`。
 
-**可选增强**：`pip install sqlcipher3-binary` 可启用整库 AES-256 加密（未安装时自动降级为 SQLite + 字段级加密，启动时会明确提示当前加密等级）。
+**可选增强**：`pip install sqlcipher3-binary` 可启用整库 AES-256 加密（未安装时自动降级为 SQLite + 字段级加密，启动时会明确提示当前加密等级）。库文件由哪种驱动创建会记在 sidecar 中，因此先降级运行、之后补装 SQLCipher 也能正常打开，并可在启动提示或「文件 → 数据库加密设置」中一键迁移。
+
+**备份与恢复**：`文件 → 导出恢复包`（或 `python main.py --export-recovery [路径]`）会导出 salt / 迭代次数 / 算法标识，**不含任何密文**。侧车文件 `unimail.meta.json` 损坏时，靠它可以重新派生数据库密钥，建议离线保存一份。
+
+**TLS 证书校验**：客户端默认**强制校验** IMAP 服务器证书与主机名。仅在连接使用自签证书的自建服务器、且明确知晓风险时，才设置环境变量 `UNIMAIL_ALLOW_INVALID_CERT=1` 放行。
 
 ## 添加真实邮箱须知
 

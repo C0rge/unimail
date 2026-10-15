@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from ..config import INITIAL_FETCH_LIMIT, MAX_FETCH_PER_RUN, SYNC_PAGE_SIZE
 from ..core.events import EventBus
 from ..core.models import Account, AccountStatus
 from ..core.security import SecurityError, SecurityService
@@ -16,6 +16,8 @@ from ..storage import CursorRepository, MailRepository
 
 log = logging.getLogger(__name__)
 
+FOLDER = "INBOX"
+
 
 class SyncWorker(QThread):
     """在后台线程中执行一次账号同步。
@@ -23,8 +25,8 @@ class SyncWorker(QThread):
     流程：
         1. 取明文凭据（内存）
         2. 连接 IMAP
-        3. 读增量游标，搜索新邮件 UID
-        4. 拉取头部入库（快速填充列表）
+        3. 读增量游标并提供 UIDVALIDITY 失效检测
+        4. 分页拉取头部入库（游标只推进到「连续已抓取区间」的最大 UID）
         5. 拉取正文补齐（可选，逐封）
         6. 更新游标
     """
@@ -66,53 +68,94 @@ class SyncWorker(QThread):
 
         try:
             imap = adapter.connect(account, password)
-            uid_validity = adapter.uid_validity(imap)
-            last_uid, old_validity = self.cursors.get(account.id, "INBOX")
+            server_validity = adapter.uid_validity(imap)
+            last_uid, cursor_validity = self.cursors.get(account.id, FOLDER)
 
-            # UIDVALIDITY 变化说明服务器端邮件序号已重置，需重新同步
-            if old_validity and uid_validity and old_validity != uid_validity:
-                log.warning("账号 %s UIDVALIDITY 变化，重置游标", account.email)
+            # ---- UIDVALIDITY 语义修正
+            # 服务器端邮箱被重建时 UID 会复用。此时本地副本全部失效：
+            # 若不清理，新邮件会因唯一键 (account_id, folder, uid) 冲突被静默丢弃。
+            # 判定依据取「本地邮件的 uid_validity」而不是只看游标，这样即使
+            # 游标表丢失也不会漏判。
+            stored_validities = self.mails.folder_uid_validities(account.id, FOLDER)
+            invalidated = (
+                bool(stored_validities) and server_validity is not None
+                and server_validity not in stored_validities
+            ) or (
+                cursor_validity is not None and server_validity is not None
+                and cursor_validity != server_validity and last_uid > 0
+            )
+            if invalidated:
+                removed = self.mails.purge_folder(account.id, FOLDER)
+                log.warning(
+                    "账号 %s 的 UIDVALIDITY 已变化（本地=%s 服务端=%s），"
+                    "已清理 %d 封过期本地副本并重置游标",
+                    account.email, sorted(stored_validities) or cursor_validity,
+                    server_validity, removed,
+                )
                 last_uid = 0
-            max_uid = last_uid
+
             new_count = 0
+            new_pairs: list[tuple[str, str]] = []   # (uid, mail_id)，供第二阶段补正文
+            cursor_uid = last_uid
+            first_sync = last_uid <= 0
+            page_size = max(int(INITIAL_FETCH_LIMIT), 1) if first_sync \
+                else max(int(SYNC_PAGE_SIZE), 1)
+            budget = MAX_FETCH_PER_RUN if first_sync else 0     # 0 = 不限
+            fetched_this_run = 0
 
-            uids = adapter.search_new_uids(imap, last_uid, limit=200)
-            log.info("账号 %s 发现 %d 封新邮件", account.email, len(uids))
-
-            # 第一阶段：拉头部，快速填充列表
-            header_batch: list[tuple[str, object]] = []
-            for uid in uids:
-                if self._cancelled:
+            # 分页循环：始终取「最旧的一批」并推进游标，直到追平服务端。
+            # 这样既不会丢中间的邮件，也不会因单页上限而永远追不上。
+            while not self._cancelled:
+                uids = adapter.search_new_uids(imap, cursor_uid, limit=page_size)
+                if not uids:
                     break
-                try:
-                    mail = adapter.fetch_headers(imap, uid, "INBOX")
-                except ImapError as exc:
-                    log.warning("拉取邮件头 %s 失败：%s", uid, exc)
-                    continue
-                mail_id = self.mails.insert_mail(account.id, account.platform, mail)
-                if mail_id:
-                    new_count += 1
-                    header_batch.append((uid, mail))
-                    max_uid = max(max_uid, int(uid))
-                    self.progress.emit(account.id, new_count)
+                log.info("账号 %s 本页发现 %d 封新邮件（游标 %s）",
+                         account.email, len(uids), cursor_uid)
+
+                page_continuous = True
+                for uid in uids:
+                    if self._cancelled:
+                        page_continuous = False
+                        break
+                    try:
+                        mail = adapter.fetch_headers(imap, uid, FOLDER)
+                    except ImapError as exc:
+                        # 单封失败即停止推进游标，下次同步从这里重试，
+                        # 避免「跳过失败邮件后游标越过它」造成永久丢失。
+                        log.warning("拉取邮件头 %s 失败，游标停在该封之前：%s", uid, exc)
+                        page_continuous = False
+                        break
+                    mail_id = self.mails.insert_mail(
+                        account.id, account.platform, mail, uid_validity=server_validity
+                    )
+                    cursor_uid = int(uid)      # 已入库（或已存在）→ 可安全推进
+                    fetched_this_run += 1
+                    if mail_id:
+                        new_count += 1
+                        new_pairs.append((uid, mail_id))
+                        self.progress.emit(account.id, new_count)
+
+                # 游标只推进到「连续已抓取区间」的最大 UID
+                if cursor_uid > last_uid:
+                    self.cursors.upsert(account.id, FOLDER, cursor_uid, server_validity)
+                    last_uid = cursor_uid
+
+                if not page_continuous or len(uids) < page_size:
+                    break
+                if budget and fetched_this_run >= budget:
+                    log.info("账号 %s 首次同步达到单次上限 %d 封，其余邮件将在下次同步继续",
+                             account.email, budget)
+                    break
 
             # 第二阶段：为最新若干封补齐正文
-            for uid, _ in header_batch[-self.fetch_body_limit:]:
+            for uid, mail_id in new_pairs[-self.fetch_body_limit:]:
                 if self._cancelled:
                     break
                 try:
-                    full = adapter.fetch_message(imap, uid, "INBOX")
-                    row = self.mails.db.query_one(
-                        "SELECT id FROM mails WHERE account_id = ? AND folder = 'INBOX' AND uid = ?",
-                        (account.id, str(uid)),
-                    )
-                    if row:
-                        self.mails.update_body(row["id"], full.body_text, full.body_html)
+                    full = adapter.fetch_message(imap, uid, FOLDER)
+                    self.mails.update_body(mail_id, full.body_text, full.body_html)
                 except ImapError as exc:
                     log.warning("拉取正文 %s 失败：%s", uid, exc)
-
-            if max_uid > last_uid:
-                self.cursors.upsert(account.id, "INBOX", max_uid, uid_validity)
 
             self.account_service.accounts.set_last_synced(account.id)
             self.account_service.set_status(account.id, AccountStatus.OK)
