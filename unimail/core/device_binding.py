@@ -67,8 +67,8 @@ def _dpapi_protect(data: bytes, entropy: bytes = b"") -> bytes:
     而这里只需要两个函数。多一个重量级依赖会同时抬高打包体积与
     「某个平台装不上」的风险。
     """
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
+    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]  # 仅 Windows 存在；Linux 上的 mypy 看不到
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # 仅 Windows 存在；Linux 上的 mypy 看不到
 
     in_blob = _blob(data)
     ent_blob = _blob(entropy) if entropy else None
@@ -83,7 +83,7 @@ def _dpapi_protect(data: bytes, entropy: bytes = b"") -> bytes:
         ctypes.byref(out_blob),
     )
     if not ok:
-        raise OSError(f"CryptProtectData 失败（错误码 {ctypes.GetLastError()}）")
+        raise OSError(f"CryptProtectData 失败（错误码 {ctypes.GetLastError()}）")  # type: ignore[attr-defined]
     try:
         return _blob_bytes(out_blob)
     finally:
@@ -91,8 +91,8 @@ def _dpapi_protect(data: bytes, entropy: bytes = b"") -> bytes:
 
 
 def _dpapi_unprotect(data: bytes, entropy: bytes = b"") -> bytes:
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
+    crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]  # 仅 Windows 存在；Linux 上的 mypy 看不到
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # 仅 Windows 存在；Linux 上的 mypy 看不到
 
     in_blob = _blob(data)
     ent_blob = _blob(entropy) if entropy else None
@@ -109,7 +109,7 @@ def _dpapi_unprotect(data: bytes, entropy: bytes = b"") -> bytes:
     if not ok:
         # 换机器、换用户、或密文被改过都会走到这里——这不是「异常」，
         # 而是设计内的失效路径，调用方据此退回密码解锁。
-        raise OSError(f"CryptUnprotectData 失败（错误码 {ctypes.GetLastError()}）")
+        raise OSError(f"CryptUnprotectData 失败（错误码 {ctypes.GetLastError()}）")  # type: ignore[attr-defined]
     try:
         return _blob_bytes(out_blob)
     finally:
@@ -151,7 +151,7 @@ class DeviceBinding:
         """当前平台是否提供可用的 OS 级保护。"""
         if self.backend == "dpapi":
             try:
-                ctypes.windll.crypt32       # noqa: B018 - 探测符号存在性
+                ctypes.windll.crypt32       # type: ignore[attr-defined]  # noqa: B018
                 return True
             except (AttributeError, OSError):
                 return False
