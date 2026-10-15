@@ -2677,16 +2677,19 @@ def main() -> int:
     else:
         print("全部通过 ✓")
         code = 0
-    # --- 临时诊断：定位 Windows CI 收尾阶段的退出码异常（会移除）
-    print("DBG before-flush", flush=True)
-    try:
-        sys.stdout.flush()
-        print("DBG stdout-flushed", flush=True)
-        sys.stderr.flush()
-        print("DBG stderr-flushed", flush=True)
-    except Exception as exc:  # noqa: BLE001
-        print(f"DBG flush-error {exc!r}", flush=True)
-    print(f"DBG calling os._exit({code})", flush=True)
+    # 退出码保卫战：套件里建过 QApplication，收尾时 Qt 相关 DLL 在
+    # ExitProcess 的 DLL_PROCESS_DETACH 阶段可能崩溃（0xC0000005），
+    # 把已经确定的退出码覆盖掉（且表现随 console/管道环境漂移：
+    # 同一台机器 git-bash 报 0、PowerShell 报 0xC0000005、CI 报 1）。
+    # 所有断言已经跑完、输出已经落盘，清理毫无意义——Windows 上直接
+    # TerminateProcess 自身：不执行 DLL 卸载通知，退出码原样送达父进程。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
     os._exit(code)
 
 
