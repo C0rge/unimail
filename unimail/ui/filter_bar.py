@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import PLATFORMS
+from . import icons
 
 TIME_PRESETS = [
     ("全部时间", None),
@@ -100,6 +101,30 @@ class FilterBar(QFrame):
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         layout.addWidget(self.refresh_btn)
+
+    # ------------------------------------------------------------ 主题
+    def apply_theme(self, palette: dict) -> None:
+        self.refresh_btn.setIcon(
+            icons.icon("refresh", palette.get("text_dim", "#8b98a9"), 14))
+        self._add_action_icon(palette)
+
+    def _add_action_icon(self, palette: dict) -> None:
+        """给搜索框左侧装一个放大镜。
+
+        用 `addAction` + `TrailingPosition=None` 的默认前置位：
+        比画在 placeholder 里可靠（placeholder 在获得焦点后就消失，
+        留下一段空白）。
+        """
+        if getattr(self, "_search_icon_added", False):
+            self.search.actions()[0].setIcon(
+                icons.icon("search", palette.get("text_faint", "#5d6b7d"), 14))
+            return
+        action = self.search.addAction(
+            icons.icon("search", palette.get("text_faint", "#5d6b7d"), 14),
+            QLineEdit.LeadingPosition,
+        )
+        action.setEnabled(False)      # 纯装饰：不参与点击/焦点
+        self._search_icon_added = True
 
     # ------------------------------------------------------------ 交互
     def _on_time_preset(self) -> None:

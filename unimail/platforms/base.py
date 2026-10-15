@@ -305,6 +305,39 @@ class ImapAdapter:
             pass
         return None
 
+    # ------------------------------------------------------------ 标记回写
+    FLAG_SEEN = "\\Seen"
+    FLAG_FLAGGED = "\\Flagged"
+
+    def store_flags(self, imap: imaplib.IMAP4, uid: str, folder: str = "INBOX",
+                    add: list[str] | tuple[str, ...] = (),
+                    remove: list[str] | tuple[str, ...] = ()) -> None:
+        r"""把「已读 / 星标」写回服务器（`UID STORE ±FLAGS.SILENT`）。
+
+        `.SILENT` 表示不需要服务器回传新的 FLAGS 列表——我们只关心是否写成功，
+        回传只会多一次解析。不需要增删任何标志时直接返回，不产生任何往返。
+
+        只改 `\Seen` / `\Flagged` 这两个「用户可见状态」标志，**不动**
+        `\Deleted`：那等于直接删服务器上的邮件，是本地客户端绝不该有的行为。
+        """
+        allowed = {self.FLAG_SEEN, self.FLAG_FLAGGED}
+        add_set = sorted(set(add) & allowed)
+        remove_set = sorted(set(remove) & allowed)
+        if not add_set and not remove_set:
+            return
+        with contextlib.suppress(imaplib.IMAP4.error, OSError):
+            imap.select(folder or "INBOX", readonly=False)
+        try:
+            if add_set:
+                imap.uid("STORE", str(uid), "+FLAGS.SILENT",
+                         "(" + " ".join(add_set) + ")")
+            if remove_set:
+                imap.uid("STORE", str(uid), "-FLAGS.SILENT",
+                         "(" + " ".join(remove_set) + ")")
+        except imaplib.IMAP4.error as exc:
+            raise ImapError(f"同步标记到服务器失败（uid={uid}）：{exc}") from exc
+
+
 
 def make_account_stub(draft) -> Account:
     """从 AccountDraft 构造一个未落库的 Account，用于试连。"""

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import contextlib
+import csv
+import email
+import email.message
 import logging
 import os
 import re
@@ -15,7 +18,9 @@ from ..config import (
     DANGEROUS_EXTENSIONS,
     DEFAULT_SYNC_INTERVAL,
     MAX_ATTACHMENT_BYTES,
+    MAX_PREVIEW_BYTES,
     PLATFORMS,
+    SYNC_SERVER_FLAGS,
 )
 from ..platforms import ImapError, get_adapter, make_account_stub
 from ..storage import (
@@ -23,9 +28,19 @@ from ..storage import (
     AttachmentRepository,
     CursorRepository,
     MailRepository,
+    PendingFlagRepository,
 )
 from .events import EventBus
-from .models import Account, AccountDraft, AccountStatus, Mail, MailFilter, MailSummary
+from .models import (
+    Account,
+    AccountDraft,
+    AccountStatus,
+    Attachment,
+    Mail,
+    MailFilter,
+    MailSummary,
+    ThreadSummary,
+)
 from .security import SecurityError, SecurityService
 
 log = logging.getLogger(__name__)
@@ -65,6 +80,31 @@ def safe_attachment_name(filename: str | None, max_len: int = 120) -> str:
     return name
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(html: str | None) -> str:
+    """把 HTML 粗略降为纯文本（仅在重建 `.eml` 且没有明文正文时兜底）。"""
+    if not html:
+        return ""
+    return re.sub(r"\s+", " ", _TAG_RE.sub(" ", html)).strip()
+
+
+def decode_text_bytes(data: bytes) -> str:
+    """把字节流解成文本（预览 `text/*` 附件用）。
+
+    与 MIME 解析同源的保守策略：先按 UTF-8 严格解，失败再试 GB18030——
+    后者覆盖 GBK/GB2312 且对任何字节序列都能解出结果（最差是乱码），
+    因此不会抛异常。UTF-8 合法时优先 UTF-8 可避免把西文误判成中文。
+    """
+    for enc in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def unlink_attachment_file(path: str | Path | None) -> bool:
     """尽力删除附件落盘文件。
 
@@ -100,11 +140,13 @@ class AccountService:
     """账号管理用例。"""
 
     def __init__(self, accounts: AccountRepository, cursors: CursorRepository,
-                 security: SecurityService, bus: EventBus) -> None:
+                 security: SecurityService, bus: EventBus,
+                 pending_flags: PendingFlagRepository | None = None) -> None:
         self.accounts = accounts
         self.cursors = cursors
         self.security = security
         self.bus = bus
+        self.pending_flags = pending_flags
         self._active_id: str | None = None
 
     # ------------------------------------------------------------ 查询
@@ -176,6 +218,11 @@ class AccountService:
         stale = self.accounts.delete(account_id)
         for path in stale:
             unlink_attachment_file(path)
+        if self.pending_flags is not None:
+            # 账号都没了，还留着「待回写标记」只会在下次同步时刷一堆无主错误
+            with contextlib.suppress(Exception):
+                self.pending_flags.db.execute(
+                    "DELETE FROM pending_flags WHERE account_id = ?", (account_id,))
         if self._active_id == account_id:
             self._active_id = None
         log.info("已删除账号 %s（同时清理 %d 个本地附件副本）",
@@ -199,12 +246,18 @@ class MailService:
 
     def __init__(self, mails: MailRepository, attachments: AttachmentRepository,
                  accounts: AccountRepository, security: SecurityService,
-                 bus: EventBus) -> None:
+                 bus: EventBus, pending_flags: PendingFlagRepository | None = None) -> None:
         self.mails = mails
         self.attachments = attachments
         self.accounts = accounts
         self.security = security
         self.bus = bus
+        self.pending_flags = pending_flags
+        # 保活会话池由 AppContext 注入：core 层不能反向依赖 sync 层（会形成
+        # import 循环——sync.worker 本身就要用到 AccountService）。
+        self.sessions = None
+        # 服务端标记双向同步开关（设置面板控制）
+        self.sync_server_flags = SYNC_SERVER_FLAGS
         self._counts_cache: tuple[dict[str, tuple[int, int]],
                                   tuple[int, int]] | None = None
         self._counts_expires = 0.0
@@ -218,8 +271,24 @@ class MailService:
         """收件箱列表（轻量投影，不含正文与附件明细）。"""
         return self.mails.query_summaries(flt)
 
+    def search_count(self, flt: MailFilter) -> int | None:
+        """关键词命中总数（仅全文索引路径给得出；否则返回 None 表示「不显示」）。"""
+        return self.mails.count_search(flt)
+
+    def summaries_by_ids(self, mail_ids: list[str]) -> list[MailSummary]:
+        return self.mails.summaries_by_ids(mail_ids)
+
     def get(self, mail_id: str) -> Mail | None:
         return self.mails.get(mail_id)
+
+    # ------------------------------------------------------------ 会话视图
+    def threads(self, flt: MailFilter) -> list[ThreadSummary]:
+        """按会话归并的列表（折叠态）。"""
+        return self.mails.thread_summaries(flt)
+
+    def thread_mails(self, thread_key: str, limit: int = 100) -> list[MailSummary]:
+        """展开某个会话后的成员邮件（时间升序 = 阅读顺序）。"""
+        return self.mails.mails_in_thread(thread_key, limit)
 
     def invalidate_counts(self) -> None:
         self._counts_cache = None
@@ -248,6 +317,7 @@ class MailService:
     # ------------------------------------------------------------ 状态
     def mark_read(self, mail_id: str, is_read: bool = True) -> None:
         self.mails.set_read(mail_id, is_read)
+        self._queue_server_flag(mail_id, read=is_read)
         self.invalidate_counts()
         self.bus.mail_updated.emit(mail_id)
 
@@ -257,13 +327,47 @@ class MailService:
             return False
         new_state = not mail.is_starred
         self.mails.set_starred(mail_id, new_state)
+        self._queue_server_flag(mail_id, starred=new_state)
         self.bus.mail_updated.emit(mail_id)
         return new_state
 
     def mark_all_read(self, account_id: str | None = None) -> None:
+        affected = self.mails.ids_unread(account_id)
         self.mails.mark_all_read(account_id)
+        for mail_id in affected:
+            self._queue_server_flag(mail_id, read=True)
         self.invalidate_counts()
         self.bus.accounts_changed.emit()
+
+    def _queue_server_flag(self, mail_id: str, read: bool | None = None,
+                           starred: bool | None = None) -> None:
+        """把本地状态变化排进「待回写服务器」队列。
+
+        只在开关打开时入队。入队而不是立刻推送，是因为点已读/星标是**高频、
+        低价值**操作：为它同步等一次网络往返会让 UI 明显卡顿，
+        而失败弹窗更没必要。真正推送发生在下次同步时（`SyncWorker`）。
+        """
+        if not (self.sync_server_flags and self.pending_flags is not None):
+            return
+        ctx = self.mails.mail_context(mail_id)
+        if ctx is None:
+            return
+        add: list[str] = []
+        remove: list[str] = []
+        if read is not None:
+            (add if read else remove).append("\\Seen")
+        if starred is not None:
+            (add if starred else remove).append("\\Flagged")
+        try:
+            self.pending_flags.add(ctx["account_id"], ctx.get("folder") or "INBOX",
+                                   str(ctx["uid"]), add=add, remove=remove)
+        except Exception:
+            log.warning("排入待回写标记失败（本地状态已生效）", exc_info=True)
+
+    def pending_flag_count(self, account_id: str | None = None) -> int:
+        if self.pending_flags is None:
+            return 0
+        return self.pending_flags.count(account_id)
 
     def delete(self, mail_id: str) -> None:
         stale = self.mails.delete(mail_id)
@@ -331,46 +435,7 @@ class MailService:
 
         self._check_size_limit(att.size, att.filename)
 
-        ctx = self.mails.mail_context_of_attachment(attachment_id)
-        if ctx is None:
-            raise FileNotFoundError("找不到附件所属邮件")
-
-        part_index = (ctx.get("part_index") or "").strip()
-        if not part_index:
-            raise ValueError(
-                "该附件缺少 IMAP 部件编号，无法下载。\n"
-                "可能是旧版本同步的数据，请重新同步该邮件后再试。"
-            )
-
-        account = self.accounts.get(ctx["account_id"])
-        if account is None:
-            raise FileNotFoundError("附件所属账号已被删除")
-
-        ciphertext = self.accounts.get_credential(account.id)
-        if ciphertext is None:
-            raise SecurityError("无法获取该账号凭据，请重新添加账号")
-        password = self.security.decrypt_secret(ciphertext)
-
-        adapter = get_adapter(account.platform)
-        imap = None
-        try:
-            imap = adapter.connect(account, password)
-            # 只读 select 可能被部分服务器拒绝；拒绝不影响接下来的 BODY[part]
-            # （多数服务器在登录后已默认选中 INBOX），因此这里不构成失败条件。
-            with contextlib.suppress(Exception):
-                imap.select(ctx["folder"] or "INBOX", readonly=True)
-            raw = adapter.fetch_attachment(imap, str(ctx["uid"]), part_index)
-        except ImapError as exc:
-            raise ImapError(f"从服务器下载附件失败：{exc}") from exc
-        finally:
-            if imap is not None:
-                adapter.disconnect(imap)
-
-        if not raw:
-            raise ValueError("服务器返回的附件内容为空")
-
-        # 按原始 MIME 重新解码（IMAP 返回的可能是 base64/quoted-printable）
-        data = self._decode_attachment_payload(raw, att.content_type)
+        data = self._fetch_attachment_from_server(attachment_id, att)
 
         # 元数据里的 size 可能来自估算或缺失，落盘前用真实长度再判一次
         self._check_size_limit(len(data), att.filename)
@@ -388,6 +453,325 @@ class MailService:
             written, len(data), renamed=danger_ext,
             name_hint=self._danger_hint(att.filename, danger_ext) if danger_ext else "",
         )
+
+    # ------------------------------------------------------------ 连接复用
+    def _with_connection(self, account: Account, password: str, fn):
+        """在账号连接上执行 `fn(adapter, imap)`，优先复用保活会话。
+
+        会话池由 AppContext 注入。没有会话池时退回「一次一连接」——
+        功能等价，只是每次都要重新握手。
+        """
+        adapter = get_adapter(account.platform)
+        if self.sessions is not None:
+            with self.sessions.borrow(account, password) as imap:
+                return fn(adapter, imap)
+        imap = adapter.connect(account, password)
+        try:
+            return fn(adapter, imap)
+        finally:
+            adapter.disconnect(imap)
+
+    def _account_and_password(self, account_id: str) -> tuple[Account, str]:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise FileNotFoundError("附件所属账号已被删除")
+        ciphertext = self.accounts.get_credential(account.id)
+        if ciphertext is None:
+            raise SecurityError("无法获取该账号凭据，请重新添加账号")
+        return account, self.security.decrypt_secret(ciphertext)
+
+    def _fetch_attachment_from_server(self, attachment_id: str,
+                                      att: Attachment) -> bytes:
+        """按 part 编号从服务器取回附件的**真实字节流**。"""
+        ctx = self.mails.mail_context_of_attachment(attachment_id)
+        if ctx is None:
+            raise FileNotFoundError("找不到附件所属邮件")
+        part_index = (ctx.get("part_index") or "").strip()
+        if not part_index:
+            raise ValueError(
+                "该附件缺少 IMAP 部件编号，无法下载。\n"
+                "可能是旧版本同步的数据，请重新同步该邮件后再试。"
+            )
+        account, password = self._account_and_password(ctx["account_id"])
+        folder = ctx.get("folder") or "INBOX"
+
+        def _fetch(adapter, imap):
+            # 只读 select 可能被部分服务器拒绝；拒绝不影响接下来的 BODY[part]
+            # （多数服务器在登录后已默认选中 INBOX），因此这里不构成失败条件。
+            with contextlib.suppress(Exception):
+                imap.select(folder, readonly=True)
+            return adapter.fetch_attachment(imap, str(ctx["uid"]), part_index)
+
+        try:
+            raw = self._with_connection(account, password, _fetch)
+        except ImapError as exc:
+            raise ImapError(f"从服务器下载附件失败：{exc}") from exc
+        if not raw:
+            raise ValueError("服务器返回的附件内容为空")
+        # 按原始 MIME 重新解码（IMAP 返回的可能是 base64/quoted-printable）
+        return self._decode_attachment_payload(raw, att.content_type)
+
+    # ------------------------------------------------------------ 内联预览
+    def attachment_bytes(self, attachment_id: str, *,
+                         max_bytes: int | None = MAX_PREVIEW_BYTES,
+                         allow_network: bool = True) -> bytes:
+        """取附件字节流：本地已有就直读，否则按需下载（并落盘缓存）。
+
+        与 `download_attachment` 的差别：这里不改变文件名、不追加 `.download`
+        后缀（预览不落用户可见目录），只关心「拿到字节」。
+        """
+        att = self.attachments.get(attachment_id)
+        if att is None:
+            raise FileNotFoundError("附件记录不存在")
+        if att.stored_path and Path(att.stored_path).is_file():
+            data = Path(att.stored_path).read_bytes()
+        else:
+            if not allow_network:
+                raise FileNotFoundError("附件尚未下载到本地")
+            if max_bytes and att.size and att.size > max_bytes:
+                raise ValueError(
+                    f"附件约 {att.size / 1024 / 1024:.1f} MB，超过预览上限 "
+                    f"{max_bytes / 1024 / 1024:.0f} MB。请先下载到本地再打开。"
+                )
+            data = self._fetch_attachment_from_server(attachment_id, att)
+            # 顺手落盘：下次预览/打开不必再走一趟网络
+            with contextlib.suppress(OSError):
+                target = ATTACHMENT_DIR / f"{att.id[:8]}_{safe_attachment_name(att.filename)}"
+                written = self._atomic_write_exclusive(target, data)
+                self.attachments.set_stored_path(attachment_id, str(written))
+        if max_bytes and len(data) > max_bytes:
+            raise ValueError(
+                f"附件 {len(data) / 1024 / 1024:.1f} MB，超过预览上限 "
+                f"{max_bytes / 1024 / 1024:.0f} MB。请先下载到本地再打开。"
+            )
+        return data
+
+    def preview_attachment(self, attachment_id: str) -> tuple[str, object]:
+        """返回 `(kind, payload)` 供详情面板内联预览。
+
+        kind ∈ {"image", "text", "none"}：
+          * image → payload 是 bytes（由 UI 层用 QImage 解出）
+          * text  → payload 是已解码的 str
+        刻意不做 PDF 渲染：多一个重量级依赖，而且 PDF 阅读器本来就
+        比内嵌渲染好用——这类附件走「下载后打开」更合适。
+        """
+        att = self.attachments.get(attachment_id)
+        if att is None:
+            raise FileNotFoundError("附件记录不存在")
+        ctype = (att.content_type or "").lower()
+        if ctype.startswith("image/"):
+            return "image", self.attachment_bytes(attachment_id)
+        if (ctype.startswith("text/") or ctype in
+                ("application/json", "application/xml", "application/csv")):
+            data = self.attachment_bytes(attachment_id, max_bytes=2 * 1024 * 1024)
+            return "text", decode_text_bytes(data)
+        return "none", ""
+
+    # ------------------------------------------------------------ 内嵌图片
+    def inline_resource(self, mail_id: str, content_id: str) -> bytes | None:
+        """解析正文里的 `cid:` 引用 → 本地已缓存的字节。
+
+        **只在本地已有缓存时返回**，绝不在渲染正文时发起网络请求：
+        `loadResource()` 是在 UI 线程里被同步调用的，一旦联网就会整窗卡住。
+        要加载内嵌图片，由用户显式点「加载内嵌图片」触发后台下载。
+        """
+        att = self.attachments.by_content_id(mail_id, content_id)
+        if att is None or not att.stored_path:
+            return None
+        path = Path(att.stored_path)
+        if not path.is_file():
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    def inline_missing(self, mail_id: str) -> list[Attachment]:
+        """该邮件里「有 cid 但本地没有缓存」的内嵌资源。"""
+        out = []
+        for att in self.attachments.inline_of_mail(mail_id):
+            if att.stored_path and Path(att.stored_path).is_file():
+                continue
+            out.append(att)
+        return out
+
+    def download_inline_images(self, mail_id: str,
+                               limit: int = 20) -> tuple[int, int]:
+        """下载该邮件的内嵌图片，返回 `(成功数, 失败数)`。
+
+        由用户显式触发（详情面板的按钮），不自动执行——自动下载内嵌图片
+        等价于自动加载远程内容，正是跟踪像素想达到的效果。
+        """
+        ok = failed = 0
+        for att in self.inline_missing(mail_id)[:limit]:
+            try:
+                self.attachment_bytes(att.id)
+                ok += 1
+            except (OSError, ValueError, FileNotFoundError, ImapError, SecurityError):
+                log.warning("内嵌资源下载失败：%s", att.filename, exc_info=True)
+                failed += 1
+        return ok, failed
+
+    # ------------------------------------------------------------ 批量操作
+    def mark_read_many(self, mail_ids: list[str], is_read: bool = True) -> int:
+        n = self.mails.set_read_many(mail_ids, is_read)
+        for mail_id in mail_ids:
+            self._queue_server_flag(mail_id, read=is_read)
+        self.invalidate_counts()
+        self.bus.accounts_changed.emit()
+        return n
+
+    def star_many(self, mail_ids: list[str], starred: bool = True) -> int:
+        n = self.mails.set_starred_many(mail_ids, starred)
+        for mail_id in mail_ids:
+            self._queue_server_flag(mail_id, starred=starred)
+        self.bus.accounts_changed.emit()
+        return n
+
+    def delete_many(self, mail_ids: list[str]) -> int:
+        stale = self.mails.delete_many(mail_ids)
+        for path in stale:
+            unlink_attachment_file(path)
+        self.invalidate_counts()
+        self.bus.mails_removed.emit(list(mail_ids))
+        return len(mail_ids)
+
+    # ------------------------------------------------------------ 导出
+    def build_rfc822(self, mail_id: str, *, allow_network: bool = True) -> bytes:
+        """把一封邮件还原成 RFC822 字节流（`.eml` 的内容）。
+
+        优先向服务器取**原始报文**（保留全部头部与编码，是无损的）；
+        拿不到时用本地字段重建——正文、收件人、时间都在，
+        但原始头部顺序与 DKIM 签名无法还原，因此会在重建件里留一个
+        `X-UniMail-Note` 说明，避免下游误以为它是原件。
+        """
+        mail = self.mails.get(mail_id)
+        if mail is None:
+            raise FileNotFoundError("邮件不存在")
+
+        if allow_network and self.sessions is not None:
+            ctx = self.mails.mail_context(mail_id)
+            if ctx:
+                try:
+                    account, password = self._account_and_password(ctx["account_id"])
+                    folder = ctx.get("folder") or "INBOX"
+                    uid = str(ctx["uid"])
+
+                    def _fetch(adapter, imap):
+                        with contextlib.suppress(Exception):
+                            imap.select(folder, readonly=True)
+                        return adapter.fetch_raw(imap, uid, headers_only=False)
+
+                    raw = self._with_connection(account, password, _fetch)
+                    if raw:
+                        return raw
+                except (ImapError, SecurityError, FileNotFoundError, OSError) as exc:
+                    log.info("取原始报文失败，改用本地重建：%s", exc)
+        return self._reconstruct_rfc822(mail)
+
+    def _reconstruct_rfc822(self, mail: Mail) -> bytes:
+        """用本地已存字段重建一封 RFC822 邮件（不联网，可测）。"""
+        msg = email.message.EmailMessage()
+        msg["Subject"] = mail.subject or ""
+        if mail.from_addr or mail.from_name:
+            msg["From"] = email.utils.formataddr((mail.from_name or "", mail.from_addr or ""))
+        if mail.to_addrs:
+            msg["To"] = ", ".join(mail.to_addrs)
+        if mail.date:
+            dt = mail.date if mail.date.tzinfo else mail.date.replace(tzinfo=timezone.utc)
+            msg["Date"] = email.utils.format_datetime(dt)
+        if mail.message_id:
+            msg["Message-ID"] = mail.message_id
+        msg["X-UniMail-Note"] = (
+            "由 UniMail 从本地存储字段重建（未能取回服务器原始报文），"
+            "原文头部顺序与签名信息可能缺失。"
+        )
+        body_text = mail.body_text or _strip_tags(mail.body_html)
+        msg.set_content(body_text or "")
+        if mail.body_html:
+            msg.add_alternative(mail.body_html, subtype="html")
+        for att in mail.attachments:
+            if not att.stored_path:
+                continue
+            path = Path(att.stored_path)
+            if not path.is_file():
+                continue
+            maintype, _, subtype = (att.content_type or "application/octet-stream").partition("/")
+            try:
+                msg.add_attachment(path.read_bytes(), maintype=maintype or "application",
+                                   subtype=subtype or "octet-stream",
+                                   filename=att.filename or path.name)
+            except OSError:
+                log.warning("重建邮件时读取附件失败：%s", path, exc_info=True)
+        return msg.as_bytes()
+
+    def export_eml(self, mail_id: str, target: str | Path) -> Path:
+        """导出单封邮件为 `.eml`。"""
+        data = self.build_rfc822(mail_id)
+        dest = Path(target)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        log.info("已导出邮件：%s（%d 字节）", dest, len(data))
+        return dest
+
+    def export_mbox(self, mail_ids: list[str], target: str | Path,
+                    *, progress: object = None) -> tuple[Path, int]:
+        """把多封邮件导出为 `.mbox` 归档。
+
+        格式要点：每封前加一行 `From <发件人> <日期>`，正文里以 `From `
+        开头的行要转义成 `>From `——否则 mbox 解析器会把正文误当成新邮件的开始。
+        这是 mboxo 的规范做法，Thunderbird / mutt 都按它解析。
+        """
+        dest = Path(target)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with open(dest, "wb") as fh:
+            for i, mail_id in enumerate(mail_ids, 1):
+                mail = self.mails.get(mail_id)
+                if mail is None:
+                    continue
+                try:
+                    raw = self.build_rfc822(mail_id)
+                except (OSError, ValueError, ImapError) as exc:
+                    log.warning("导出 %s 失败：%s", mail_id[:8], exc)
+                    continue
+                sender = mail.from_addr or "unknown@unimail"
+                when = (mail.date or datetime.now(timezone.utc)).strftime("%a %b %d %H:%M:%S %Y")
+                fh.write(f"From {sender} {when}\n".encode("utf-8", errors="replace"))
+                escaped = b"\n".join(
+                    b">" + line if line.startswith(b"From ") else line
+                    for line in raw.replace(b"\r\n", b"\n").split(b"\n")
+                )
+                fh.write(escaped)
+                if not escaped.endswith(b"\n"):
+                    fh.write(b"\n")
+                fh.write(b"\n")
+                written += 1
+                if callable(progress):
+                    progress(i, len(mail_ids))
+        log.info("已导出 mbox：%s（%d 封）", dest, written)
+        return dest, written
+
+    def export_csv(self, flt: MailFilter, target: str | Path) -> tuple[Path, int]:
+        """把当前筛选结果导出为 CSV（复用列表投影，不加载正文）。"""
+        rows = self.mails.query_summaries(flt)
+        dest = Path(target)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # utf-8-sig：Excel 打开中文 CSV 时不会乱码（BOM 是其识别依据）
+        with open(dest, "w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["时间", "发件人", "发件人地址", "主题", "平台",
+                             "账号", "已读", "星标", "附件", "大小(字节)", "摘要"])
+            for m in rows:
+                writer.writerow([
+                    m.date.astimezone().strftime("%Y-%m-%d %H:%M") if m.date else "",
+                    m.from_name, m.from_addr, m.subject, m.platform, m.account_id,
+                    "是" if m.is_read else "否", "是" if m.is_starred else "否",
+                    "是" if m.has_attachments else "否", m.raw_size,
+                    (m.preview or "").replace("\n", " "),
+                ])
+        log.info("已导出 CSV：%s（%d 行）", dest, len(rows))
+        return dest, len(rows)
 
     @staticmethod
     def _dangerous_extension(filename: str | None) -> bool:

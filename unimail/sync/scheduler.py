@@ -23,16 +23,18 @@ class Scheduler(QObject):
     """
 
     def __init__(self, account_service: AccountService, worker_pool, bus: EventBus,
-                 tick_seconds: int = SCHEDULER_TICK) -> None:
+                 tick_seconds: int = SCHEDULER_TICK, session_pool=None) -> None:
         super().__init__()
         self.account_service = account_service
         self.worker_pool = worker_pool
         self.bus = bus
+        self.session_pool = session_pool
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.tick)
         self._tick_seconds = tick_seconds
         self._enabled = True
         self._first_run_done = False
+        self._ticks = 0
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
@@ -57,6 +59,18 @@ class Scheduler(QObject):
     def tick(self) -> None:
         if not self._enabled:
             return
+        self._ticks += 1
+        # 顺带回收空闲保活连接：服务器对单账号的并发连接数有配额，
+        # 一直攥着不放会导致后续登录被拒（「too many connections」）。
+        # 每 10 个心跳回收一次，避免每个心跳都去遍历加锁。
+        if self.session_pool is not None and self._ticks % 10 == 1:
+            try:
+                closed = self.session_pool.sweep()
+                if closed:
+                    log.debug("已回收 %d 条空闲 IMAP 会话", closed)
+            except Exception:
+                log.debug("回收空闲会话失败", exc_info=True)
+
         now = datetime.now(timezone.utc)
         for account in self.account_service.list():
             if account.status == "disabled":

@@ -1,6 +1,8 @@
 """领域模型：内存中的数据结构定义。"""
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,6 +28,42 @@ def _parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value))
     except (ValueError, TypeError):
         return None
+
+
+def _load_str_list(value: Any) -> list[str]:
+    """把库里存的 JSON 数组读成 str 列表；任何异常形态都退化为空列表。
+
+    引用链字段（`ref_ids` / `in_reply_to`）是老库迁移后才出现的列，
+    手改过库、或早期版本写入的脏值都可能不是合法 JSON——不能因此让整封邮件读不出来。
+    """
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    try:
+        parsed = json.loads(str(value))
+    except (ValueError, TypeError):
+        return []
+    if isinstance(parsed, list):
+        return [str(v) for v in parsed if v]
+    return []
+
+
+# 公开别名：仓储层也要把 JSON 列读成 str 列表，不必各写一份容错逻辑。
+load_str_list = _load_str_list
+
+
+PREVIEW_LIMIT = 200
+
+
+def make_preview(text: str | None, limit: int = PREVIEW_LIMIT) -> str:
+    """把正文压成单行摘要（列表展示与全文检索共用）。
+
+    放在 core 层而不是解析层：正文回填（`update_body`）也必须刷新预览，
+    而存储层不应依赖 `platforms`。摘要逻辑只有这一份实现。
+    """
+    flat = re.sub(r"\s+", " ", text or "").strip()
+    return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
 @dataclass
@@ -139,11 +177,15 @@ class Mail:
     is_read: bool = False
     is_starred: bool = False
     raw_size: int = 0
+    # 会话（线程）归并：`references` / `in_reply_to` 存的是 message-id 列表，
+    # 落库列名为 `ref_ids` / `in_reply_to`（`references` 是 SQLite 保留字）。
+    references: list[str] = field(default_factory=list)
+    in_reply_to: list[str] = field(default_factory=list)
+    thread_key: str = ""
     attachments: list[Attachment] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: dict) -> Mail:
-        import json
         try:
             to_addrs = json.loads(row.get("to_addrs") or "[]")
         except (ValueError, TypeError):
@@ -167,6 +209,9 @@ class Mail:
             is_read=bool(row.get("is_read")),
             is_starred=bool(row.get("is_starred")),
             raw_size=row.get("raw_size") or 0,
+            references=_load_str_list(row.get("ref_ids")),
+            in_reply_to=_load_str_list(row.get("in_reply_to")),
+            thread_key=row.get("thread_key") or "",
         )
 
     @property
@@ -190,6 +235,7 @@ class Mail:
             is_read=self.is_read,
             is_starred=self.is_starred,
             raw_size=self.raw_size,
+            thread_key=self.thread_key,
         )
 
 
@@ -216,6 +262,7 @@ class MailSummary:
     is_read: bool = False
     is_starred: bool = False
     raw_size: int = 0
+    thread_key: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> MailSummary:
@@ -234,6 +281,7 @@ class MailSummary:
             is_read=bool(row.get("is_read")),
             is_starred=bool(row.get("is_starred")),
             raw_size=row.get("raw_size") or 0,
+            thread_key=row.get("thread_key") or "",
         )
 
     @property
@@ -245,8 +293,65 @@ class MailSummary:
 MAIL_SUMMARY_COLUMNS = (
     "id", "account_id", "platform", "folder", "uid", "subject",
     "from_name", "from_addr", "date", "preview",
-    "has_attachments", "is_read", "is_starred", "raw_size",
+    "has_attachments", "is_read", "is_starred", "raw_size", "thread_key",
 )
+
+
+@dataclass
+class ThreadSummary:
+    """会话（线程）投影：折叠态显示「最新一封 + 组内统计」。
+
+    归并键是 `thread_key`（由 References / In-Reply-To 推出，见解析层）。
+    这里刻意组合而不是继承 `MailSummary`：折叠行需要额外两个统计量，
+    而 `from_row` 要多读两列，继承会让「上下文列」与「投影列」的映射变模糊。
+    """
+    latest: MailSummary
+    total: int = 1
+    unread: int = 0
+
+    @property
+    def thread_key(self) -> str:
+        return self.latest.thread_key or self.latest.id
+
+    @property
+    def id(self) -> str:
+        return self.latest.id
+
+    @property
+    def is_read(self) -> bool:
+        return self.unread == 0
+
+    @classmethod
+    def from_row(cls, row: dict) -> ThreadSummary:
+        return cls(
+            latest=MailSummary.from_row(row),
+            total=int(row.get("_total") or 1),
+            unread=int(row.get("_unread") or 0),
+        )
+
+
+@dataclass
+class PendingFlag:
+    """一条待回写服务器的「标已读 / 星标」变更（离线队列）。"""
+    id: str
+    account_id: str
+    folder: str
+    uid: str
+    add_flags: list[str] = field(default_factory=list)
+    remove_flags: list[str] = field(default_factory=list)
+    created_at: str = ""
+
+    @classmethod
+    def from_row(cls, row: dict) -> PendingFlag:
+        return cls(
+            id=row["id"],
+            account_id=row["account_id"],
+            folder=row.get("folder") or "INBOX",
+            uid=str(row["uid"]),
+            add_flags=_load_str_list(row.get("add_flags")),
+            remove_flags=_load_str_list(row.get("remove_flags")),
+            created_at=row.get("created_at") or "",
+        )
 
 
 @dataclass
@@ -265,6 +370,11 @@ class NormalizedMail:
     preview: str = ""
     attachments: list[AttachmentMeta] = field(default_factory=list)
     raw_size: int = 0
+    # 会话归并（解析层产出）：References / In-Reply-To 里的 message-id 列表，
+    # 以及算好的归并键。三者都缺失时 `thread_key` 为空，由落库侧用 mail_id 兜底。
+    references: list[str] = field(default_factory=list)
+    in_reply_to: list[str] = field(default_factory=list)
+    thread_key: str = ""
 
 
 @dataclass

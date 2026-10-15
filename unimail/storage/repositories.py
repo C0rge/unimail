@@ -16,8 +16,12 @@ from ..core.models import (
     MailFilter,
     MailSummary,
     NormalizedMail,
+    ThreadSummary,
+    load_str_list,
+    make_preview,
     new_id,
 )
+from ..core.textsearch import fts_eligible, match_query
 
 
 def utcnow_iso() -> str:
@@ -294,8 +298,9 @@ class MailRepository:
                 """INSERT INTO mails
                    (id, account_id, platform, folder, uid, uid_validity, message_id,
                     subject, from_name, from_addr, to_addrs, date, preview, body_text,
-                    body_html, has_attachments, is_read, is_starred, raw_size, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    body_html, has_attachments, is_read, is_starred, raw_size,
+                    ref_ids, in_reply_to, thread_key, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     mail_id, account_id, platform, mail.folder, mail.uid,
                     int(uid_validity or 0),
@@ -303,7 +308,13 @@ class MailRepository:
                     json.dumps(mail.to_addrs, ensure_ascii=False),
                     (mail.date or datetime.now(timezone.utc)).isoformat(),
                     mail.preview, mail.body_text, mail.body_html,
-                    1 if mail.attachments else 0, 0, 0, mail.raw_size, utcnow_iso(),
+                    1 if mail.attachments else 0, 0, 0, mail.raw_size,
+                    json.dumps(mail.references, ensure_ascii=False),
+                    json.dumps(mail.in_reply_to, ensure_ascii=False),
+                    # 无任何引用线索时用 mail_id 兜底：不能留空——空值会让所有
+                    # 「没有引用头」的邮件在会话视图里被并成同一个巨大会话。
+                    mail.thread_key or mail_id,
+                    utcnow_iso(),
                 ),
             )
             for att in mail.attachments:
@@ -355,7 +366,11 @@ class MailRepository:
                 json.dumps(mail.to_addrs, ensure_ascii=False),
                 (mail.date or datetime.now(timezone.utc)).isoformat(),
                 mail.preview, mail.body_text, mail.body_html,
-                1 if mail.attachments else 0, 0, 0, mail.raw_size, now,
+                1 if mail.attachments else 0, 0, 0, mail.raw_size,
+                json.dumps(mail.references, ensure_ascii=False),
+                json.dumps(mail.in_reply_to, ensure_ascii=False),
+                mail.thread_key or mail_id,
+                now,
             ))
             for att in mail.attachments:
                 attach_rows.append(
@@ -373,8 +388,9 @@ class MailRepository:
                 """INSERT OR IGNORE INTO mails
                    (id, account_id, platform, folder, uid, uid_validity, message_id,
                     subject, from_name, from_addr, to_addrs, date, preview, body_text,
-                    body_html, has_attachments, is_read, is_starred, raw_size, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    body_html, has_attachments, is_read, is_starred, raw_size,
+                    ref_ids, in_reply_to, thread_key, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 mail_rows,
             )
             # INSERT OR IGNORE 命中唯一键时静默跳过。这里用 total_changes 的增量
@@ -420,20 +436,28 @@ class MailRepository:
         return landed
 
     def update_bodies_batch(self, rows: list[tuple[str, str, str]]) -> int:
-        """批量回填正文：rows = [(mail_id, body_text, body_html), …]。"""
+        """批量回填正文：rows = [(mail_id, body_text, body_html), …]。
+
+        一并刷新 `preview`：它是列表摘要与全文检索的依据之一，正文到了却不更新，
+        列表里这封邮件就永远没有摘要，索引里也留着过期摘要。
+        `NULLIF(?, '')` 保证正文为空时**不清掉**已有预览。
+        """
         if not rows:
             return 0
         with self.db.transaction() as conn:
             conn.executemany(
-                "UPDATE mails SET body_text = ?, body_html = ? WHERE id = ?",
-                [(text, html, mail_id) for mail_id, text, html in rows],
+                "UPDATE mails SET body_text = ?, body_html = ?, "
+                "preview = COALESCE(NULLIF(?, ''), preview) WHERE id = ?",
+                [(text, html, make_preview(text), mail_id)
+                 for mail_id, text, html in rows],
             )
         return len(rows)
 
     def update_body(self, mail_id: str, body_text: str, body_html: str) -> None:
         self.db.execute(
-            "UPDATE mails SET body_text = ?, body_html = ? WHERE id = ?",
-            (body_text, body_html, mail_id),
+            "UPDATE mails SET body_text = ?, body_html = ?, "
+            "preview = COALESCE(NULLIF(?, ''), preview) WHERE id = ?",
+            (body_text, body_html, make_preview(body_text), mail_id),
         )
 
     def replace_attachments(self, mail_id: str,
@@ -569,34 +593,152 @@ class MailRepository:
             (attachment_id,),
         )
 
-    def _select_sql(self, flt: MailFilter, cols: str) -> tuple[str, list]:
-        """拼接筛选 SQL。列名由调用方以**常量**传入（MAIL_SUMMARY_COLUMNS / "*"），
-        条件值一律走占位符——SQLite 不支持参数化标识符，这是唯一写法。"""
-        sql = [f"SELECT {cols} FROM mails WHERE 1=1"]  # noqa: S608
+    def mail_context(self, mail_id: str) -> dict | None:
+        """取邮件的同步元信息（重连 IMAP 时需要 account / folder / uid）。"""
+        return self.db.query_one(
+            "SELECT account_id, platform, folder, uid FROM mails WHERE id = ?",
+            (mail_id,),
+        )
+
+    def body_fetch_info(self, mail_id: str) -> dict | None:
+        """正文补拉需要的全部信息 + 是否已有正文（一次查询给出）。
+
+        收敛到仓储层的原因：正文池（`BodyFetchPool`）此前直接拿
+        `mails.db.query_one(...)` 写裸 SQL——同一张表的投影散落在两层里，
+        表结构一变（比如加列、改列名）就会漏改。这里合并成一次往返，
+        同时回答「该不该拉」与「往哪拉」。
+        """
+        return self.db.query_one(
+            "SELECT account_id, platform, folder, uid,"
+            " (body_text IS NOT NULL AND body_text != '') OR"
+            " (body_html IS NOT NULL AND body_html != '') AS has_body"
+            " FROM mails WHERE id = ?",
+            (mail_id,),
+        )
+
+    def ids_unread(self, account_id: str | None = None,
+                   limit: int = 5000) -> list[str]:
+        """未读邮件的 id 列表。
+
+        「全部标记为已读」需要逐封把 `\\Seen` 回写服务器，因此必须先知道
+        究竟改了哪些。上限用于防止一次操作生成几十万条待回写记录。
+        """
+        if account_id:
+            rows = self.db.query_all(
+                "SELECT id FROM mails WHERE is_read = 0 AND account_id = ? LIMIT ?",
+                (account_id, limit),
+            )
+        else:
+            rows = self.db.query_all(
+                "SELECT id FROM mails WHERE is_read = 0 LIMIT ?", (limit,))
+        return [r["id"] for r in rows]
+
+    def set_read_many(self, mail_ids: list[str], is_read: bool) -> int:
+        if not mail_ids:
+            return 0
+        with self.db.transaction() as conn:
+            conn.executemany(
+                "UPDATE mails SET is_read = ? WHERE id = ?",
+                [(1 if is_read else 0, mid) for mid in mail_ids],
+            )
+        return len(mail_ids)
+
+    def set_starred_many(self, mail_ids: list[str], starred: bool) -> int:
+        if not mail_ids:
+            return 0
+        with self.db.transaction() as conn:
+            conn.executemany(
+                "UPDATE mails SET is_starred = ? WHERE id = ?",
+                [(1 if starred else 0, mid) for mid in mail_ids],
+            )
+        return len(mail_ids)
+
+    def delete_many(self, mail_ids: list[str]) -> list[str]:
+        """批量删除本地副本，返回需要一并清理的附件文件路径。"""
+        if not mail_ids:
+            return []
+        stale: list[str] = []
+        for mid in mail_ids:
+            stale.extend(self.stored_paths_of_mail(mid))
+        with self.db.transaction() as conn:
+            conn.executemany("DELETE FROM mails WHERE id = ?",
+                             [(mid,) for mid in mail_ids])
+        return stale
+
+    def _select_sql(self, flt: MailFilter, cols: str, *,
+                    order: str = "date") -> tuple[str, list]:
+        """拼接完整筛选 SQL（含 ORDER BY / LIMIT）。
+
+        关键词有两种实现：
+          * 全文索引可用 → 走 FTS5 的 `MATCH`（能命中索引，无命中场景快约三个数量级）
+          * 不可用 / 关键词没有可检索词元 → 回退 `LIKE`（功能不缺失，只是更慢）
+
+        `order` 为 `"rank"` 时按相关度排序（只对 FTS 路径有意义）。
+        """
+        sql, params, use_fts = self._base_sql(flt, cols)
+        if use_fts and order == "rank":
+            return sql + " ORDER BY rank LIMIT ?", [*params, flt.limit]
+        return sql + " ORDER BY m.date DESC LIMIT ?", [*params, flt.limit]
+
+    @staticmethod
+    def _project(cols: str, alias: str) -> str:
+        """给投影列加表别名前缀。
+
+        全文检索路径要 join `mails_fts`，而它也有 `subject`/`from_name`/
+        `preview`/`body_text` 这些同名列，不加前缀会 ambiguous。
+        """
+        if cols.strip() == "*":
+            return f"{alias}.*"
+        return ", ".join(f"{alias}.{c.strip()}" for c in cols.split(","))
+
+    def _common_filters(self, flt: MailFilter, alias: str) -> tuple[list[str], list]:
+        """非关键词的筛选条件（两条检索路径、列表与会话视图共用）。"""
+        sql: list[str] = []
         params: list = []
         if flt.account_id:
-            sql.append("AND account_id = ?")
+            sql.append(f"AND {alias}.account_id = ?")
             params.append(flt.account_id)
         if flt.platform:
-            sql.append("AND platform = ?")
+            sql.append(f"AND {alias}.platform = ?")
             params.append(flt.platform)
-        if flt.keyword:
-            sql.append("AND (subject LIKE ? ESCAPE '\\' OR from_addr LIKE ? ESCAPE '\\' "
-                       "OR from_name LIKE ? ESCAPE '\\' OR preview LIKE ? ESCAPE '\\' "
-                       "OR body_text LIKE ? ESCAPE '\\')")
-            kw = f"%{escape_like(flt.keyword)}%"
-            params.extend([kw] * 5)
         if flt.date_from:
-            sql.append("AND date >= ?")
+            sql.append(f"AND {alias}.date >= ?")
             params.append(flt.date_from.isoformat())
         if flt.date_to:
-            sql.append("AND date <= ?")
+            sql.append(f"AND {alias}.date <= ?")
             params.append(flt.date_to.isoformat())
         if flt.unread_only:
-            sql.append("AND is_read = 0")
-        sql.append("ORDER BY date DESC LIMIT ?")
-        params.append(flt.limit)
-        return " ".join(sql), params
+            sql.append(f"AND {alias}.is_read = 0")
+        return sql, params
+
+    def _base_sql(self, flt: MailFilter, cols: str) -> tuple[str, list, bool]:
+        """`SELECT … WHERE …`（不含 ORDER BY / LIMIT）。
+
+        返回 `(sql, params, 是否走了全文索引)`。统一用别名 `m` 引用 mails，
+        这样全文路径 join 进来时列名不冲突，也便于被会话视图的 CTE 复用。
+        """
+        params: list = []
+        use_fts = bool(flt.keyword and self.db.fts_available
+                       and fts_eligible(flt.keyword) and match_query(flt.keyword))
+        if use_fts:
+            sql = [f"SELECT {self._project(cols, 'm')} FROM mails m "  # noqa: S608
+                   "JOIN mails_fts f ON f.rowid = m.rowid "
+                   "WHERE mails_fts MATCH ?"]
+            params.append(match_query(flt.keyword))
+        else:
+            sql = [f"SELECT {self._project(cols, 'm')} FROM mails m WHERE 1=1"]  # noqa: S608
+            if flt.keyword:
+                sql.append(
+                    "AND (m.subject LIKE ? ESCAPE '\\' OR m.from_addr LIKE ? ESCAPE '\\' "
+                    "OR m.from_name LIKE ? ESCAPE '\\' OR m.preview LIKE ? ESCAPE '\\' "
+                    "OR m.body_text LIKE ? ESCAPE '\\')"
+                )
+                kw = f"%{escape_like(flt.keyword)}%"
+                params.extend([kw] * 5)
+        extra, extra_params = self._common_filters(flt, "m")
+        sql.extend(extra)
+        params.extend(extra_params)
+        return " ".join(sql), params, use_fts
 
     def query(self, flt: MailFilter) -> list[Mail]:
         """完整查询（含正文）。零散场景用；列表渲染请用 `query_summaries()`。"""
@@ -604,15 +746,109 @@ class MailRepository:
         rows = self.db.query_all(sql, params)
         return [Mail.from_row(r) for r in rows]
 
-    def query_summaries(self, flt: MailFilter) -> list[MailSummary]:
+    def query_summaries(self, flt: MailFilter, *,
+                        order: str = "date") -> list[MailSummary]:
         """列表专用查询：只投影渲染需要的列，**不取 body_text / body_html**。
 
         正文单封可达上百 KB，列表一次 300 行时仅正文就是数十 MB。
         投影后列表常驻内存下降一个数量级，筛选与滚动不再触发大对象 GC 抖动。
         """
-        sql, params = self._select_sql(flt, ", ".join(MAIL_SUMMARY_COLUMNS))
+        sql, params = self._select_sql(
+            flt, ", ".join(MAIL_SUMMARY_COLUMNS), order=order
+        )
         rows = self.db.query_all(sql, params)
         return [MailSummary.from_row(r) for r in rows]
+
+    def summary_by_id(self, mail_id: str) -> MailSummary | None:
+        """按 id 取列表投影（增量插入新邮件时用）。"""
+        cols = ", ".join(f"m.{c}" for c in MAIL_SUMMARY_COLUMNS)
+        row = self.db.query_one(
+            f"SELECT {cols} FROM mails m WHERE m.id = ?",  # noqa: S608
+            (mail_id,),
+        )
+        return MailSummary.from_row(row) if row else None
+
+    def summaries_by_ids(self, mail_ids: list[str]) -> list[MailSummary]:
+        """按 id 批量取投影，**保持传入顺序**。
+
+        顺序很关键：增量插入到日期倒序的列表时，若按库返回顺序插入，
+        行位置会与「重新整表查询」的结果不一致。
+        """
+        if not mail_ids:
+            return []
+        cols = ", ".join(f"m.{c}" for c in MAIL_SUMMARY_COLUMNS)
+        found: dict[str, MailSummary] = {}
+        # SQLite 的变量上限默认 999，分批查询以兼容极端情况
+        for start in range(0, len(mail_ids), 500):
+            chunk = mail_ids[start:start + 500]
+            marks = ", ".join("?" * len(chunk))
+            rows = self.db.query_all(
+                f"SELECT {cols} FROM mails m WHERE m.id IN ({marks})",  # noqa: S608
+                chunk,
+            )
+            for row in rows:
+                summary = MailSummary.from_row(row)
+                found[summary.id] = summary
+        return [found[mid] for mid in mail_ids if mid in found]
+
+    def thread_summaries(self, flt: MailFilter) -> list[ThreadSummary]:
+        """按 `thread_key` 归并的会话列表。
+
+        「每组取最新一封 + 组内总数/未读数」全部交给窗口函数在**数据库里**完成。
+        若先取回全部投影再在 Python 里分组，2 万封邮件会先物化 2 万行，
+        与「列表只取几百行」的初衷完全相悖。
+
+        `_rn = 1` 取的是组内最新一封（`ORDER BY date DESC`），它既是折叠态的
+        展示行，也是排序依据。
+        """
+        inner, params, _use_fts = self._base_sql(
+            flt, ", ".join(MAIL_SUMMARY_COLUMNS)
+        )
+        projected = ", ".join(MAIL_SUMMARY_COLUMNS)
+        sql = (
+            "WITH filtered AS (" + inner + "), "  # noqa: S608
+            "ranked AS (SELECT filtered.*, "
+            "ROW_NUMBER() OVER (PARTITION BY thread_key ORDER BY date DESC) AS _rn, "
+            "COUNT(*) OVER (PARTITION BY thread_key) AS _total, "
+            "SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) "
+            "OVER (PARTITION BY thread_key) AS _unread "
+            "FROM filtered) "
+            f"SELECT {projected}, _total, _unread FROM ranked WHERE _rn = 1 "
+            "ORDER BY date DESC LIMIT ?"
+        )
+        rows = self.db.query_all(sql, [*params, flt.limit])
+        return [ThreadSummary.from_row(r) for r in rows]
+
+    def mails_in_thread(self, thread_key: str,
+                        limit: int = 100) -> list[MailSummary]:
+        """会话内的全部邮件（按时间升序，符合阅读顺序）。"""
+        cols = ", ".join(f"m.{c}" for c in MAIL_SUMMARY_COLUMNS)
+        rows = self.db.query_all(
+            f"SELECT {cols} FROM mails m WHERE m.thread_key = ? "  # noqa: S608
+            "ORDER BY m.date ASC LIMIT ?",
+            (thread_key, limit),
+        )
+        return [MailSummary.from_row(r) for r in rows]
+
+    def count_search(self, flt: MailFilter) -> int | None:
+        """关键词命中的**总数**（不受 `limit` 限制，用于「共 N 条结果」）。
+
+        只有 FTS 路径才给得出精确总数：`LIKE` 路径要数全就得整表扫一遍，
+        那与列表查询的代价重复，因此返回 `None` 让调用方不显示总数。
+        """
+        if not (flt.keyword and self.db.fts_available
+                and fts_eligible(flt.keyword)):
+            return None
+        mq = match_query(flt.keyword)
+        if not mq:
+            return None
+        sql = ["SELECT COUNT(*) FROM mails m "
+               "JOIN mails_fts f ON f.rowid = m.rowid WHERE mails_fts MATCH ?"]
+        params: list = [mq]
+        extra, extra_params = self._common_filters(flt, "m")
+        sql.extend(extra)
+        params.extend(extra_params)
+        return int(self.db.scalar(" ".join(sql), params) or 0)
 
     def count_by_account(self) -> dict[str, tuple[int, int]]:
         """返回 {account_id: (total, unread)}，用覆盖索引避免读表页。
@@ -662,3 +898,114 @@ class AttachmentRepository:
     def get(self, attachment_id: str) -> Attachment | None:
         row = self.db.query_one("SELECT * FROM attachments WHERE id = ?", (attachment_id,))
         return Attachment.from_row(row) if row else None
+
+    def by_content_id(self, mail_id: str, content_id: str) -> Attachment | None:
+        """按 `Content-ID` 找内嵌资源（正文里的 `cid:` 图片指向它）。
+
+        比较时统一去掉尖括号并小写：邮件里的写法五花八门
+        （`<abc@x>` / `abc@x` / `<ABC@X>`），精确匹配会漏掉一大批。
+        """
+        if not content_id:
+            return None
+        row = self.db.query_one(
+            "SELECT * FROM attachments WHERE mail_id = ? "
+            "AND LOWER(REPLACE(REPLACE(content_id, '<', ''), '>', '')) = ? "
+            "LIMIT 1",
+            (mail_id, content_id.strip().strip("<>").lower()),
+        )
+        return Attachment.from_row(row) if row else None
+
+    def inline_of_mail(self, mail_id: str) -> list[Attachment]:
+        """该邮件里所有带 Content-ID 的内嵌资源。"""
+        rows = self.db.query_all(
+            "SELECT * FROM attachments WHERE mail_id = ? "
+            "AND content_id IS NOT NULL AND content_id != ''",
+            (mail_id,),
+        )
+        return [Attachment.from_row(r) for r in rows]
+
+
+class PendingFlagRepository:
+    """待回写服务器的标记变更队列。
+
+    入队时的合并规则：同一 (account, folder, uid) 只保留一条，
+    新动作在已有基础上**叠加/抵消**——否则反复点「已读/未读」会堆出一串
+    相互矛盾的指令，按顺序全部执行既浪费往返，也可能以中间态收场。
+    """
+
+    def __init__(self, db) -> None:
+        self.db = db
+
+    def add(self, account_id: str, folder: str, uid: str,
+            add: list[str] | tuple[str, ...] = (),
+            remove: list[str] | tuple[str, ...] = ()) -> None:
+        add_set = {f for f in add if f}
+        remove_set = {f for f in remove if f}
+        # 同一次调用里对同一标志既加又删 = 自相矛盾，视为没点这个标志。
+        # 两个集合都要减掉，否则 `remove` 会被原样写进队列，
+        # 「加回来再删掉」反而变成一条真实的删除指令。
+        both = add_set & remove_set
+        if both:
+            add_set -= both
+            remove_set -= both
+        if not add_set and not remove_set:
+            return
+        existing = self.db.query_one(
+            "SELECT * FROM pending_flags WHERE account_id = ? AND folder = ? AND uid = ?",
+            (account_id, folder or "INBOX", str(uid)),
+        )
+        if existing:
+            row = dict(existing)
+            merged_add = set(load_str_list(row.get("add_flags")))
+            merged_remove = set(load_str_list(row.get("remove_flags")))
+            # 新动作覆盖相反方向的旧动作
+            merged_add = (merged_add | add_set) - remove_set
+            merged_remove = (merged_remove | remove_set) - add_set
+            merged_add -= merged_remove
+            merged_remove -= merged_add
+            if not merged_add and not merged_remove:
+                self.db.execute("DELETE FROM pending_flags WHERE id = ?", (row["id"],))
+                return
+            self.db.execute(
+                "UPDATE pending_flags SET add_flags = ?, remove_flags = ? WHERE id = ?",
+                (json.dumps(sorted(merged_add)), json.dumps(sorted(merged_remove)),
+                 row["id"]),
+            )
+            return
+        self.db.execute(
+            "INSERT INTO pending_flags"
+            "(id, account_id, folder, uid, add_flags, remove_flags, created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (new_id(), account_id, folder or "INBOX", str(uid),
+             json.dumps(sorted(add_set)), json.dumps(sorted(remove_set)), utcnow_iso()),
+        )
+
+    def list_for_account(self, account_id: str, limit: int = 200) -> list[dict]:
+        rows = self.db.query_all(
+            "SELECT * FROM pending_flags WHERE account_id = ? "
+            "ORDER BY created_at ASC LIMIT ?",
+            (account_id, limit),
+        )
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["add_flags"] = load_str_list(item.get("add_flags"))
+            item["remove_flags"] = load_str_list(item.get("remove_flags"))
+            out.append(item)
+        return out
+
+    def remove(self, flag_id: str) -> None:
+        self.db.execute("DELETE FROM pending_flags WHERE id = ?", (flag_id,))
+
+    def count(self, account_id: str | None = None) -> int:
+        if account_id:
+            return int(self.db.scalar(
+                "SELECT COUNT(*) FROM pending_flags WHERE account_id = ?",
+                (account_id,)) or 0)
+        return int(self.db.scalar("SELECT COUNT(*) FROM pending_flags") or 0)
+
+    def drop_for_uid(self, account_id: str, folder: str, uid: str) -> None:
+        self.db.execute(
+            "DELETE FROM pending_flags WHERE account_id = ? AND folder = ? AND uid = ?",
+            (account_id, folder or "INBOX", str(uid)),
+        )

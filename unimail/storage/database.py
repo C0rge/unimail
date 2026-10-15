@@ -30,6 +30,7 @@ from ..config import (
     DB_VERSION,
     sqlcipher_pip_hint,
 )
+from ..core.textsearch import segment
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +132,9 @@ CREATE TABLE IF NOT EXISTS mails (
     is_read         INTEGER NOT NULL DEFAULT 0,
     is_starred      INTEGER NOT NULL DEFAULT 0,
     raw_size        INTEGER DEFAULT 0,
+    ref_ids         TEXT,
+    in_reply_to     TEXT,
+    thread_key      TEXT,
     created_at      TEXT NOT NULL,
     UNIQUE(account_id, folder, uid)
 );
@@ -145,6 +149,20 @@ CREATE TABLE IF NOT EXISTS attachments (
     content_id   TEXT,
     part_index   TEXT,
     FOREIGN KEY(mail_id) REFERENCES mails(id) ON DELETE CASCADE
+);
+
+-- 待回写服务器的标记变更（v6）。
+-- 用户点「标为已读」时本地立刻生效，同时入队一条记录；
+-- 真正推送发生在下次同步/会话可用时。网络抖动不应该让用户看到失败弹窗，
+-- 但也不该把动作丢掉——留着下次再推。
+CREATE TABLE IF NOT EXISTS pending_flags (
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL,
+    folder       TEXT NOT NULL DEFAULT 'INBOX',
+    uid          TEXT NOT NULL,
+    add_flags    TEXT,
+    remove_flags TEXT,
+    created_at   TEXT NOT NULL
 );
 """
 
@@ -166,7 +184,9 @@ CREATE INDEX IF NOT EXISTS idx_mails_read     ON mails(is_read, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_acc_read ON mails(account_id, is_read, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_folder   ON mails(account_id, folder, uid);
 CREATE INDEX IF NOT EXISTS idx_mails_validity ON mails(account_id, folder, uid_validity);
+CREATE INDEX IF NOT EXISTS idx_mails_thread   ON mails(thread_key, date DESC);
 CREATE INDEX IF NOT EXISTS idx_attach_mail    ON attachments(mail_id);
+CREATE INDEX IF NOT EXISTS idx_pending_flags  ON pending_flags(account_id, created_at);
 """
 
 # 需要重建的索引：定义已变更，`CREATE INDEX IF NOT EXISTS` 对同名旧索引无效，
@@ -174,7 +194,55 @@ CREATE INDEX IF NOT EXISTS idx_attach_mail    ON attachments(mail_id);
 REBUILT_INDEXES = {
     "idx_mails_read": "CREATE INDEX IF NOT EXISTS idx_mails_read "
                       "ON mails(is_read, date DESC)",
+    # v6：会话视图的查询是「按 thread_key 分组 + 组内按时间取最新」，
+    # 索引末尾若不是 `date DESC`，每个会话都要再做一次排序。
+    "idx_mails_thread": "CREATE INDEX IF NOT EXISTS idx_mails_thread "
+                        "ON mails(thread_key, date DESC)",
 }
+
+# ---------------------------------------------------------------- 全文索引
+# 方案标识：切分/分词策略一旦变更，旧索引不可复用，打开库时发现不一致会自动
+# 全量重建。改动 textsearch 的切分规则时必须同步改这个值。
+FTS_SCHEME = "cjk-seg-v1"
+
+# FTS5 表与同步触发器。
+#
+# 刻意**不用** external-content 模式：external-content 要求索引内容直接取自
+# `mails` 的列，而我们需要在入库时把 CJK 逐字切分（否则中文整段成一个词元），
+# 两者不可兼得——要么破坏 `mails` 里的原文（用户看到的正文会带多余空格，
+# 且 `LIKE` 兜底路径失效），要么索引里是没切分的整段（搜中文完全命中不了）。
+# 所以用**独立 FTS 表 + 触发器内调用 `seg()` 切分**：`mails` 保留原文，
+# 索引侧才切分。
+#
+# 触发器放在数据库里（而不是应用层写入时手动同步）是刻意的：只要有人写
+# `mails`，索引就跟着更新，哪怕这段代码绕过了仓储层。
+#
+# 更新触发器限定 `OF subject, from_name, preview, body_text`：标已读、加星标
+# 这类高频操作只改 `is_read`/`is_starred`，不应触发全文索引重建。
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS mails_fts USING fts5(
+    subject, from_name, preview, body_text,
+    tokenize="unicode61 remove_diacritics 2"
+);
+
+CREATE TRIGGER IF NOT EXISTS mails_fts_ai AFTER INSERT ON mails BEGIN
+    INSERT INTO mails_fts(rowid, subject, from_name, preview, body_text)
+    VALUES (new.rowid, seg(new.subject), seg(new.from_name),
+            seg(new.preview), seg(new.body_text));
+END;
+
+CREATE TRIGGER IF NOT EXISTS mails_fts_ad AFTER DELETE ON mails BEGIN
+    DELETE FROM mails_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mails_fts_au
+AFTER UPDATE OF subject, from_name, preview, body_text ON mails BEGIN
+    DELETE FROM mails_fts WHERE rowid = old.rowid;
+    INSERT INTO mails_fts(rowid, subject, from_name, preview, body_text)
+    VALUES (new.rowid, seg(new.subject), seg(new.from_name),
+            seg(new.preview), seg(new.body_text));
+END;
+"""
 
 
 class Database:
@@ -199,6 +267,8 @@ class Database:
         self._conns: list[Any] = []
         self._conns_lock = threading.Lock()
         self._closed = False
+        # 全文索引是否可用（缺 FTS5 构建时置 False，检索自动回退 LIKE）
+        self._fts = False
 
         if encrypted is None:
             encrypted = _SQLCIPHER_AVAILABLE and db_key is not None
@@ -263,6 +333,11 @@ class Database:
             conn = sqlite3.connect(str(self.path), check_same_thread=False)
             row_factory = sqlite3.Row
         conn.row_factory = row_factory
+        # FTS 触发器要调用 `seg()`，而 `create_function` 是**连接级**注册，
+        # 所以每条连接建好后立刻注册。注册失败不阻断建连：全文索引会退回不可用，
+        # 检索走 LIKE，应用其余功能不受影响。
+        with contextlib.suppress(Exception):
+            conn.create_function("seg", 1, segment, deterministic=True)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_MS)}")
@@ -302,6 +377,7 @@ class Database:
         # 列已补齐，此时创建索引才不会撞上老库缺列的 schema
         conn.executescript(INDEXES)
         conn.commit()
+        self._init_fts()
         self.set_registered_driver()
 
     def _open_error_hint(self, exc: Exception) -> str:
@@ -340,8 +416,93 @@ class Database:
                 self.execute(f"DROP INDEX IF EXISTS {name}")
             current = 4
             log.info("数据库已从 v%d 迁移到 v4（重建列表筛选相关索引）", from_version)
+        if current < 5:
+            # 会话视图所需的引用链字段。数据管道在这里一次铺好，界面层的会话归并
+            # 直接使用，将来不必再迁移一次。
+            #   ref_ids     : References 头里的 message-id 列表（JSON 数组）。
+            #                 注意列名不能叫 `references`——那是 SQLite 保留字，
+            #                 直接用作列名会 `near "references": syntax error`。
+            #   in_reply_to : In-Reply-To 里的 message-id 列表
+            #   thread_key  : 归并键 = References[0] > In-Reply-To > 自身 message-id，
+            #                 都缺失时由落库侧用 mail_id 兜底（保证唯一，不误并会话）
+            # 全文索引表与触发器由 `_init_fts()` 建立（那里有降级容错）。
+            self._add_column_if_missing("mails", "ref_ids", "TEXT")
+            self._add_column_if_missing("mails", "in_reply_to", "TEXT")
+            self._add_column_if_missing("mails", "thread_key", "TEXT")
+            # 历史行没有引用头可依，回填成自身 id —— 与落库时的兜底规则一致。
+            # 留空的话，会话视图会把所有历史邮件并成一个巨大会话。
+            self.execute(
+                "UPDATE mails SET thread_key = id "
+                "WHERE thread_key IS NULL OR thread_key = ''"
+            )
+            current = 5
+            log.info("数据库已从 v%d 迁移到 v5（会话引用链字段 + 全文索引）", from_version)
+        if current < 6:
+            # v6：待回写服务器的标记队列 + `idx_mails_thread` 改为带 date DESC。
+            # 表由 SCHEMA 的 `CREATE TABLE IF NOT EXISTS` 建立（幂等），
+            # 索引由 REBUILT_INDEXES 先 DROP 再建。
+            for name in REBUILT_INDEXES:
+                self.execute(f"DROP INDEX IF EXISTS {name}")
+            current = 6
+            log.info("数据库已从 v%d 迁移到 v6（待回写标记队列 + 会话索引）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
+
+    def _init_fts(self) -> None:
+        """建立全文索引表与同步触发器，必要时重建索引。
+
+        某些平台的 SQLCipher 构建可能没把 FTS5 编进去。这种情况下**不能**让
+        整个应用起不来——标记为不可用即可，检索会回退到 `LIKE` 匹配，
+        其余功能完全不受影响。
+        """
+        self._fts = False
+        try:
+            conn = self._conn()
+            conn.executescript(FTS_SCHEMA)
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - 任意驱动层错误都只影响检索能力
+            with contextlib.suppress(Exception):
+                self._conn().rollback()
+            log.warning("全文索引不可用，检索将回退到 LIKE 匹配：%s", exc)
+            return
+        self._fts = True
+        # 切分/分词方案变更后旧索引不可复用，必须重新切分写入
+        if self.get_meta("fts_scheme") != FTS_SCHEME:
+            try:
+                rows = self.fts_rebuild()
+                self.set_meta("fts_scheme", FTS_SCHEME)
+                log.info("全文索引已建立：%d 封（方案 %s）", rows, FTS_SCHEME)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("全文索引重建失败，本次以 LIKE 检索：%s", exc)
+                self._fts = False
+
+    @property
+    def fts_available(self) -> bool:
+        """全文索引是否可用。不可用时检索自动回退 `LIKE`，功能不缺失只是更慢。"""
+        return bool(self._fts)
+
+    def fts_rebuild(self) -> int:
+        """全量重建全文索引，返回索引行数。
+
+        索引内容必须来自 `seg()` 切分后的文本，所以只能逐列 `SELECT` 出来重写，
+        用不上 FTS5 的 `rebuild` 命令——那只是重建索引自身内部结构，不会重新
+        执行切分，方案变更后用它得不到正确结果。
+        """
+        with self.transaction():
+            self.execute("DELETE FROM mails_fts")
+            self.execute(
+                "INSERT INTO mails_fts(rowid, subject, from_name, preview, body_text) "
+                "SELECT rowid, seg(subject), seg(from_name), seg(preview), seg(body_text) "
+                "FROM mails"
+            )
+        return int(self.scalar("SELECT COUNT(*) FROM mails_fts") or 0)
+
+    def fts_stats(self) -> tuple[int, int]:
+        """返回 ``(mails 行数, 索引行数)``，两者不等说明索引与内容表脱节。"""
+        return (
+            int(self.scalar("SELECT COUNT(*) FROM mails") or 0),
+            int(self.scalar("SELECT COUNT(*) FROM mails_fts") or 0),
+        )
 
     def _add_column_if_missing(self, table: str, column: str, coltype: str) -> None:
         cols = {r["name"] for r in self.query_all(f"PRAGMA table_info({table})")}

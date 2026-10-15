@@ -22,6 +22,16 @@
    19. KDF 算法与密码策略（v1.3.0）
    20. KDF 渐进升级（v1.3.0）
    21. 解锁退避持久化（v1.3.0）
+   22. 恶意 MIME 语料：13 条畸形报文全部安全解析（v1.3.0）
+   23. 关键路径中断注入：事务 / 附件落盘 / 侧车 / 加密迁移（v1.3.0）
+   24. 全文检索：FTS5 + CJK 切分、触发器同步、LIKE 回退、注入安全（v1.4.0）
+   25. 会话引用链：References / In-Reply-To 解析与归并键兜底（v1.4.0）
+   26. 事件总线带负载：id 列表驱动增量插入（v1.4.0）
+   27. 待回写标记队列：增删抵消 / 合并 / 开关生效（v1.5.0）
+   28. 导出 eml / mbox / CSV：mboxo 转义、BOM、可被标准库解析（v1.5.0）
+   29. 界面偏好持久化：白名单、越界回落、损坏文件容错（v1.4.0）
+   30. 设备绑定免密解锁：DPAPI/Keychain 往返 + 密文损坏检测（v1.6.0）
+   31. UI 层：设计令牌、图标、模型增量、多选 J/K、任务面板、锁屏遮罩（v1.4.0–v1.6.0）
 
 运行：python tests/smoke.py
 """
@@ -64,6 +74,25 @@ def setup_env(prefix: str):
     ctxmod.DB_PATH = cfg.DB_PATH
     svcmod.ATTACHMENT_DIR = cfg.ATTACHMENT_DIR
     return tmp, cfg, ctxmod, svcmod
+
+
+@contextlib.contextmanager
+def _fake_server(adapter, svcmod=None):
+    """把服务层与会话池里的适配器**一起**替换为测试替身。
+
+    v1.5.0 起附件下载 / 正文补拉走 `SessionPool` 的保活连接，而会话池在
+    `unimail.sync.session` 里解析适配器（这是刻意的解耦：core 层不能
+    反向依赖 sync 层）。因此只 patch 服务层已经不够——连接会照样真连出去。
+    """
+    from unittest.mock import patch as _patch
+
+    import unimail.core.services as _svc
+    import unimail.sync.session as sessmod
+    import unimail.sync.worker as workermod
+    with _patch.object(svcmod or _svc, "get_adapter", return_value=adapter), \
+            _patch.object(sessmod, "get_adapter", return_value=adapter), \
+            _patch.object(workermod, "get_adapter", return_value=adapter):
+        yield adapter
 
 
 # ============================================================ 1. 安全层
@@ -344,7 +373,7 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
     fake.fetch_attachment.return_value = FAKE_PDF
     fake.disconnect = lambda x: None
 
-    with patch.object(svcmod, "get_adapter", return_value=fake):
+    with _fake_server(fake, svcmod):
         result = ctx.mails.download_attachment(atts[0].id)
 
     path = result.path
@@ -358,7 +387,7 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
     check("FETCH 使用正确 UID", str(call[1]) == "200", f"实际 {call[1]!r}")
 
     fake.fetch_attachment.reset_mock()
-    with patch.object(svcmod, "get_adapter", return_value=fake):
+    with _fake_server(fake, svcmod):
         result2 = ctx.mails.download_attachment(atts[0].id)
     check("二次下载命中缓存", fake.fetch_attachment.call_count == 0)
     check("两次返回同一路径", result2.path == path)
@@ -422,6 +451,20 @@ def test_migration():
     check(f"db_version 升到 {DB_VERSION}", db.get_meta("db_version") == str(DB_VERSION),
           f"实际 {db.get_meta('db_version')}")
 
+    # ---- v5：会话引用链字段 + 全文索引
+    for col in ("ref_ids", "in_reply_to", "thread_key"):
+        check(f"迁移后新增 mails.{col} 列", col in mail_cols, f"实际列: {sorted(mail_cols)}")
+    check("历史行的 thread_key 回填为自身 id（避免并成一个巨大会话）",
+          db.query_one("SELECT thread_key FROM mails WHERE id = 'm1'")["thread_key"] == "m1")
+    check("迁移后全文索引可用", db.fts_available)
+    # 用占位符传参而不是把引号塞进 SQL 字符串里：f-string 里带反斜杠转义在
+    # Python 3.10 上是语法错误（3.12 才放开），CI 的 py3.10 会直接编译失败。
+    fts_hits = int(db.scalar(
+        "SELECT COUNT(*) FROM mails_fts WHERE mails_fts MATCH ?", ('"hi"',)) or 0)
+    check("迁移时已为历史邮件建好索引（能检索到迁移前的邮件）", fts_hits == 1,
+          f"命中 {fts_hits}")
+    check("索引行数与邮件行数一致", db.fts_stats() == (1, 1), f"实际 {db.fts_stats()}")
+
     # v4 重建了 idx_mails_read（单列 → (is_read, date DESC)）。`CREATE INDEX
     # IF NOT EXISTS` 对同名旧索引无效，必须 DROP 后再建，否则老库永远沿用旧定义。
     read_idx = db.query_one(
@@ -435,6 +478,11 @@ def test_migration():
     db2 = Database(cfg.DB_PATH, None)
     check("重复迁移幂等", "uid_validity" in
           {r["name"] for r in db2.query_all("PRAGMA table_info(mails)")})
+    # 重复打开不应重复迁移，也不应破坏全文索引
+    check("重复打开后版本不变且索引仍可用",
+          db2.get_meta("db_version") == str(DB_VERSION) and db2.fts_available
+          and db2.fts_stats() == (1, 1),
+          f"实际 {db2.get_meta('db_version')} / {db2.fts_stats()}")
     db2.close()
 
 
@@ -1281,7 +1329,7 @@ def test_attachment_safety_policy():
 
     bom = _add(1, "bom.exe", 1024)
     att = ctx.mails.mails.attachments_of(bom)[0]
-    with patch.object(svcmod, "get_adapter", return_value=fake):
+    with _fake_server(fake, svcmod):
         res = ctx.mails.download_attachment(att.id)
     check("危险扩展名不还原为可执行后缀",
           res.path.name.endswith(".exe.download"), f"实际 {res.path.name}")
@@ -1305,7 +1353,7 @@ def test_attachment_safety_policy():
     att_big = ctx.mails.mails.attachments_of(big)[0]
     fake.connect.reset_mock()
     try:
-        with patch.object(svcmod, "get_adapter", return_value=fake):
+        with _fake_server(fake, svcmod):
             ctx.mails.download_attachment(att_big.id)
         check("超过单文件上限时拒绝下载", False, "竟然下载了")
     except ValueError as exc:
@@ -1320,7 +1368,7 @@ def test_attachment_safety_policy():
 
     keep = _add(3, "doc.pdf", 10)
     att_keep = ctx.mails.mails.attachments_of(keep)[0]
-    with patch.object(svcmod, "get_adapter", return_value=fake):
+    with _fake_server(fake, svcmod):
         res3 = ctx.mails.download_attachment(att_keep.id)
     check("普通扩展名保持原样", res3.path.name.endswith("doc.pdf") and not res3.renamed,
           f"实际 {res3.path.name}")
@@ -1841,6 +1889,714 @@ def _assert_migration_failure_keeps_source() -> None:
     check("中断后磁盘上的原库文件仍是可读的明文库", int(rows) == 3, f"实际 {rows}")
 
 
+# ============================================================ 21. 全文检索
+def test_fulltext_search():
+    """FTS5 全文索引：CJK 切分、触发器同步、LIKE 回退与注入安全。"""
+    from datetime import datetime, timezone
+
+    from unimail.core.models import MailFilter, NormalizedMail
+    from unimail.core.textsearch import fts_eligible, match_query, segment
+    from unimail.storage import Database, MailRepository
+
+    _tmp, cfg, _ctx, _svc = setup_env("fts_")
+    db = Database(cfg.DB_PATH, None, encrypted=False)
+    mails = MailRepository(db)
+
+    check("新库自动建立全文索引", db.fts_available)
+
+    now = datetime.now(timezone.utc)
+
+    def mk(uid, subject, body):
+        return NormalizedMail(uid=uid, subject=subject, body_text=body,
+                              preview=body[:80], date=now)
+
+    res = mails.insert_mails_batch("acc1", "qq", [
+        mk("1", "项目进度更新", "关于下周会议安排的通知，请查收附件。"),
+        mk("2", "Quarterly report", "Please review the attached report."),
+        mk("3", "全角测试", "ＡＢＣ １２３ 全角字母数字"),
+        mk("4", "无关邮件", "今天天气不错。"),
+    ], uid_validity=1)
+    check("批量写入 4 封", len(res.inserted) == 4)
+    check("触发器已同步索引行数", db.fts_stats() == (4, 4), f"实际 {db.fts_stats()}")
+
+    def hits(kw):
+        return [m.subject for m in mails.query_summaries(MailFilter(keyword=kw, limit=100))]
+
+    check("中文 2 字检索命中", "项目进度更新" in hits("会议"), f"命中 {hits('会议')}")
+    check("中文 4 字检索命中", "项目进度更新" in hits("会议安排"))
+    check("中文跨词连续子串命中", "项目进度更新" in hits("项目进"))
+    check("词序反例：搜「议会」不命中「会议」", hits("议会") == [], f"命中 {hits('议会')}")
+    check("英文检索命中", "Quarterly report" in hits("report"))
+    check("英文大小写不敏感", "Quarterly report" in hits("REPORT"))
+    check("全角字母经 NFKC 命中", "全角测试" in hits("ABC"))
+    check("全角数字经 NFKC 命中", "全角测试" in hits("123"))
+    check("未出现的词不命中", hits("锌镉锑") == [])
+    check("多词 AND：无邮件同时含两词则不命中", hits("会议 天气") == [])
+
+    check("给出关键词命中总数", mails.count_search(MailFilter(keyword="会议")) == 1,
+          f"实际 {mails.count_search(MailFilter(keyword='会议'))}")
+
+    # ---- 更新正文 → 索引跟随
+    mails.update_body(res.inserted[0][1], "改成了完全不同的内容", "")
+    check("更新正文后旧词不再命中", "项目进度更新" not in hits("会议"))
+    check("更新正文后新词可命中", "项目进度更新" in hits("完全不同的内容"),
+          f"命中 {hits('完全不同的内容')}")
+    check("更新正文后预览也同步刷新（列表摘要不再是空的）",
+          bool((mails.get(res.inserted[0][1]).preview or "").strip()),
+          f"实际 {mails.get(res.inserted[0][1]).preview!r}")
+
+    # ---- 标已读 / 加星标不应触发索引重建（触发器限定 UPDATE OF 这几个列）
+    mails.set_read(res.inserted[1][1], True)
+    mails.set_starred(res.inserted[1][1], True)
+    check("标已读/加星标后仍可检索", "Quarterly report" in hits("report"))
+    check("标已读/加星标不改变索引行数", db.fts_stats() == (4, 4),
+          f"实际 {db.fts_stats()}")
+
+    # ---- 删除 → 索引跟随
+    mails.delete(res.inserted[3][1])
+    check("删除后索引行数跟进", db.fts_stats() == (3, 3), f"实际 {db.fts_stats()}")
+    check("已删除邮件不再命中", "无关邮件" not in hits("天气"))
+
+    # ---- 含标点的关键词回退 LIKE：语义与历史行为一致
+    check("含标点的关键词不走全文索引",
+          not fts_eligible("a_b") and not fts_eligible("%") and not fts_eligible("a-b"))
+    check("纯字母数字 / CJK / 空格可走全文索引",
+          fts_eligible("report") and fts_eligible("会议 纪要") and fts_eligible("API 文档"))
+    check("纯空白不可检索", not fts_eligible("   "))
+
+    # ---- 注入尝试：一律当普通文本，不抛异常、不匹配全库
+    for evil in ['" OR 1=1', "*", "NEAR", "(", ")", ":", "^", "a NEAR b"]:
+        got = hits(evil)
+        check(f"注入尝试被安全处理 {evil!r}",
+              all("无关" not in s for s in got), f"命中 {got}")
+
+    # ---- 索引重建
+    before = db.fts_stats()
+    rebuilt = db.fts_rebuild()
+    check("索引可全量重建且行数一致", rebuilt == before[0] == db.fts_stats()[1],
+          f"重建 {rebuilt} / 重建前 {before}")
+    check("重建后仍可检索", "Quarterly report" in hits("report"))
+
+    # ---- 切分与匹配式
+    check("CJK 逐字切分", " ".join(segment("会议").split()) == "会 议",
+          f"实际 {segment('会议')!r}")
+    check("NFKC 归一全角字母", segment("ＡＢＣ") == "ABC")
+    check("切分对 None 安全返回空串", segment(None) == "")
+    check("匹配式把中文词包成短语", match_query("会议") == '"会 议"',
+          f"实际 {match_query('会议')!r}")
+    check("多词用 AND 连接", match_query("会议 纪要") == '"会 议" AND "纪 要"',
+          f"实际 {match_query('会议 纪要')!r}")
+    check("引号被转义（无法闭合短语）", match_query('"') == '""""',
+          f"实际 {match_query(chr(34))!r}")
+    check("无词元时返回空串", match_query("   ") == "")
+
+    db.close()
+
+
+# ============================================================ 22. 会话引用链
+def test_thread_grouping():
+    """References / In-Reply-To 解析与会话归并键。"""
+    from datetime import datetime, timezone
+
+    from unimail.core.models import NormalizedMail
+    from unimail.platforms.parser import parse_message
+    from unimail.storage import Database, MailRepository
+
+    def raw(headers: str, body: str = "正文") -> bytes:
+        return (headers + "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+                + body).encode("utf-8")
+
+    nm = parse_message(raw(
+        "Subject: Re: 会议纪要\r\n"
+        "Message-ID: <m3@example.com>\r\n"
+        "References: <root@example.com> <m1@example.com> <m2@example.com>\r\n"
+        "In-Reply-To: <m2@example.com>\r\n"), "3")
+    check("解析出 References 里全部 message-id",
+          nm.references == ["root@example.com", "m1@example.com", "m2@example.com"],
+          f"实际 {nm.references}")
+    check("解析出 In-Reply-To", nm.in_reply_to == ["m2@example.com"],
+          f"实际 {nm.in_reply_to}")
+    check("会话键取 References 的第一个（会话根）",
+          nm.thread_key == "root@example.com", f"实际 {nm.thread_key}")
+    check("自身 message-id 已去尖括号", nm.message_id == "m3@example.com",
+          f"实际 {nm.message_id}")
+
+    nm2 = parse_message(raw("Subject: hi\r\nIn-Reply-To: <parent@example.com>\r\n"), "4")
+    check("无 References 时回落到 In-Reply-To",
+          nm2.thread_key == "parent@example.com", f"实际 {nm2.thread_key}")
+
+    nm3 = parse_message(raw("Subject: solo\r\nMessage-ID: <solo@example.com>\r\n"), "5")
+    check("无引用头时回落到自身 message-id",
+          nm3.thread_key == "solo@example.com", f"实际 {nm3.thread_key}")
+
+    nm4 = parse_message(raw("Subject: bare\r\n"), "6")
+    check("引用链全缺失时 thread_key 为空（交由落库侧兜底）",
+          nm4.thread_key == "", f"实际 {nm4.thread_key!r}")
+
+    nm5 = parse_message(raw("Subject: noangle\r\nReferences: a@x.com b@x.com\r\n"), "7")
+    check("容忍不带尖括号的 message-id",
+          nm5.references == ["a@x.com", "b@x.com"], f"实际 {nm5.references}")
+
+    nm6 = parse_message(raw(
+        "Subject: folded\r\n"
+        "References: <r@x.com>\r\n <mid1@x.com>\r\n\t<mid2@x.com>\r\n"), "8")
+    check("容忍折行的 References（RFC 5322 允许）",
+          nm6.thread_key == "r@x.com" and len(nm6.references) == 3,
+          f"实际 {nm6.references}")
+
+    # ---- 落库后字段可读回，缺失时兜底为 mail_id
+    _tmp, cfg, _ctx, _svc = setup_env("thread_")
+    db = Database(cfg.DB_PATH, None, encrypted=False)
+    mails = MailRepository(db)
+    now = datetime.now(timezone.utc)
+    res = mails.insert_mails_batch("acc1", "qq", [
+        NormalizedMail(uid="1", subject="root", body_text="根", date=now,
+                       message_id="root@x.com", thread_key="root@x.com"),
+        NormalizedMail(uid="2", subject="re", body_text="回复", date=now,
+                       message_id="m2@x.com", references=["root@x.com"],
+                       in_reply_to=["root@x.com"], thread_key="root@x.com"),
+        NormalizedMail(uid="3", subject="solo", body_text="单封", date=now),
+    ], uid_validity=1)
+    check("批量写入 3 封", len(res.inserted) == 3)
+    ids = dict(res.inserted)
+    m_root, m_re, m_solo = (mails.get(ids["1"]), mails.get(ids["2"]), mails.get(ids["3"]))
+    check("落库后 References 可读回", m_re.references == ["root@x.com"],
+          f"实际 {m_re.references}")
+    check("落库后 In-Reply-To 可读回", m_re.in_reply_to == ["root@x.com"],
+          f"实际 {m_re.in_reply_to}")
+    check("同会话的两封 thread_key 相同",
+          m_root.thread_key == m_re.thread_key == "root@x.com",
+          f"实际 {m_root.thread_key} / {m_re.thread_key}")
+    check("无引用头的邮件 thread_key 兜底为自身 mail_id",
+          m_solo.thread_key == ids["3"], f"实际 {m_solo.thread_key!r} vs {ids['3']!r}")
+    check("thread_key 可随列表投影取出（会话视图分组用）",
+          m_re.to_summary().thread_key == "root@x.com")
+    check("伪造的 ref_ids 脏值不会让邮件读不出来",
+          _dirty_ref_ids_readable(db, mails, ids["1"]))
+    db.close()
+
+
+def _dirty_ref_ids_readable(db, mails, mail_id: str) -> bool:
+    """把 ref_ids 改成非法 JSON，确认读取时退化为空列表而不是抛异常。"""
+    db.execute("UPDATE mails SET ref_ids = ? WHERE id = ?", ("{不是 JSON", mail_id))
+    try:
+        return mails.get(mail_id).references == []
+    except Exception:  # noqa: BLE001
+        return False
+
+
+
+# ============================================================ 26. 事件总线带负载
+def test_event_bus_payloads():
+    """v1.4.0：同步线程只报「新增了哪些 id」，UI 才能做增量插入。"""
+    _tmp, _cfg, _ctxmod, _svc = setup_env("bus_")
+    from unimail.core.events import EventBus
+
+    bus = EventBus()
+    inserted: list[tuple[str, list]] = []
+    removed: list[list] = []
+    tasks: list[tuple[str, str]] = []
+    done: list[tuple[str, bool, str]] = []
+
+    bus.mails_inserted.connect(lambda aid, ids: inserted.append((aid, list(ids))))
+    bus.mails_removed.connect(lambda ids: removed.append(list(ids)))
+    bus.task_started.connect(lambda tid, label: tasks.append((tid, label)))
+    bus.task_finished.connect(lambda tid, ok, msg: done.append((tid, ok, msg)))
+
+    bus.emit_mails_inserted("acc1", ["m1", "m2"])
+    bus.emit_mails_inserted("acc1", [])          # 空列表不触发（避免无意义刷新）
+    bus.emit_mails_removed(["m1"])
+    bus.emit_task_started("sync:acc1", "同步 a@b.c")
+    bus.emit_task_finished("sync:acc1", True, "新增 2 封")
+
+    check("mails_inserted 携带账号与 id 列表", inserted == [("acc1", ["m1", "m2"])],
+          f"实际 {inserted}")
+    check("空的插入事件被过滤", len(inserted) == 1)
+    check("mails_removed 携带 id 列表", removed == [["m1"]], f"实际 {removed}")
+    check("task_started 携带任务标签", tasks == [("sync:acc1", "同步 a@b.c")])
+    check("task_finished 携带结果与消息", done == [("sync:acc1", True, "新增 2 封")])
+
+
+# ============================================================ 27. 待回写标记队列
+def test_pending_flags_queue():
+    """离线期间点的已读/星标要排队，下次同步推回服务器（STORE ±FLAGS）。"""
+    _tmp, _cfg, _ctxmod, _svc = setup_env("pf_")
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.storage import PendingFlagRepository
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="pf@qq.com", password="c"))
+    store = PendingFlagRepository(ctx.db)
+
+    nm = NormalizedMail(uid="1", subject="s", from_addr="a@b.c",
+                        date=datetime.now(timezone.utc))
+    mid = ctx.mails.mails.insert_mail(acc.id, "qq", nm)
+    row = ctx.db.query_one("SELECT folder, uid FROM mails WHERE id = ?", (mid,))
+
+    # 同一标志同时出现在增/删里 → 不产生任何记录（等价于没点）
+    store.add(acc.id, "INBOX", row["uid"], add=["\\Seen"], remove=["\\Seen"])
+    check("同标志同时增删视为无操作", store.count(acc.id) == 0,
+          f"实际 {store.count(acc.id)}")
+
+    # 反复点「已读/未读」必须收敛成**一条**记录（后者定稿），
+    # 否则会堆出一串自相矛盾的 STORE 指令，按顺序全发一遍既浪费往返，
+    # 又可能以中间态收场。
+    store.add(acc.id, "INBOX", row["uid"], add=[], remove=["\\Seen"])
+    store.add(acc.id, "INBOX", row["uid"], add=["\\Seen"], remove=[])
+    check("反复切换只留一条记录", store.count(acc.id) == 1,
+          f"实际 {store.count(acc.id)}")
+    merged = store.list_for_account(acc.id)[0]
+    check("最后一次意图定稿（只发 +FLAGS）",
+          merged["add_flags"] == ["\\Seen"] and merged["remove_flags"] == [],
+          f"实际 {dict(merged)}")
+
+    # 不同标志叠加到同一条记录上
+    store.drop_for_uid(acc.id, "INBOX", row["uid"])
+    store.add(acc.id, "INBOX", row["uid"], add=["\\Flagged"], remove=[])
+    store.add(acc.id, "INBOX", row["uid"], add=["\\Seen"], remove=[])
+    check("两个不同标记合并为一条记录", store.count(acc.id) == 1)
+    merged = store.list_for_account(acc.id)[0]
+    check("合并后两个标志都在", sorted(merged["add_flags"]) == ["\\Flagged", "\\Seen"],
+          f"实际 {dict(merged)}")
+
+    store.drop_for_uid(acc.id, "INBOX", row["uid"])
+    check("按 UID 清空队列", store.count(acc.id) == 0)
+
+    # 不同 UID 互不干扰
+    nm2 = NormalizedMail(uid="2", subject="s2", from_addr="a@b.c",
+                         date=datetime.now(timezone.utc))
+    mid2 = ctx.mails.mails.insert_mail(acc.id, "qq", nm2)
+    row2 = ctx.db.query_one("SELECT folder, uid FROM mails WHERE id = ?", (mid2,))
+    store.add(acc.id, "INBOX", row["uid"], add=["\\Seen"], remove=[])
+    store.add(acc.id, "INBOX", row2["uid"], add=["\\Flagged"], remove=[])
+    check("不同 UID 各自成条", store.count(acc.id) == 2)
+
+    # mark_read 走服务层时应自动入队（开关默认开）
+    store.drop_for_uid(acc.id, "INBOX", row["uid"])
+    before = ctx.mails.pending_flag_count(acc.id)
+    ctx.mails.sync_server_flags = True
+    ctx.mails.mark_read(mid, True)
+    check("标已读会排入待回写队列",
+          ctx.mails.pending_flag_count(acc.id) == before + 1,
+          f"实际 {ctx.mails.pending_flag_count(acc.id)}")
+    item = next(i for i in store.list_for_account(acc.id) if i["uid"] == row["uid"])
+    check("入队内容是 +FLAGS \\Seen",
+          item["add_flags"] == ["\\Seen"] and item["remove_flags"] == [],
+          f"实际 {dict(item)}")
+
+    # 再点一次「未读」→ 同一 UID 收敛成一条，方向以后者为准
+    ctx.mails.mark_read(mid, False)
+    item = next(i for i in store.list_for_account(acc.id) if i["uid"] == row["uid"])
+    check("反向操作覆盖同一条记录而不是再排一条",
+          item["remove_flags"] == ["\\Seen"] and item["add_flags"] == [],
+          f"实际 {dict(item)}")
+
+    after = ctx.mails.pending_flag_count(acc.id)
+    ctx.mails.sync_server_flags = False
+    ctx.mails.mark_read(mid, True)
+    check("关闭开关后不再入队", ctx.mails.pending_flag_count(acc.id) == after,
+          f"实际 {ctx.mails.pending_flag_count(acc.id)} vs {after}")
+    ctx.db.close()
+
+
+# ============================================================ 28. 导出 eml / mbox / CSV
+def test_export_formats():
+    """导出必须能被第三方工具打开：RFC2047 主题、mboxo 转义、CSV BOM。"""
+    import base64
+    import csv as _csv
+    import mailbox
+    from email import message_from_bytes
+    from email.header import decode_header, make_header
+
+    _tmp, _cfg, _ctxmod, _svc = setup_env("exp_")
+    from unimail.core.models import AccountDraft, MailFilter, NormalizedMail
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="exp@qq.com", password="c"))
+
+    # 正文故意留一行以 `From ` 开头：这正是 mbox 解析器会误判为
+    # 「下一封邮件开始」的陷阱行。
+    ids = []
+    for i, subject in enumerate(["第一封", "第二封 From 某人", "第三封"]):
+        nm = NormalizedMail(uid=str(i + 1), subject=subject, from_addr="a@b.c",
+                            body_text=f"body {i}\nFrom the start of a line\nend",
+                            date=datetime.now(timezone.utc))
+        ids.append(ctx.mails.mails.insert_mail(acc.id, "qq", nm))
+
+    # 强制走本地重建：联网取原始报文的分支依赖真实 IMAP，
+    # 在回归测试里既慢又不可复现。
+    ctx.mails.sessions = None
+
+    out = Path(tempfile.mkdtemp(prefix="exp_out_"))
+
+    eml = ctx.mails.export_eml(ids[0], out / "a.eml")
+    raw = eml.read_bytes()
+    msg = message_from_bytes(raw)
+    subject = str(make_header(decode_header(msg["Subject"] or "")))
+    check("eml 主题经 RFC2047 编码后可还原", subject == "第一封", f"实际 {subject!r}")
+    check("eml 是 RFC822（有 From/Date 头部）",
+          bool(msg["From"]) and bool(msg["Date"]))
+    payload = msg.get_payload(decode=True) or b""
+    check("eml 正文可还原", b"body 0" in payload, f"实际 {payload[:80]!r}")
+    check("重建件带 X-UniMail-Note 说明（不冒充原件）",
+          "X-UniMail-Note" in msg)
+
+    mbox, n = ctx.mails.export_mbox(ids, out / "a.mbox")
+    body = mbox.read_bytes()
+    check("mbox 导出全部邮件", n == 3, f"实际 {n}")
+    seps = [ln for ln in body.split(b"\n") if ln.startswith(b"From a@b.c ")]
+    check("mbox 每封以 From 分隔行开头", len(seps) == 3, f"实际 {len(seps)} 行")
+    check("正文里以 From 开头的行被转义成 >From",
+          b"\n>From the start of a line" in body)
+    check("mboxo 转义没有把整封邮件写两遍",
+          body.count(b"body 0") == 1, f"实际 {body.count(b'body 0')} 次")
+    parsed = list(mailbox.mbox(str(mbox)))
+    check("mbox 可被标准库按 mboxo 解析出 3 封", len(parsed) == 3,
+          f"实际 {len(parsed)}")
+    check("解析回来的主题正确",
+          str(make_header(decode_header(parsed[0]["Subject"] or ""))) == "第一封")
+
+    csv_path, rows = ctx.mails.export_csv(MailFilter(account_id=acc.id),
+                                          out / "a.csv")
+    text = csv_path.read_text("utf-8-sig")
+    check("CSV 行数与邮件数一致", rows == 3)
+    check("CSV 带 BOM（Excel 不乱码）", csv_path.read_bytes()[:3] == b"\xef\xbb\xbf")
+    check("CSV 含主题列", "第一封" in text)
+    header = next(iter(_csv.reader(text.splitlines())))
+    check("CSV 首行是表头", header[0] == "时间" and "主题" in header, f"实际 {header}")
+    # 整表按标准 CSV 解析一遍（而不是按行找字符串），这样字段里的
+    # 逗号/引号有没有被正确转义才真的被验证到
+    records = list(_csv.reader(text.splitlines()))
+    check("CSV 每条记录列数与表头一致",
+          all(len(r) == len(header) for r in records), f"实际 {[len(r) for r in records]}")
+    subjects = [r[3] for r in records[1:]]
+    check("CSV 主题列内容精确（未被逗号串列）",
+          "第二封 From 某人" in subjects, f"实际 {subjects}")
+    check("CSV 时间列非空", all(r[0] for r in records[1:]))
+    check("CSV 是明文本（中文主题未被编码）",
+          base64.b64encode("第一封".encode()).decode() not in text)
+    ctx.db.close()
+
+
+# ============================================================ 29. 界面偏好持久化
+def test_ui_settings_roundtrip():
+    _tmp, cfg, _ctxmod, _svc = setup_env("uiset_")
+    from unimail.ui import settings as mod
+    mod.SETTINGS_PATH = cfg.DB_PATH.parent / "ui.json"
+
+    s = mod.UiSettings()
+    s.theme_mode = "light"
+    s.font_scale = 1.25
+    s.view_mode = "thread"
+    s.sync_server_flags = False
+    s.device_unlock = True
+    s.window_geometry = "abc="
+    s.save()
+
+    s2 = mod.UiSettings.load()
+    check("往返保存与读取一致",
+          (s2.theme_mode, s2.font_scale, s2.view_mode, s2.sync_server_flags,
+           s2.device_unlock, s2.window_geometry)
+          == ("light", 1.25, "thread", False, True, "abc="), f"实际 {s2}")
+
+    # 越界值必须被拉回合法档位，否则会一路传进样式表
+    s3 = mod.UiSettings(theme_mode="neon", font_scale=3.7, view_mode="grid")
+    s3.sanitize()
+    check("非法主题回落 system", s3.theme_mode == "system")
+    check("非法字号回落 1.0", s3.font_scale == 1.0)
+    check("非法视图回落 list", s3.view_mode == "list")
+
+    # 未知字段（未来版本写入）应被忽略而不是报错
+    mod.SETTINGS_PATH.write_text('{"theme_mode":"dark","unknown_key":1}', "utf-8")
+    s4 = mod.UiSettings.load()
+    check("未知字段被白名单过滤", s4.theme_mode == "dark")
+
+    # 半截文件：启动时读不到就该回默认值，而不是崩
+    mod.SETTINGS_PATH.write_text('{"theme_mode":', "utf-8")
+    s5 = mod.UiSettings.load()
+    check("损坏的设置文件回退默认值", s5 == mod.UiSettings())
+
+
+# ============================================================ 30. 设备绑定免密解锁
+def test_device_binding():
+    """绑定只保存「被 OS 保护的密文」，且任何损坏都必须失败而不是错解。"""
+    import base64
+
+    from unimail.core import device_binding as dbmod
+    from unimail.core.device_binding import DeviceBinding
+
+    if sys.platform not in ("win32", "darwin"):
+        print("  [skip] 当前平台不提供设备绑定后端")
+        return
+
+    home = Path(tempfile.mkdtemp(prefix="devb_"))
+    binding = DeviceBinding(path=home / "device.key")
+    if not binding.available():
+        print("  [skip] 当前平台无可用设备绑定后端")
+        return
+
+    key = bytes(range(48))
+    binding.bind(key, label="test")
+    check("绑定后 is_bound 为真", binding.is_bound())
+    check("绑定时间可读", binding.bound_at()[:4].isdigit())
+    check("取回的主密钥一致", binding.recall() == key)
+    meta = json.loads(binding.path.read_text("utf-8"))
+    check("落盘的是密文而不是明文密钥",
+          base64.b64encode(key).decode() not in binding.path.read_text("utf-8"))
+    check("绑定文件不含明文业务字段", "password" not in meta)
+
+    binding.unbind()
+    check("解绑后 is_bound 为假", not binding.is_bound())
+    check("解绑后取回为空", binding.recall() is None)
+
+    # 一：整段密文被替换（同步盘截断、文件被覆盖）→ 直接失败
+    binding.bind(key)
+    broken = json.loads(binding.path.read_text("utf-8"))
+    broken["blob"] = base64.b64encode(b"\x00" * 96).decode("ascii")
+    binding.path.write_text(json.dumps(broken), encoding="utf-8")
+    check("密文被整段替换后拒绝返回密钥", binding.recall() is None)
+    check("失败原因被记录（供界面提示）", bool(binding.last_error))
+
+    # 二：更隐蔽的一种——OS 解密封成功，但解出来的不是当初那把密钥。
+    #     这正是「摘要校验」存在的理由：否则错误密钥会一路流到
+    #     「数据库打不开」，比一句提示难排查得多。
+    binding.bind(key)
+    swapped = json.loads(binding.path.read_text("utf-8"))
+    other = bytes(range(48, 96))
+    if binding.backend == "dpapi":
+        cipher = dbmod._dpapi_protect(other, dbmod._entropy(""))
+        swapped["blob"] = base64.b64encode(cipher).decode("ascii")
+    else:
+        cipher = base64.b64encode(other).decode("ascii")
+        binding._keychain_write(cipher)
+        swapped["blob"] = cipher
+    binding.path.write_text(json.dumps(swapped), encoding="utf-8")
+    check("解出的密钥与摘要不符时拒绝返回", binding.recall() is None,
+          f"实际 {binding.recall()!r}")
+
+    # 三：摘要仍然完好时（未被动过）必须正常返回——否则就是「总是失败」
+    binding.bind(key)
+    check("完好文件仍然可用（不是一律失败）", binding.recall() == key)
+    binding.unbind()
+
+
+# ============================================================ 31. UI：令牌 / 模型 / 面板
+def test_ui_layer():
+    """UI 层的可测部分：令牌、模型增量、委托、面板交互、任务面板、锁屏。"""
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+
+    from unimail.ui import theme as theme_mod
+    from unimail.ui.theme import DARK, LIGHT, build_stylesheet, font_px, resolve_theme_mode
+
+    check("主题解析：显式模式不受系统影响",
+          resolve_theme_mode("dark") == "dark" and resolve_theme_mode("light") == "light")
+    check("样式表由令牌生成且可重复",
+          build_stylesheet(DARK) == build_stylesheet(DARK))
+    check("浅色样式表使用浅色底", LIGHT.bg in build_stylesheet(LIGHT))
+    check("深色样式表使用深色底", DARK.bg in build_stylesheet(DARK))
+    check("两套样式表确实不同", build_stylesheet(DARK) != build_stylesheet(LIGHT))
+    check("字号缩放改变字级", font_px("body", 1.25) > font_px("body", 1.0))
+    check("遮罩不透明", "255" in DARK.overlay and "255" in LIGHT.overlay)
+
+    from unimail.ui.icons import pixmap
+    check("图标可渲染", not pixmap("mail", "#ffffff", 18).isNull())
+    check("未知图标退化为占位而非崩溃", not pixmap("no-such-icon", "#fff").isNull())
+    check("同名同色图标命中缓存", pixmap("mail", "#ffffff", 18)
+          is pixmap("mail", "#ffffff", 18))
+
+    from unimail.ui.mail_model import (
+        MailTableModel,
+        avatar_color,
+        highlight_html,
+        initials,
+    )
+    check("头像色稳定（同一发件人不变）",
+          avatar_color("a@b.c") == avatar_color("a@b.c"))
+    check("中文名取首字", initials("张三") == "张")
+    check("西文名取缩写", initials("John Smith") == "JS")
+    # 高亮必须先转义再插标签：主题里带 HTML 不能被渲染
+    check("高亮不引入注入", "<b>" not in highlight_html("a<b>c", "b", "#fff"),
+          highlight_html("a<b>c", "b", "#fff"))
+    check("高亮命中所有出现位置",
+          highlight_html("aa", "a", "#fff").count("background") == 2)
+
+    # ---- 模型增量
+    from unimail.core.models import MailSummary, ThreadSummary
+
+    def mk(i, read=False, th=""):
+        return MailSummary(
+            id=f"id{i}", account_id="a", platform="qq", folder="INBOX", uid=str(i),
+            subject=f"主题{i}", from_name=f"发件人{i}", from_addr=f"x{i}@q.com",
+            date=datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i),
+            is_read=read, thread_key=th)
+
+    model = MailTableModel()
+    model.set_mails([mk(i) for i in range(5)])
+    check("初始 5 行", model.rowCount() == 5)
+    check("增量插入不重置且置于顶部",
+          model.insert_rows([mk(99)]) == 1 and model.id_at(0) == "id99")
+    check("重复 id 不会插入两行", model.insert_rows([mk(99)]) == 0)
+    check("批量删除行数正确", model.remove_ids(["id99", "id2"]) == 2
+          and model.rowCount() == 4)
+    check("排序保留选中", model.sort_by("sender") and model.rowCount() == 4)
+
+    model.set_threads([ThreadSummary(latest=mk(1, th="T1"), total=3, unread=2)])
+    check("会话视图折叠为一行", model.rowCount() == 1 and model.is_thread_head(0))
+    check("展开插入成员行", model.set_thread_members(
+        "T1", [mk(2, th="T1"), mk(3, th="T1")], 0) == 2 and model.rowCount() == 3)
+    check("成员行缩进", model.meta_at(1).depth == 1)
+    check("线程头记住展开态", model.is_thread_head(0) and model.meta_at(0).expanded)
+    # 刷新（重新 set_threads）后展开态必须保留，否则同步一次就全部收起
+    model.set_threads([ThreadSummary(latest=mk(1, th="T1"), total=3, unread=2)])
+    check("展开状态跨刷新保留", model.is_expanded("T1"), "刷新后丢失了展开态")
+    check("新表里仍能反查到线程头行号", model.row_of_thread("T1") == 0)
+    check("重新摊开成员行", model.set_thread_members(
+        "T1", [mk(2, th="T1"), mk(3, th="T1")], model.row_of_thread("T1")) == 2
+        and model.rowCount() == 3)
+    check("折叠移除成员行", model.collapse_thread("T1", 0) == 2
+          and model.rowCount() == 1)
+    check("折叠后展开态被清掉", not model.is_expanded("T1"))
+    model.set_threads([ThreadSummary(latest=mk(1, th="T1"), total=3, unread=2)])
+    check("折叠态同样跨刷新保留（不会被自动展开）",
+          not model.is_expanded("T1") and model.meta_at(0).expanded is False)
+
+    # ---- 面板：多选 / J-K / 会话展开
+    from unimail.ui.inbox_panel import InboxPanel
+    panel = InboxPanel()
+    panel.apply_theme(theme_mod.DARK.to_dict())
+    panel.set_mails([mk(i) for i in range(6)], keyword="主题", hit_count=6)
+    check("列表模式装载 6 行", panel.model.row_count() == 6)
+    panel.table.selectRow(1)
+    panel.extend_selection(1)
+    check("Shift+J 追加选中", sorted(panel.selected_ids()) == ["id1", "id2"],
+          f"实际 {panel.selected_ids()}")
+    panel.move_cursor(1)
+    check("J 移动光标并单选该行（导航即重选，不是追加）",
+          panel._current_row() == 3 and panel.selected_ids() == ["id3"],
+          f"row={panel._current_row()} sel={panel.selected_ids()}")
+    panel.select_all(True)
+    check("全选", len(panel.selected_ids()) == 6)
+    panel.select_all(False)
+    check("取消选择后选中集为空",
+          not panel.table.selectionModel().selectedRows())
+
+    # 搜索高亮：命中数要如实反映，且主题里含 HTML 也不能被渲染
+    panel.set_mails([mk(0)], keyword="主题", hit_count=1)
+    check("高亮关键词被记进模型", panel.model.keyword == "主题")
+    check("命中数写进工具栏",
+          "1" in panel.toolbar.count.text() and "命中" in panel.toolbar.count.text(),
+          f"实际 {panel.toolbar.count.text()!r}")
+
+    # 会话视图：点线程头 → 发信号；主窗口回填成员后真正展开
+    seen: list[tuple[str, int]] = []
+    panel.thread_toggle_requested.connect(lambda k, r: seen.append((k, r)))
+    panel.set_mails([mk(1, th="T1")], thread_mode=True,
+                    threads=[ThreadSummary(latest=mk(1, th="T1"), total=3, unread=2)])
+    check("会话视图装载线程头", panel.model.row_count() == 1)
+    panel._toggle_thread_row(0)
+    check("点会话头发展开请求", seen == [("T1", 0)], f"实际 {seen}")
+    panel.toggle_thread("T1", 0, [mk(2, th="T1"), mk(3, th="T1")])
+    check("回填成员后展开成 3 行", panel.model.row_count() == 3)
+    check("面板能报出已展开的会话", panel.expanded_thread_keys() == {"T1"})
+    check("面板能反查线程头行号", panel.row_of_thread("T1") == 0)
+    panel.toggle_thread("T1", 0, [])
+    check("再点一次折叠回 1 行", panel.model.row_count() == 1)
+
+    # ---- 任务面板
+    from unimail.ui.task_panel import TaskPanel
+    tp = TaskPanel()
+    tp.apply_theme(theme_mod.DARK.to_dict())
+    check("无任务时隐藏", not tp.isVisible())
+    tp.on_started("sync:a", "同步 a@b.c")
+    check("任务开始后显示", tp.isVisible() and tp.row_count() == 1)
+    tp.on_progress("sync:a", 3, 10)
+    tp.on_finished("sync:a", True, "新增 3 封")
+    check("完成后保留片刻供查看", tp.row_count() == 1 and tp.active_ids() == [])
+    tp.on_started("sync:a", "同步 a@b.c")
+    check("同一任务 id 归并为一行", tp.row_count() == 1)
+    tp.clear_finished()
+    check("清理已完成行", tp.row_count() == 1)
+
+    # ---- 锁屏：必须真正盖住全部内容
+    from unittest.mock import patch as _patch
+
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.ui import main_window as mwmod, settings as setmod
+    from unimail.ui.context import AppContext
+    from unimail.ui.main_window import MainWindow
+    setmod.SETTINGS_PATH = Path(tempfile.mkdtemp(prefix="lockcfg_")) / "ui.json"
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="lock@qq.com",
+                                        password="c"))
+    mid = ctx.mails.mails.insert_mail(
+        acc.id, "qq",
+        NormalizedMail(uid="1", subject="机密主题", from_addr="a@b.c",
+                       body_text="机密正文内容", date=datetime.now(timezone.utc)))
+    win = MainWindow(ctx, setmod.UiSettings(theme_mode="dark"),
+                     theme_mod.ThemeManager("dark"))
+    win.resize(1000, 700)
+    win.show()
+    app.processEvents()
+    win.reload_mails()
+    win._on_mail_selected(mid)
+    app.processEvents()
+    check("详情面板已装载邮件",
+          win.detail_panel.subject.text() == "机密主题",
+          f"实际 {win.detail_panel.subject.text()!r}")
+    win.lock("测试锁定")
+    app.processEvents()
+    check("遮罩可见", win.lock_overlay.isVisible())
+    check("遮罩覆盖整个窗口", win.lock_overlay.geometry() == win.rect(),
+          f"{win.lock_overlay.geometry()} vs {win.rect()}")
+    check("点击命中遮罩（不会穿透到列表）",
+          win.childAt(60, 300) is win.lock_overlay)
+    check("锁定后窗口记住锁定态", win._locked)
+    check("锁定时详情面板被清空（正文不留在控件里）",
+          win.detail_panel.subject.text() == ""
+          and "机密正文" not in win.detail_panel.body.toPlainText(),
+          f"subject={win.detail_panel.subject.text()!r}")
+    params, verifier, _ = ctx._read_security_meta()
+    check("正确密码可通过校验", ctx.security.verify_password("pw-1234567890",
+                                                            params, verifier))
+    check("错误密码被拒绝", not ctx.security.verify_password("wrong-password",
+                                                             params, verifier))
+
+    # 错误密码：不能解锁，且要给出提示
+    win.lock_overlay.password.setText("wrong-password")
+    win.lock_overlay._try_unlock()
+    app.processEvents()
+    check("错误密码不解锁",
+          win.lock_overlay.isVisible() and win._locked)
+    check("错误密码有提示", win.lock_overlay.error.isVisible())
+
+    # 正确密码：走真实解锁路径（信号 → 主窗口），遮罩必须自己收起来
+    status: list[str] = []
+    original_status = win.set_status
+    win.set_status = lambda t: (status.append(t), original_status(t))
+    win.lock_overlay.password.setText("pw-1234567890")
+    win.lock_overlay._try_unlock()
+    app.processEvents()
+    check("解锁后遮罩隐藏", not win.lock_overlay.isVisible())
+    check("解锁后锁定态复位", not win._locked)
+    check("解锁后状态栏反馈", "已解锁" in status, f"实际 {status}")
+
+    # 空闲超时自动锁定
+    with _patch.object(mwmod, "AUTO_LOCK_SECONDS", 0):
+        win._check_auto_lock()
+    app.processEvents()
+    check("空闲超时自动锁定",
+          win._locked and win.lock_overlay.isVisible())
+    win._quitting = True
+    ctx.shutdown()
+    win.close()
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -1867,6 +2623,16 @@ SUITES = [
     ("解锁退避持久化", test_unlock_guard_backoff),
     ("恶意 MIME 语料", test_hostile_mime_corpus),
     ("关键路径中断注入", test_interruption_injection),
+    # ---- 第三批（v1.4.0）
+    ("全文检索（FTS5 + CJK 切分）", test_fulltext_search),
+    ("会话引用链与归并键", test_thread_grouping),
+    # ---- 第四批（v1.4.0 – v1.6.0）
+    ("事件总线带负载", test_event_bus_payloads),
+    ("待回写标记队列", test_pending_flags_queue),
+    ("导出 eml / mbox / CSV", test_export_formats),
+    ("界面偏好持久化", test_ui_settings_roundtrip),
+    ("设备绑定免密解锁", test_device_binding),
+    ("UI：令牌 / 模型 / 面板 / 锁屏", test_ui_layer),
 ]
 
 

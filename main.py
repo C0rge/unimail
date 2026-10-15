@@ -26,7 +26,8 @@ from unimail.storage import DatabaseError, sqlcipher_available
 from unimail.ui.context import AppContext
 from unimail.ui.dialogs import LoginDialog
 from unimail.ui.main_window import MainWindow
-from unimail.ui.theme import STYLESHEET
+from unimail.ui.settings import UiSettings
+from unimail.ui.theme import ThemeManager
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -149,6 +150,8 @@ def main() -> int:
     parser.add_argument("--seed", action="store_true", help="注入演示数据")
     parser.add_argument("--reset", action="store_true", help="清空本地数据库")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
+    parser.add_argument("--theme", choices=("system", "dark", "light"),
+                        help="临时覆盖主题（不写入设置文件）")
     parser.add_argument("--export-recovery", nargs="?", const="", default=None,
                         metavar="路径", help="导出恢复包后退出（不含任何密文）")
     args = parser.parse_args()
@@ -160,7 +163,15 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    app.setStyleSheet(STYLESHEET)
+    app.setQuitOnLastWindowClosed(False)     # 托盘常驻：关掉窗口不等于退出
+
+    # 主题必须在**登录框之前**就绪：登录框本身也要按当前主题着色。
+    # 这正是界面偏好存在明文 JSON（而不是加密库）里的原因。
+    settings = UiSettings.load()
+    if args.theme:
+        settings.theme_mode = args.theme
+    theme = ThemeManager(settings.theme_mode, settings.font_scale)
+    theme.apply(app)
 
     ctx = AppContext()
 
@@ -205,9 +216,17 @@ def main() -> int:
             return 0
         offer_encryption_upgrade(ctx)
 
-    window = MainWindow(ctx)
+    window = MainWindow(ctx, settings, theme)
     window.show()
-    return app.exec()
+    code = app.exec()
+
+    # 事件循环退出后再兜一次底：托盘模式下 `quit_app()` 是唯一出口，
+    # 但用户可能在别处（比如系统关机）走到这里。
+    try:
+        ctx.shutdown(stop_timeout_ms=3000)
+    except Exception:
+        logging.getLogger(__name__).exception("退出清理失败")
+    return code
 
 
 if __name__ == "__main__":

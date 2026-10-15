@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.6.0"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
@@ -47,8 +47,15 @@ UNLOCK_MAX_ATTEMPTS = 5               # 单次运行内的尝试次数上限（�
 UNLOCK_BACKOFF_BASE = 1.0             # 退避基数（秒）：1,2,4,8… 上限见下
 UNLOCK_BACKOFF_MAX = 30.0
 
-DB_VERSION = 4                    # v4: 重建列表筛选相关索引
+DB_VERSION = 6                    # v6: 待回写服务器标记队列 + 会话索引（thread_key, date DESC）
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
+IDLE_POLL_SECONDS = 20            # 空闲检查间隔（秒）
+
+# 服务端标记双向同步：把「标已读 / 星标」写回 IMAP（UID STORE ±FLAGS）。
+# 关闭后只在本地生效，多设备间状态会不一致。UI 提供开关，默认开启。
+SYNC_SERVER_FLAGS = True
+# 附件内联预览的单文件上限（超过则不预览，只允许下载）
+MAX_PREVIEW_BYTES = 8 * 1024 * 1024
 
 # TLS 证书校验：默认强制校验。仅在明确知晓风险时（如企业自建服务器使用自签证书），
 # 通过环境变量 UNIMAIL_ALLOW_INVALID_CERT=1 显式关闭。

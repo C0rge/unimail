@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from ..config import platform_color, platform_name
 from ..core.models import Account
+from . import icons
 
 
 def _dot_pixmap(color: str, size: int = 9) -> QPixmap:
@@ -43,8 +44,9 @@ class AccountPanel(QFrame):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("Sidebar")
-        self.setFixedWidth(228)
+        self.setFixedWidth(236)
         self._accounts: list[Account] = []
+        self._theme: dict = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 10)
@@ -82,6 +84,30 @@ class AccountPanel(QFrame):
 
         layout.addLayout(bottom)
 
+    # ------------------------------------------------------------ 主题
+    def apply_theme(self, palette: dict) -> None:
+        self._theme = dict(palette)
+        self.sync_btn.setIcon(icons.icon("refresh", palette.get("on_accent", "#ffffff"), 14))
+        self.add_btn.setIcon(icons.icon("plus", palette.get("text_dim", "#8b98a9"), 14))
+        self._retint()
+
+    def _retint(self) -> None:
+        """换主题后重画每一行的状态点（图标是按颜色渲染的，必须重建）。"""
+        dim = self._theme.get("border_strong", "#3a4557")
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            account_id = item.data(Qt.UserRole)
+            unread = item.data(Qt.UserRole + 1) or 0
+            color = (platform_color(self._account_platform(account_id)) if account_id
+                     else self._theme.get("accent", "#4c8dff"))
+            item.setIcon(QIcon(_dot_pixmap(color if unread else dim)))
+
+    def _account_platform(self, account_id: str | None) -> str:
+        if not account_id:
+            return ""
+        account = next((a for a in self._accounts if a.id == account_id), None)
+        return account.platform if account else ""
+
     # ------------------------------------------------------------ 刷新
     def set_accounts(self, accounts: list[Account], counts: dict[str, tuple[int, int]],
                      total: tuple[int, int]) -> None:
@@ -93,6 +119,7 @@ class AccountPanel(QFrame):
         total_all, unread_all = total
         item = QListWidgetItem()
         item.setData(Qt.UserRole, None)
+        item.setData(Qt.UserRole + 1, unread_all)
         item.setText(self._row_text("全部邮箱", total_all, unread_all))
         item.setIcon(self._icon("#4c8dff", unread_all > 0))
         self.list.addItem(item)
@@ -102,6 +129,7 @@ class AccountPanel(QFrame):
             text = self._row_text(acc.label, total_n, unread_n)
             it = QListWidgetItem()
             it.setData(Qt.UserRole, acc.id)
+            it.setData(Qt.UserRole + 1, unread_n)
             it.setText(text)
             it.setIcon(self._icon(platform_color(acc.platform), unread_n > 0))
             status_tip = {
@@ -113,6 +141,7 @@ class AccountPanel(QFrame):
         # 恢复选中
         self._reselect(current)
         self.list.blockSignals(False)
+        self._retint()
 
         self.summary.setText(
             f"{len(accounts)} 个账号 · {total_all} 封邮件 · {unread_all} 未读"
@@ -134,8 +163,8 @@ class AccountPanel(QFrame):
 
     @staticmethod
     def _icon(color: str, highlight: bool):
-        from PySide6.QtGui import QIcon
-        return QIcon(_dot_pixmap(color if highlight else "#3a4557"))
+        dim = "#3a4557"
+        return QIcon(_dot_pixmap(color if highlight else dim))
 
     def current_account_id(self) -> str | None:
         item = self.list.currentItem()

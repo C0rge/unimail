@@ -1,5 +1,6 @@
 """存储层包。"""
 from .database import (
+    FTS_SCHEME,
     SQLCIPHER_AVAILABLE,
     Database,
     DatabaseError,
@@ -10,9 +11,11 @@ from .repositories import (
     AttachmentRepository,
     CursorRepository,
     MailRepository,
+    PendingFlagRepository,
 )
 
 __all__ = [
+    "FTS_SCHEME",
     "SQLCIPHER_AVAILABLE",
     "AccountRepository",
     "AttachmentRepository",
@@ -20,5 +23,6 @@ __all__ = [
     "Database",
     "DatabaseError",
     "MailRepository",
+    "PendingFlagRepository",
     "sqlcipher_available",
 ]

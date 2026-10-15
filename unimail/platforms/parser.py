@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from email.message import Message
 from html.parser import HTMLParser
 
-from ..core.models import AttachmentMeta, NormalizedMail
+from ..core.models import AttachmentMeta, NormalizedMail, make_preview
 
 # 常见中文邮箱的错误编码标注
 _ENCODING_FIXES = {
@@ -343,6 +343,44 @@ def parse_address(raw: str | None) -> tuple[str, str]:
     return decode_header_value(name), (addr or "").strip()
 
 
+# ---------------------------------------------------------------- 会话引用链
+# References / In-Reply-To 里的 message-id。正常形如 `<abc@host>`，但也存在
+# 不带尖括号、或在一个头里折行塞入多个 id 的写法，两头都要兜。
+_MESSAGE_ID_RE = re.compile(r"<([^<>\s]+)>")
+
+
+def _normalize_message_id(raw: str) -> str:
+    """规范化单个 message-id：去尖括号与两端空白。"""
+    return raw.strip().strip("<>").strip()
+
+
+def _extract_message_ids(raw: str | None) -> list[str]:
+    """从 References / In-Reply-To 头里提取 message-id 列表（不含尖括号）。"""
+    if not raw:
+        return []
+    text = str(raw)
+    ids = _MESSAGE_ID_RE.findall(text)
+    if ids:
+        return ids
+    # 少数客户端不带尖括号：退化为按空白切分，只保留看起来像 message-id 的片段
+    return [t.strip("<>") for t in text.split() if "@" in t]
+
+
+def compute_thread_key(references: list[str], in_reply_to: list[str],
+                       message_id: str) -> str:
+    """按 JWZ 规则算出会话归并键。
+
+    优先级：References 的第一个（会话根）> In-Reply-To 的第一个 > 自身
+    message-id。三者都缺失时返回空串，由落库侧用 `mail_id` 兜底——
+    绝不能留空：那会让所有「没有引用头」的邮件（单封通知、垃圾邮件等，
+    占比很高）在会话视图里被并成同一个巨大会话。
+    """
+    for candidate in references[:1] + in_reply_to[:1]:
+        if candidate:
+            return candidate
+    return message_id
+
+
 def parse_address_list(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -369,11 +407,6 @@ def decode_payload(part: Message) -> str:
         raw = part.get_payload()
         return raw if isinstance(raw, str) else ""
     return _decode_best(payload, _fix_charset(part.get_content_charset()))
-
-
-def make_preview(text: str, limit: int = 200) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _iter_subparts(msg: Message) -> list[Message]:
@@ -724,11 +757,14 @@ def parse_message(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Normaliz
 
     subject = decode_header_value(msg.get("Subject")) or "(无主题)"
     from_name, from_addr = parse_address(msg.get("From"))
+    message_id = _normalize_message_id(msg.get("Message-ID") or "")
+    ref_ids = _extract_message_ids(msg.get("References"))
+    in_reply_to = _extract_message_ids(msg.get("In-Reply-To"))
 
     return NormalizedMail(
         uid=str(uid),
         folder=folder,
-        message_id=(msg.get("Message-ID") or "").strip(),
+        message_id=message_id,
         subject=subject,
         from_name=from_name,
         from_addr=from_addr,
@@ -739,6 +775,9 @@ def parse_message(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Normaliz
         preview=make_preview(body_text),
         attachments=attachments,
         raw_size=len(raw_bytes),
+        references=ref_ids,
+        in_reply_to=in_reply_to,
+        thread_key=compute_thread_key(ref_ids, in_reply_to, message_id),
     )
 
 
@@ -747,10 +786,13 @@ def parse_headers_only(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Nor
     msg = email.message_from_bytes(raw_bytes)
     subject = decode_header_value(msg.get("Subject")) or "(无主题)"
     from_name, from_addr = parse_address(msg.get("From"))
+    message_id = _normalize_message_id(msg.get("Message-ID") or "")
+    ref_ids = _extract_message_ids(msg.get("References"))
+    in_reply_to = _extract_message_ids(msg.get("In-Reply-To"))
     return NormalizedMail(
         uid=str(uid),
         folder=folder,
-        message_id=(msg.get("Message-ID") or "").strip(),
+        message_id=message_id,
         subject=subject,
         from_name=from_name,
         from_addr=from_addr,
@@ -759,4 +801,7 @@ def parse_headers_only(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Nor
         preview="",
         attachments=_extract_attachments(msg),
         raw_size=len(raw_bytes),
+        references=ref_ids,
+        in_reply_to=in_reply_to,
+        thread_key=compute_thread_key(ref_ids, in_reply_to, message_id),
     )

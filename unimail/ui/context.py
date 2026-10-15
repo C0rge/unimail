@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import APP_VERSION, DB_PATH, KDF_ALGORITHM, sidecar_path
+from ..core.device_binding import DeviceBinding
 from ..core.events import EventBus
 from ..core.security import (
     KdfParams,
@@ -26,9 +27,10 @@ from ..storage import (
     Database,
     DatabaseError,
     MailRepository,
+    PendingFlagRepository,
     sqlcipher_available,
 )
-from ..sync import BodyFetchPool, Scheduler, WorkerPool
+from ..sync import BodyFetchPool, Scheduler, SessionPool, WorkerPool
 
 log = logging.getLogger(__name__)
 
@@ -99,8 +101,14 @@ class AppContext:
         self.scheduler: Scheduler | None = None
         self.pool: WorkerPool | None = None
         self.body_pool: BodyFetchPool | None = None
+        # IMAP 保活会话池：每账号一条连接，避免「看附件就握手一次」。
+        # 这里创建（而不是在 _wire 里）是为了让它在数据库重开时也保持不变，
+        # 从而让「锁定/解锁」不会打断正在进行的同步。
+        self.sessions = SessionPool()
+        self.device_binding = DeviceBinding()
         self.is_first_run = not DB_PATH.exists()
         self.kdf_upgrade_pending = False      # 现有库的 KDF 参数是否弱于当前默认
+        self._closed = False                  # 让 shutdown() 可重复调用
 
     # ------------------------------------------------------------ 元数据
     @property
@@ -305,9 +313,12 @@ class AppContext:
         if self.scheduler:
             self.scheduler.stop()
         if self.pool:
-            self.pool.stop_all()
+            self.pool.stop_all(timeout_ms=4000)
         if self.body_pool:
-            self.body_pool.stop_all()
+            self.body_pool.stop_all(timeout=4.0)
+        # 保活连接里带着**用旧主密码解出来的明文凭据**，必须一并丢弃：
+        # 否则改完密码后这些连接仍能以旧凭据继续访问邮箱。
+        self.sessions.close_all()
         return resume
 
     def _resume(self, resume: bool) -> None:
@@ -396,6 +407,11 @@ class AppContext:
         self._write_security_meta(new_params, new_verifier, driver=self.db.driver_name)
         UnlockGuard().reset()
         self.kdf_upgrade_pending = False
+        # 设备绑定保存的是**旧主密钥**，改密码后它必然失效。
+        # 与其留着一个每次解锁都会失败的绑定，不如主动解绑并告知用户。
+        if self.device_binding.is_bound():
+            self.device_binding.unbind()
+            log.info("主密码已变更，设备绑定已自动解除")
         log.info("主密码已更新，%d 个账号凭据已重新加密，KDF 现为 %s",
                  rotated, new_params.display)
 
@@ -438,14 +454,21 @@ class AppContext:
         mail_repo = MailRepository(self.db)
         attach_repo = AttachmentRepository(self.db)
         cursor_repo = CursorRepository(self.db)
+        pending_repo = PendingFlagRepository(self.db)
 
-        self.accounts = AccountService(account_repo, cursor_repo, self.security, self.bus)
+        self.accounts = AccountService(account_repo, cursor_repo, self.security,
+                                       self.bus, pending_repo)
         self.mails = MailService(mail_repo, attach_repo, account_repo,
-                                 self.security, self.bus)
+                                 self.security, self.bus, pending_repo)
+        # core 层不能反向依赖 sync 层（会形成 import 循环），
+        # 因此会话池由这里注入。
+        self.mails.sessions = self.sessions
         self.pool = WorkerPool(self.accounts, mail_repo, cursor_repo,
-                               self.security, self.bus)
-        self.body_pool = BodyFetchPool(self.accounts, mail_repo, self.bus)
-        self.scheduler = Scheduler(self.accounts, self.pool, self.bus)
+                               self.security, self.bus, sessions=self.sessions)
+        self.body_pool = BodyFetchPool(self.accounts, mail_repo, self.bus,
+                                       sessions=self.sessions)
+        self.scheduler = Scheduler(self.accounts, self.pool, self.bus,
+                                   session_pool=self.sessions)
 
         # 清理孤儿附件文件：历史版本删邮件时只删数据库行，磁盘明文副本会残留
         try:
@@ -453,14 +476,29 @@ class AppContext:
         except Exception:
             log.warning("清理孤儿附件失败", exc_info=True)
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, stop_timeout_ms: int = 8000) -> list[str]:
+        """停止后台工作 → 关闭连接 → 关闭数据库 → 清空密钥。
+
+        返回「超时未能退出」的账号列表。调用方应据此如实提示用户，
+        而不是假装干净退出——那些线程可能正持有半截事务。
+
+        幂等：走托盘退出时 `MainWindow.quit_app()` 会调一次，进程收尾
+        还会再兜一次底。第二次必须是无害的空操作，否则「关闭已关闭的
+        数据库」会在退出路径上抛异常，把一次正常退出变成崩溃报告。
+        """
+        if self._closed:
+            return []
+        self._closed = True
         if self.scheduler:
             self.scheduler.stop()
+        stragglers: list[str] = []
         if self.pool:
-            self.pool.stop_all()
+            stragglers = self.pool.stop_all(timeout_ms=stop_timeout_ms)
         if self.body_pool:
-            self.body_pool.stop_all()
+            self.body_pool.stop_all(timeout=stop_timeout_ms / 1000.0)
+        self.sessions.close_all()
         if self.db:
             self.db.close()
         self.security.lock()
         log.info("应用已安全关闭")
+        return stragglers

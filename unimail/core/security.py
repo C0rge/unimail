@@ -341,11 +341,50 @@ class SecurityService:
         self._install_keys(mk)
         return self.db_key()
 
+    def verify_password(self, password: str, params: KdfParams, verifier: str) -> bool:
+        """只校验主密码是否正确，**不改动当前会话密钥**。
+
+        用途：应用内锁屏后的重新认证（A.9）。不能复用 `unlock()`——
+        那会重新派生密钥并覆盖当前会话；若用户输入的是某个旧密码而库刚被改过，
+        覆盖失败或成功都会让内存里的会话与实际数据不一致。
+
+        返回 False 表示密码不对（或参数/校验块不可用），不抛异常：
+        调用方就是「错了就再让用户试一次」，异常在这里没有额外信息量。
+        """
+        try:
+            mk = derive_master_key(password, params)
+            f = Fernet(base64.urlsafe_b64encode(_derive_subkey(mk, b"verifier")))
+            plain = f.decrypt(verifier.encode("ascii"))
+        except (SecurityError, InvalidToken, ValueError, TypeError):
+            return False
+        return hmac.compare_digest(plain, b"unimail-verifier")
+
     def _install_keys(self, master_key: bytes) -> None:
         self._master_key = master_key
         self._cred_key = _derive_subkey(master_key, b"credentials")
         self._fernet = Fernet(base64.urlsafe_b64encode(self._cred_key))
         self.touch()
+
+    def master_key_copy(self) -> bytes:
+        """返回主密钥副本（供**显式开启**的设备绑定快速解锁使用）。
+
+        刻意做成显式命名、且不在文档中当「常用接口」宣传：主密钥等价于主密码，
+        任何拿到它的代码都能解开全部数据。除 `DeviceKeyStore` 外不应有调用方。
+        """
+        if self._master_key is None:
+            raise SecurityError("安全服务未解锁")
+        return self._master_key
+
+    def restore_from_master_key(self, master_key: bytes) -> None:
+        """用已保存的主密钥直接恢复会话（设备绑定免密解锁路径）。
+
+        与 `unlock()` 的差别：不做 verifier 校验——调用方拿到的密钥要么来自
+        操作系统凭据保护（Windows DPAPI / macOS Keychain），要么就是空。
+        校验由 `DeviceKeyStore` 在更外层完成。
+        """
+        if not isinstance(master_key, (bytes, bytearray)) or len(master_key) < 16:
+            raise SecurityError("设备绑定的密钥无效")
+        self._install_keys(bytes(master_key))
 
     def change_password(self, old_password: str, params: KdfParams,
                         verifier: str, new_password: str) -> tuple[bytes, KdfParams, str]:

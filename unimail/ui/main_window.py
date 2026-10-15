@@ -1,11 +1,28 @@
-"""主窗口：三栏布局 + 状态栏 + 事件接线。"""
+"""主窗口：三栏布局 + 状态栏 + 事件接线 + 托盘 + 锁屏。
+
+这个文件是「所有东西最终汇合的地方」，因此值得说明它的接线原则：
+
+1. **UI 不直接读写数据库。** 所有动作都通过 `ctx` 里的服务层，
+   视图只负责把用户意图翻译成一次服务调用。
+2. **后台线程只发信号，不碰控件。** 跨线程的信号由 Qt 自动排队到主线程；
+   这里明确声明 `QueuedConnection` 语义依赖（默认行为即满足，因为
+   `EventBus` 属于主线程）。
+3. **增量优先。** 收到 `mails_inserted` 时先尝试增量插入；只有在
+   「当前筛选条件可能受影响」时才回退到整表重查。这是 v1.4.0 里
+   用户最直观能感知到的改进——后台来新邮件不再把滚动位置顶掉。
+4. **锁屏与退出是两件事。** `Ctrl+L` / 空闲超时 → 弹遮罩（进程继续跑，
+   后台同步不断）；`Ctrl+Q` / 托盘退出 → 停线程、关库、退出进程。
+"""
 from __future__ import annotations
 
+import contextlib
 import logging
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -16,46 +33,61 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import APP_NAME, AUTO_LOCK_SECONDS
+from ..config import APP_NAME, AUTO_LOCK_SECONDS, IDLE_POLL_SECONDS
 from ..core.models import MailFilter
 from ..core.security import SecurityError
+from . import icons
 from .account_panel import AccountPanel
 from .context import AppContext
 from .detail_panel import DetailPanel
-from .dialogs import AboutDialog, AddAccountDialog
+from .dialogs import AboutDialog, AddAccountDialog, FirstRunWizard, SettingsDialog
 from .filter_bar import FilterBar
 from .inbox_panel import InboxPanel
+from .lockscreen import IdleWatcher, LockOverlay
+from .settings import UiSettings
+from .task_panel import TaskPanel
+from .theme import ThemeManager
+from .tray import TrayIcon
 
 log = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, context: AppContext) -> None:
+    def __init__(self, context: AppContext, settings: UiSettings | None = None,
+                 theme: ThemeManager | None = None) -> None:
         super().__init__()
         self.ctx = context
+        self.settings = settings or UiSettings.load()
+        self.theme = theme or ThemeManager(self.settings.theme_mode,
+                                           self.settings.font_scale)
         self.setWindowTitle(f"{APP_NAME} — 多平台邮箱统一管理")
-        self.resize(1280, 800)
-        self.setMinimumSize(1000, 620)
+        self.resize(1320, 840)
+        self.setMinimumSize(1020, 640)
 
-        self._pending_verify: AddAccountDialog | None = None
         self._last_sync_status: dict[str, str] = {}
+        self._locked = False
+        self._quitting = False
+        self._view_mode = self.settings.view_mode
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self.reload_mails)
 
         self._build_ui()
         self._wire_events()
         self._install_shortcuts()
-
-        # 空闲自动锁定检查
-        self._lock_timer = QTimer(self)
-        self._lock_timer.timeout.connect(self._check_auto_lock)
-        self._lock_timer.start(60_000)
+        self._apply_theme()
+        self._setup_tray()
+        self._setup_lock()
 
         # 立即渲染本地已有数据，再延迟触发网络同步
         self.refresh_accounts()
         self.reload_mails()
-        QTimer.singleShot(200, self._offer_kdf_upgrade)
+        QTimer.singleShot(150, self._restore_geometry)
+        QTimer.singleShot(250, self._offer_kdf_upgrade)
         QTimer.singleShot(400, self._initial_sync)
+        QTimer.singleShot(800, self._maybe_first_run)
 
-    # ------------------------------------------------------------ UI
+    # ================================================================ UI
     def _build_ui(self) -> None:
         central = QWidget()
         root = QHBoxLayout(central)
@@ -66,9 +98,16 @@ class MainWindow(QMainWindow):
         self.splitter.setHandleWidth(1)
         self.splitter.setChildrenCollapsible(False)
 
-        # 左：账号
+        # 左：账号 + 任务面板
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
         self.account_panel = AccountPanel()
-        self.splitter.addWidget(self.account_panel)
+        ll.addWidget(self.account_panel, 1)
+        self.task_panel = TaskPanel()
+        ll.addWidget(self.task_panel)
+        self.splitter.addWidget(left)
 
         # 中：筛选 + 收件箱
         center = QWidget()
@@ -85,7 +124,7 @@ class MainWindow(QMainWindow):
         self.detail_panel = DetailPanel()
         self.splitter.addWidget(self.detail_panel)
 
-        self.splitter.setSizes([228, 720, 420])
+        self.splitter.setSizes([236, 700, 400])
         self.splitter.setStretchFactor(1, 3)
         self.splitter.setStretchFactor(2, 2)
 
@@ -99,35 +138,50 @@ class MainWindow(QMainWindow):
         self.status_text.setObjectName("StatusBar")
         self.encryption_label = QLabel("")
         self.encryption_label.setObjectName("StatusBar")
+        self.pending_label = QLabel("")
+        self.pending_label.setObjectName("StatusBar")
         bar.addWidget(self.status_text, 1)
+        bar.addPermanentWidget(self.pending_label)
         bar.addPermanentWidget(self.encryption_label)
         self.setStatusBar(bar)
+        self._refresh_security_labels()
 
-        level = self.ctx.db.encryption_level if self.ctx.db else ""
-        self.encryption_label.setText(f"🔒 {level}")
-
+        self.detail_panel.inline_resolver = self._resolve_inline
+        self.detail_panel.inline_missing = self._inline_missing
         self._build_menu()
 
     def _build_menu(self) -> None:
         menubar = self.menuBar()
 
         m_file = menubar.addMenu("文件")
-        act_add = QAction("添加邮箱账号…", self)
+        act_add = QAction(icons.icon("plus", "#8b98a9", 14), "添加邮箱账号…", self)
         act_add.setShortcut("Ctrl+N")
         act_add.triggered.connect(self._on_add_account)
         m_file.addAction(act_add)
 
-        act_sync = QAction("立即同步全部", self)
+        act_sync = QAction(icons.icon("refresh", "#8b98a9", 14), "立即同步全部", self)
         act_sync.setShortcut("F5")
         act_sync.triggered.connect(lambda: self._sync_all())
         m_file.addAction(act_sync)
 
         m_file.addSeparator()
-        act_pwd = QAction("修改主密码…", self)
+        act_import = QAction(icons.icon("export", "#8b98a9", 14),
+                             "导出当前列表为 CSV…", self)
+        act_import.triggered.connect(lambda: self._on_export("csv", []))
+        m_file.addAction(act_import)
+
+        act_settings = QAction(icons.icon("settings", "#8b98a9", 14), "设置…", self)
+        act_settings.setShortcut("Ctrl+,")
+        act_settings.triggered.connect(self._on_settings)
+        m_file.addAction(act_settings)
+
+        m_file.addSeparator()
+        act_pwd = QAction(icons.icon("key", "#8b98a9", 14), "修改主密码…", self)
         act_pwd.triggered.connect(self._on_change_password)
         m_file.addAction(act_pwd)
 
-        act_recovery = QAction("导出恢复包…", self)
+        act_recovery = QAction(icons.icon("shield", "#8b98a9", 14),
+                               "导出恢复包…", self)
         act_recovery.triggered.connect(self._on_export_recovery)
         m_file.addAction(act_recovery)
 
@@ -135,19 +189,19 @@ class MainWindow(QMainWindow):
         act_encrypt.triggered.connect(self._on_encryption_settings)
         m_file.addAction(act_encrypt)
 
-        act_lock = QAction("立即锁定", self)
+        act_lock = QAction(icons.icon("lock", "#8b98a9", 14), "立即锁定", self)
         act_lock.setShortcut("Ctrl+L")
-        act_lock.triggered.connect(self._on_lock)
+        act_lock.triggered.connect(self.lock)
         m_file.addAction(act_lock)
 
         m_file.addSeparator()
-        act_quit = QAction("退出", self)
+        act_quit = QAction(icons.icon("close", "#8b98a9", 14), "退出", self)
         act_quit.setShortcut("Ctrl+Q")
-        act_quit.triggered.connect(self.close)
+        act_quit.triggered.connect(self.quit_app)
         m_file.addAction(act_quit)
 
         m_view = menubar.addMenu("视图")
-        act_refresh = QAction("刷新列表", self)
+        act_refresh = QAction(icons.icon("refresh", "#8b98a9", 14), "刷新列表", self)
         act_refresh.triggered.connect(self.reload_mails)
         m_view.addAction(act_refresh)
 
@@ -155,22 +209,92 @@ class MainWindow(QMainWindow):
         act_reset.triggered.connect(self.filter_bar.reset)
         m_view.addAction(act_reset)
 
+        m_view.addSeparator()
+        act_thread = QAction(icons.icon("layout-thread", "#8b98a9", 14),
+                             "切换会话视图", self)
+        act_thread.setShortcut("Ctrl+G")
+        act_thread.triggered.connect(self.toggle_view_mode)
+        m_view.addAction(act_thread)
+
+        act_focus = QAction("聚焦搜索框", self)
+        act_focus.setShortcut("Ctrl+F")
+        act_focus.triggered.connect(self._focus_search)
+        m_view.addAction(act_focus)
+
+        m_theme = m_view.addMenu(icons.icon("sun", "#8b98a9", 14), "主题")
+        for label, value in (("跟随系统", "system"), ("深色", "dark"), ("浅色", "light")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.settings.theme_mode == value)
+            act.triggered.connect(lambda _=False, v=value: self._set_theme_mode(v))
+            m_theme.addAction(act)
+
         m_help = menubar.addMenu("帮助")
+        act_guide = QAction("使用向导", self)
+        act_guide.triggered.connect(self._show_wizard)
+        m_help.addAction(act_guide)
+
         act_about = QAction("关于 UniMail", self)
         act_about.triggered.connect(self._on_about)
         m_help.addAction(act_about)
 
     def _install_shortcuts(self) -> None:
-        for seq, slot in [
+        bindings = [
             (QKeySequence("Ctrl+R"), lambda: self._sync_all()),
             (QKeySequence("Ctrl+A"), lambda: self.account_panel.select_account(None)),
-        ]:
+            (QKeySequence("Escape"), self._on_escape),
+        ]
+        self._actions = []
+        for seq, slot in bindings:
             a = QAction(self)
             a.setShortcut(seq)
             a.triggered.connect(slot)
             self.addAction(a)
+            self._actions.append(a)
 
-    # ------------------------------------------------------------ 接线
+    # ================================================================ 主题
+    def _apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(self.theme.stylesheet())
+        palette = self.theme.palette_dict()
+        self.inbox_panel.apply_theme(palette)
+        self.account_panel.apply_theme(palette)
+        self.detail_panel.apply_theme(palette)
+        self.task_panel.apply_theme(palette)
+        self.filter_bar.apply_theme(palette)
+        if getattr(self, "tray", None) is not None:
+            self.tray.apply_theme(palette)
+        if getattr(self, "lock_overlay", None) is not None:
+            self.lock_overlay.apply_theme(palette)
+
+    def _set_theme_mode(self, mode: str) -> None:
+        self.settings.theme_mode = mode
+        self.theme.set_mode(mode)
+        self.settings.save()
+        self._apply_theme()
+        self.set_status(f"主题已切换为{'跟随系统' if mode == 'system' else ('深色' if mode == 'dark' else '浅色')}")
+
+    def _apply_settings(self) -> None:
+        """设置对话框保存后统一落地到运行时。"""
+        self.theme.set_mode(self.settings.theme_mode)
+        self.theme.set_scale(self.settings.font_scale)
+        self._apply_theme()
+
+        self.ctx.mails.sync_server_flags = self.settings.sync_server_flags
+        self.detail_panel.auto_inline = self.settings.inline_images_auto
+        if self.settings.view_mode != self._view_mode:
+            self._view_mode = self.settings.view_mode
+            self.inbox_panel.toolbar.set_view_mode(self._view_mode)
+            self.reload_mails()
+        if self.tray is not None:
+            if self.settings.minimize_to_tray:
+                self.tray.show()
+            else:
+                self.tray.hide()
+        self._refresh_security_labels()
+
+    # ================================================================ 接线
     def _wire_events(self) -> None:
         ap = self.account_panel
         ap.add_requested.connect(self._on_add_account)
@@ -180,31 +304,111 @@ class MainWindow(QMainWindow):
         ap.manage_requested.connect(self._on_manage_account)
         ap.account_selected.connect(self._on_account_selected)
 
-        self.filter_bar.filter_changed.connect(self.reload_mails)
+        self.filter_bar.filter_changed.connect(self._on_filter_changed)
         self.filter_bar.refresh_requested.connect(lambda: self._sync_all())
 
         ip = self.inbox_panel
         ip.mail_selected.connect(self._on_mail_selected)
+        ip.mail_double_clicked.connect(self._on_mail_selected)
         ip.mark_read_requested.connect(self._on_mark_read)
         ip.star_requested.connect(self._on_star)
         ip.delete_requested.connect(self._on_delete_mail)
+        ip.mark_read_many_requested.connect(self._on_mark_read_many)
+        ip.star_many_requested.connect(self._on_star_many)
+        ip.delete_many_requested.connect(self._on_delete_many)
+        ip.export_requested.connect(self._on_export)
+        ip.thread_toggle_requested.connect(self._on_thread_toggle)
+        ip.notice.connect(self.set_status)
 
-        self.detail_panel.attachment_requested.connect(self._on_download_attachment)
+        dp = self.detail_panel
+        dp.attachment_requested.connect(self._on_download_attachment)
+        dp.preview_requested.connect(self._on_preview_attachment)
+        dp.inline_download_requested.connect(self._on_download_inline)
+        dp.star_requested.connect(self._on_star)
+        dp.export_requested.connect(lambda mid: self._on_export("eml", [mid] if mid else []))
+
+        self.task_panel.cancel_requested.connect(self._on_cancel_task)
 
         bus = self.ctx.bus
         bus.accounts_changed.connect(self.refresh_accounts)
         bus.mail_updated.connect(self._on_mail_updated)
-        bus.mail_deleted.connect(lambda _mid: self.reload_mails())
+        bus.mail_deleted.connect(self._on_mail_deleted)
+        bus.mails_inserted.connect(self._on_mails_inserted)
+        bus.mails_removed.connect(self._on_mails_removed)
         bus.sync_started.connect(self._on_sync_started)
         bus.sync_finished.connect(self._on_sync_finished)
         bus.sync_error.connect(self._on_sync_error)
         bus.filter_changed.connect(self.reload_mails)
-        bus.status_message.connect(lambda text, ms: self.statusBar()
-                                   .showMessage(text, ms))
+        bus.status_message.connect(lambda text, ms: self.statusBar().showMessage(text, ms))
 
-    # ------------------------------------------------------------ 启动
+        bus.task_started.connect(self.task_panel.on_started)
+        bus.task_progress.connect(self.task_panel.on_progress)
+        bus.task_finished.connect(self.task_panel.on_finished)
+
+    def _setup_tray(self) -> None:
+        self.tray: TrayIcon | None = None
+        if not TrayIcon.available():
+            log.info("系统托盘不可用，跳过托盘初始化")
+            return
+        self.tray = TrayIcon(self, self.theme.palette_dict())
+        self.tray.show_requested.connect(self._restore_from_tray)
+        self.tray.sync_requested.connect(lambda: self._sync_all())
+        self.tray.lock_requested.connect(self.lock)
+        self.tray.settings_requested.connect(self._on_settings)
+        self.tray.quit_requested.connect(self.quit_app)
+        if self.settings.minimize_to_tray:
+            self.tray.show()
+
+    def _setup_lock(self) -> None:
+        self.lock_overlay = LockOverlay(self.ctx, self.settings, self)
+        self.lock_overlay.hide()
+        self.lock_overlay.unlocked.connect(self._on_unlocked)
+        self.lock_overlay.quit_requested.connect(self.quit_app)
+        self.installEventFilter(self.lock_overlay)
+        # `_apply_theme()` 跑在 `_setup_lock()` 之前（遮罩还不存在），
+        # 因此这里要单独补一次上色。
+        self.lock_overlay.apply_theme(self.theme.palette_dict())
+
+        self._idle = IdleWatcher(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._idle)
+        self._idle.activity.connect(self._on_activity)
+
+        self._lock_timer = QTimer(self)
+        self._lock_timer.timeout.connect(self._check_auto_lock)
+        self._lock_timer.start(max(5, IDLE_POLL_SECONDS) * 1000)
+
+    # ================================================================ 启动
+    def _restore_geometry(self) -> None:
+        data = self.settings.window_geometry
+        if not data:
+            return
+        try:
+            import base64
+
+            from PySide6.QtCore import QByteArray
+            self.restoreGeometry(QByteArray(base64.b64decode(data)))
+        except (ValueError, TypeError):
+            log.debug("窗口几何恢复失败", exc_info=True)
+
+    def _save_geometry(self) -> None:
+        try:
+            import base64
+            self.settings.window_geometry = base64.b64encode(
+                bytes(self.saveGeometry())).decode("ascii")
+        except (ValueError, TypeError):
+            pass
+
+    def _maybe_first_run(self) -> None:
+        if self.ctx.accounts is None:
+            return
+        if self.ctx.accounts.list():
+            return
+        # 没有任何账号：无论是全新用户还是清空重来，都值得看一遍说明
+        self._show_wizard(auto=True)
+
     def _initial_sync(self) -> None:
-        """延迟阶段：启动调度器并按需发起首次网络同步。"""
         if self.ctx.scheduler:
             self.ctx.scheduler.start()
         if self.ctx.accounts and self.ctx.accounts.list():
@@ -212,7 +416,13 @@ class MainWindow(QMainWindow):
         else:
             self.set_status("欢迎使用 UniMail — 请先添加一个邮箱账号")
 
-    # ------------------------------------------------------------ 账号
+    def _show_wizard(self, auto: bool = False) -> None:
+        level = self.ctx.db.encryption_level if self.ctx.db else ""
+        dlg = FirstRunWizard(level, self if not auto else None)
+        dlg.add_account_requested.connect(self._on_add_account)
+        dlg.exec()
+
+    # ================================================================ 账号
     def refresh_accounts(self) -> None:
         if not self.ctx.accounts or not self.ctx.mails:
             return
@@ -220,6 +430,20 @@ class MainWindow(QMainWindow):
         counts = self.ctx.mails.counts()
         total = self.ctx.mails.total_counts()
         self.account_panel.set_accounts(accounts, counts, total)
+        if self.tray is not None:
+            self.tray.set_unread(total[1],
+                                 [(a.label, counts.get(a.id, (0, 0))[1]) for a in accounts])
+        self._refresh_security_labels()
+
+    def _refresh_security_labels(self) -> None:
+        level = self.ctx.db.encryption_level if self.ctx.db else ""
+        self.encryption_label.setText(f"🔒 {level}" if level else "")
+        pending = 0
+        try:
+            pending = self.ctx.mails.pending_flag_count() if self.ctx.mails else 0
+        except Exception:  # noqa: BLE001 - 仅状态展示
+            pending = 0
+        self.pending_label.setText(f"待同步标记 {pending}" if pending else "")
 
     def _on_account_selected(self, account) -> None:
         if self.ctx.accounts:
@@ -233,10 +457,10 @@ class MainWindow(QMainWindow):
 
         if dlg.should_verify:
             self.set_status(f"正在验证 {draft.email} 的凭据…")
+            QApplication.processEvents()
             ok, msg = self.ctx.accounts.verify(draft)
             if not ok:
-                QMessageBox.warning(self, "连接失败",
-                                    f"无法使用该凭据登录：\n\n{msg}")
+                QMessageBox.warning(self, "连接失败", f"无法使用该凭据登录：\n\n{msg}")
                 self.set_status("凭据验证失败")
                 return
             self.set_status("凭据验证通过")
@@ -264,6 +488,7 @@ class MainWindow(QMainWindow):
         )
         if ret != QMessageBox.Yes:
             return
+        self.ctx.sessions.close_account(account_id)
         self.ctx.accounts.remove(account_id)
         self.detail_panel.clear()
         self.refresh_accounts()
@@ -291,7 +516,7 @@ class MainWindow(QMainWindow):
         self.reload_mails()
         self.set_status("已全部标记为已读")
 
-    # ------------------------------------------------------------ 同步
+    # ================================================================ 同步
     def _sync_all(self) -> None:
         if not self.ctx.scheduler:
             return
@@ -316,12 +541,13 @@ class MainWindow(QMainWindow):
         account = self.ctx.accounts.get(account_id)
         name = account.email if account else account_id
         self._last_sync_status.pop(account_id, None)
-        if new_count:
-            self.set_status(f"{name}：新增 {new_count} 封邮件")
-        else:
-            self.set_status(f"{name}：已是最新")
+        self.set_status(f"{name}：新增 {new_count} 封邮件" if new_count
+                        else f"{name}：已是最新")
         self.refresh_accounts()
-        self.reload_mails()
+        self._refresh_security_labels()
+        if new_count:
+            self._notify_new_mail(account_id, name, new_count)
+            self._maybe_prefetch()
 
     def _on_sync_error(self, account_id: str, message: str) -> None:
         account = self.ctx.accounts.get(account_id)
@@ -339,12 +565,69 @@ class MainWindow(QMainWindow):
                 "请检查网络、授权码是否过期，或该平台 IMAP 服务是否已开启。",
             )
 
-    # ------------------------------------------------------------ 邮件
+    def _notify_new_mail(self, account_id: str, name: str, count: int) -> None:
+        if self.tray is None or not self.settings.show_notifications:
+            return
+        # 锁屏或托盘态下不弹通知：通知会把主题/发件人显示在锁屏之上，
+        # 等于绕过锁定。用户解锁后会看到未读数。
+        if self._locked or not self.isVisible():
+            return
+        subjects: list[str] = []
+        try:
+            recent = self.ctx.mails.inbox(
+                MailFilter(account_id=account_id, limit=3))
+            subjects = [m.subject or "" for m in recent]
+        except Exception:
+            log.debug("读取最新主题失败", exc_info=True)
+        self.tray.notify_new_mail(name, subjects, account_id)
+
+    def _on_cancel_task(self, task_id: str) -> None:
+        if task_id.startswith("sync:") and self.ctx.pool:
+            account_id = task_id.split(":", 1)[1]
+            if self.ctx.pool.cancel_account(account_id):
+                self.set_status("已请求取消同步…")
+                return
+        self.set_status("该任务已结束或无法取消")
+
+    # ================================================================ 列表
+    def _on_filter_changed(self) -> None:
+        self._search_timer.start(180)
+
+    def _focus_search(self) -> None:
+        self.filter_bar.search.setFocus()
+        self.filter_bar.search.selectAll()
+
     def reload_mails(self) -> None:
         if not self.ctx.mails:
             return
+        flt = self._current_filter()
+        keyword = flt.keyword
+        hint = None
+
+        if self._view_mode == "thread":
+            threads = self.ctx.mails.threads(flt)
+            mails = [t.latest for t in threads]
+            hit = self.ctx.mails.search_count(flt) if keyword else None
+            if not threads:
+                hint = self._empty_hint(flt)
+            self.inbox_panel.set_mails(mails, hint, hit_count=hit, keyword=keyword,
+                                       thread_mode=True, threads=threads)
+            self._reopen_expanded_threads()
+        else:
+            mails = self.ctx.mails.inbox(flt)
+            hit = self.ctx.mails.search_count(flt) if keyword else None
+            if not mails:
+                hint = self._empty_hint(flt)
+            self.inbox_panel.set_mails(mails, hint, hit_count=hit, keyword=keyword)
+
+        self.refresh_accounts()
+        self._maybe_prefetch()
+        if keyword:
+            self.set_status(f"「{keyword}」命中 {hit if hit is not None else len(mails)} 封")
+
+    def _current_filter(self) -> MailFilter:
         d_from, d_to = self.filter_bar.date_range()
-        flt = MailFilter(
+        return MailFilter(
             account_id=self.ctx.accounts.active_id,
             platform=self.filter_bar.current_platform(),
             keyword=self.filter_bar.current_keyword(),
@@ -352,24 +635,53 @@ class MainWindow(QMainWindow):
             date_to=d_to,
             unread_only=self.filter_bar.is_unread_only(),
         )
-        mails = self.ctx.mails.inbox(flt)
-        hint = None
-        if not mails:
-            if flt.keyword or flt.platform or flt.unread_only or flt.date_from:
-                hint = "没有符合筛选条件的邮件，\n试试放宽条件或重置筛选。"
-            elif not self.ctx.accounts.list():
-                hint = "还没有绑定任何邮箱账号。\n点击左下角「添加邮箱账号」开始使用。"
-        self.inbox_panel.set_mails(mails, hint)
-        self.refresh_accounts()
 
+    def _empty_hint(self, flt: MailFilter) -> str:
+        if flt.keyword or flt.platform or flt.unread_only or flt.date_from:
+            return "没有符合筛选条件的邮件，\n试试放宽条件或重置筛选。"
+        if not self.ctx.accounts.list():
+            return "还没有绑定任何邮箱账号。\n点击左下角「添加邮箱账号」开始使用。"
+        return "这个账号下还没有邮件。"
+
+    def toggle_view_mode(self) -> None:
+        self._view_mode = "thread" if self._view_mode == "list" else "list"
+        self.settings.view_mode = self._view_mode
+        self.settings.save()
+        self.inbox_panel.toolbar.set_view_mode(self._view_mode)
+        self.reload_mails()
+        self.set_status("已切换到会话视图" if self._view_mode == "thread" else "已切换到列表视图")
+
+    def _on_thread_toggle(self, thread_key: str, row: int) -> None:
+        if not self.ctx.mails:
+            return
+        members = self.ctx.mails.thread_mails(thread_key, limit=200)
+        self.inbox_panel.toggle_thread(thread_key, row, members)
+
+    def _reopen_expanded_threads(self) -> None:
+        """刷新后把用户展开过的会话重新摊开。
+
+        `set_threads` 只重建线程头，成员行需要按 key 重新查库插入——
+        否则模型记住了「展开」，屏幕上却只有一行，箭头与会话数会自相矛盾。
+        """
+        if self.ctx.mails is None:
+            return
+        for key in list(self.inbox_panel.expanded_thread_keys()):
+            row = self.inbox_panel.row_of_thread(key)
+            if row < 0:
+                continue
+            members = self.ctx.mails.thread_mails(key, limit=200)
+            self.inbox_panel.model.set_thread_members(key, members, row)
+
+    # ================================================================ 邮件
     def _on_mail_selected(self, mail_id: str) -> None:
+        if not mail_id or self.ctx.mails is None:
+            return
         mail = self.ctx.mails.get(mail_id)
         if mail is None:
             return
 
-        # 正文尚未同步（列表只拉了头部）→ 后台补拉
-        if (not mail.body_text and not mail.body_html
-                and self.ctx.body_pool and self.ctx.body_pool.request(mail_id)):
+        if (self.ctx.body_pool and not (mail.body_text or mail.body_html)
+                and self.ctx.body_pool.request(mail_id)):
             self.set_status("正在拉取邮件正文…")
 
         self.detail_panel.show_mail(mail)
@@ -378,9 +690,9 @@ class MainWindow(QMainWindow):
             mail.is_read = True
             self.inbox_panel.refresh_row(mail.to_summary())
             self.refresh_accounts()
+            self._refresh_security_labels()
 
     def _on_mail_body_fetched(self, mail_id: str) -> None:
-        """正文补拉完成 → 若当前正选中该邮件则刷新详情。"""
         if self.inbox_panel.current_mail_id() != mail_id:
             return
         mail = self.ctx.mails.get(mail_id)
@@ -388,29 +700,186 @@ class MainWindow(QMainWindow):
             self.detail_panel.show_mail(mail)
             self.set_status("正文已加载")
 
-    def _on_mark_read(self, mail_id: str, is_read: bool) -> None:
-        self.ctx.mails.mark_read(mail_id, is_read)
-        self.reload_mails()
-
-    def _on_star(self, mail_id: str) -> None:
-        self.ctx.mails.toggle_star(mail_id)
-        mail = self.ctx.mails.get(mail_id)
-        if mail:
-            self.inbox_panel.refresh_row(mail.to_summary())
-            if self.inbox_panel.current_mail_id() == mail_id:
-                self.detail_panel.show_mail(mail)
-
-    def _on_delete_mail(self, mail_id: str) -> None:
-        self.ctx.mails.delete(mail_id)
-        self.detail_panel.clear()
-        self.reload_mails()
-        self.set_status("已删除本地副本（服务器邮件不受影响）")
-
     def _on_mail_updated(self, mail_id: str) -> None:
-        if self.ctx.mails:
-            self.refresh_accounts()
+        self._refresh_security_labels()
         self._on_mail_body_fetched(mail_id)
 
+    def _on_mail_deleted(self, mail_id: str) -> None:
+        self.inbox_panel.remove_mails([mail_id])
+        if self.detail_panel._mail is not None and self.detail_panel._mail.id == mail_id:  # noqa: SLF001
+            self.detail_panel.clear()
+        self.refresh_accounts()
+
+    def _on_mails_inserted(self, account_id: str, mail_ids: list[str]) -> None:
+        """增量插入：只有「当前筛选确实包含这些新邮件」时才插进列表。"""
+        if not mail_ids or self.ctx.mails is None:
+            return
+        if self._view_mode == "thread" or self.filter_bar.current_keyword():
+            self.reload_mails()
+            return
+        active = self.ctx.accounts.active_id
+        if active and active != account_id:
+            return
+        flt = self._current_filter()
+        if flt.platform or flt.date_from or flt.unread_only:
+            self.reload_mails()
+            return
+        summaries = self.ctx.mails.summaries_by_ids(mail_ids)
+        n = self.inbox_panel.insert_mails(summaries)
+        self.refresh_accounts()
+        if n:
+            self.set_status(f"收到 {n} 封新邮件")
+            self._maybe_prefetch()
+
+    def _on_mails_removed(self, mail_ids: list[str]) -> None:
+        if mail_ids:
+            self.inbox_panel.remove_mails(list(mail_ids))
+            self.refresh_accounts()
+
+    def _maybe_prefetch(self) -> None:
+        """后台预取可见行的正文（设置开关 + 有会话池时才做）。"""
+        if not self.settings.prefetch_bodies or self.ctx.body_pool is None:
+            return
+        if self._locked:
+            return
+        ids = self.inbox_panel.model.mail_ids()[:12]
+        if ids:
+            self.ctx.body_pool.prefetch(ids, limit=6)
+
+    # ================================================================ 批量
+    def _selected_or(self, mail_id: str) -> list[str]:
+        ids = self.inbox_panel.selected_ids()
+        return ids or ([mail_id] if mail_id else [])
+
+    def _on_mark_read(self, mail_id: str, is_read: bool) -> None:
+        self._on_mark_read_many(self._selected_or(mail_id), is_read)
+
+    def _on_mark_read_many(self, mail_ids: list[str], is_read: bool) -> None:
+        if not mail_ids:
+            return
+        n = self.ctx.mails.mark_read_many(mail_ids, is_read)
+        self._refresh_rows(mail_ids)
+        self.refresh_accounts()
+        self._refresh_security_labels()
+        self.set_status(f"已把 {n} 封标为{'已读' if is_read else '未读'}")
+
+    def _on_star(self, mail_id: str) -> None:
+        ids = self._selected_or(mail_id)
+        if not ids:
+            return
+        current = self.ctx.mails.get(ids[0])
+        target = not current.is_starred if current else True
+        self._on_star_many(ids, target)
+
+    def _on_star_many(self, mail_ids: list[str], starred: bool) -> None:
+        if not mail_ids:
+            return
+        n = self.ctx.mails.star_many(mail_ids, starred)
+        self._refresh_rows(mail_ids)
+        self.set_status(f"已为 {n} 封{'加星标' if starred else '取消星标'}"
+                        + ("（将在下次同步时回写服务器）"
+                           if self.settings.sync_server_flags else ""))
+        self._refresh_security_labels()
+
+    def _on_delete_mail(self, mail_id: str) -> None:
+        self._on_delete_many(self._selected_or(mail_id))
+
+    def _on_delete_many(self, mail_ids: list[str]) -> None:
+        if not mail_ids:
+            return
+        if len(mail_ids) > 1:
+            ret = QMessageBox.question(
+                self, "删除本地副本",
+                f"确定删除选中的 {len(mail_ids)} 封邮件吗？\n\n"
+                "只删除本机副本，服务器上的邮件不受影响。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+        self.ctx.mails.delete_many(mail_ids)
+        self.inbox_panel.remove_mails(mail_ids)
+        if self.detail_panel._mail is not None and self.detail_panel._mail.id in mail_ids:  # noqa: SLF001
+            self.detail_panel.clear()
+        self.refresh_accounts()
+        self.set_status(f"已删除 {len(mail_ids)} 封本地副本（服务器邮件不受影响）")
+
+    def _refresh_rows(self, mail_ids: list[str]) -> None:
+        summaries = self.ctx.mails.summaries_by_ids(mail_ids)
+        self.inbox_panel.refresh_rows(summaries)
+
+    # ================================================================ 导出
+    def _on_export(self, kind: str, mail_ids: list[str]) -> None:
+        if kind == "csv":
+            self._export_csv()
+            return
+        if not mail_ids:
+            self.set_status("请先选择要导出的邮件")
+            return
+        if kind == "eml":
+            self._export_eml(mail_ids[0])
+        elif kind == "mbox":
+            self._export_mbox(mail_ids)
+
+    def _export_eml(self, mail_id: str) -> None:
+        mail = self.ctx.mails.get(mail_id)
+        if mail is None:
+            return
+        default = _safe_name(mail.subject or "mail") + ".eml"
+        path, _ = QFileDialog.getSaveFileName(self, "导出为 .eml", default,
+                                              "邮件文件 (*.eml)")
+        if not path:
+            return
+        try:
+            dest = self.ctx.mails.export_eml(mail_id, path)
+        except Exception as exc:  # noqa: BLE001 - 如实报错
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.set_status(f"已导出：{dest}")
+
+    def _export_mbox(self, mail_ids: list[str]) -> None:
+        default = "unimail-导出.mbox"
+        path, _ = QFileDialog.getSaveFileName(self, "导出为 .mbox", default,
+                                              "mbox 归档 (*.mbox)")
+        if not path:
+            return
+        self.set_status(f"正在导出 {len(mail_ids)} 封邮件…")
+        QApplication.processEvents()
+
+        def progress(done: int, total: int) -> None:
+            self.set_status(f"正在导出 {done}/{total}…")
+            QApplication.processEvents()
+
+        try:
+            dest, written = self.ctx.mails.export_mbox(mail_ids, path,
+                                                       progress=progress)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.set_status(f"已导出 {written} 封到 {dest}")
+        QMessageBox.information(
+            self, "导出完成",
+            f"已导出 {written} 封邮件到：\n{dest}\n\n"
+            "该格式可被 Thunderbird、mutt 等客户端直接导入。",
+        )
+
+    def _export_csv(self) -> None:
+        flt = self._current_filter()
+        default = "unimail-邮件清单.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "导出 CSV 清单", default,
+                                              "CSV 文件 (*.csv)")
+        if not path:
+            return
+        try:
+            dest, rows = self.ctx.mails.export_csv(flt, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self.set_status(f"已导出 {rows} 行到 {dest}")
+        QMessageBox.information(self, "导出完成",
+                                f"已导出 {rows} 行到：\n{dest}\n\n"
+                                "文件带 UTF-8 BOM，Excel 打开不会乱码。")
+
+    # ================================================================ 附件
     def _on_download_attachment(self, attachment_id: str) -> None:
         try:
             result = self.ctx.mails.download_attachment(attachment_id)
@@ -429,17 +898,180 @@ class MainWindow(QMainWindow):
             "\n".join(lines),
         )
 
-    # ------------------------------------------------------------ 其他
+    def _on_preview_attachment(self, attachment_id: str) -> None:
+        att = self.ctx.mails.attachments.get(attachment_id)
+        title = att.filename if att else "预览"
+        self.set_status("正在准备预览…")
+        QApplication.processEvents()
+        try:
+            kind, payload = self.ctx.mails.preview_attachment(attachment_id)
+        except (FileNotFoundError, OSError, ValueError, SecurityError) as exc:
+            self.set_status("预览失败")
+            QMessageBox.warning(self, "预览失败", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - 网络层的意外也要如实说明
+            self.set_status("预览失败")
+            QMessageBox.warning(self, "预览失败", f"取回附件时出错：{exc}")
+            return
+        self.set_status("预览就绪")
+        self.detail_panel.show_preview(kind, payload, title)
+
+    def _resolve_inline(self, mail_id: str, content_id: str) -> bytes | None:
+        if self.ctx.mails is None:
+            return None
+        return self.ctx.mails.inline_resource(mail_id, content_id)
+
+    def _inline_missing(self, mail_id: str):
+        if self.ctx.mails is None:
+            return []
+        return self.ctx.mails.inline_missing(mail_id)
+
+    def _on_download_inline(self, mail_id: str) -> None:
+        if self.ctx.mails is None:
+            return
+        self.set_status("正在下载内嵌图片…")
+        QApplication.processEvents()
+        try:
+            ok, failed = self.ctx.mails.download_inline_images(mail_id)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "下载失败", str(exc))
+            return
+        mail = self.ctx.mails.get(mail_id)
+        if mail is not None:
+            self.detail_panel.show_mail(mail)
+        msg = f"已加载 {ok} 张内嵌图片"
+        if failed:
+            msg += f"，{failed} 张失败"
+        self.set_status(msg)
+
+    # ================================================================ 锁定
+    def _on_activity(self) -> None:
+        self.ctx.security.touch()
+
+    def lock(self, reason: str = "") -> None:
+        if self._locked:
+            return
+        self._locked = True
+        self._save_geometry()
+        # 锁定时把详情面板里的正文清掉：遮罩是实心层，但详情面板的内容
+        # 仍然留在内存与 DWM 缩略图缓存里，清掉更彻底。
+        self.detail_panel.clear()
+        self.lock_overlay.lock(reason)
+        log.info("界面已锁定")
+
+    def _on_unlocked(self) -> None:
+        self._locked = False
+        # 不依赖信号发送方（遮罩/未来的其它解锁入口）顺手隐藏自己：
+        # 这里是「已解锁」的唯一权威落点，漏掉一次就是明文内容裸露。
+        self.lock_overlay.hide()
+        self.ctx.security.touch()
+        self.reload_mails()
+        # 放在 reload 之后：刷新过程可能自己写状态栏，别把提示盖掉
+        self.set_status("已解锁")
+
+    def _check_auto_lock(self) -> None:
+        if self._locked:
+            return
+        if self.ctx.security.idle_seconds() >= AUTO_LOCK_SECONDS:
+            minutes = int(AUTO_LOCK_SECONDS // 60)
+            self.lock(f"已闲置超过 {minutes} 分钟，为保护邮件内容已自动锁定。")
+
+    def _on_escape(self) -> None:
+        if self._locked:
+            return
+        if self.filter_bar.current_keyword():
+            self.filter_bar.search.clear()
+
+    # ================================================================ 托盘
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if self._locked:
+            self.lock_overlay.raise_()
+
+    def changeEvent(self, event) -> None:
+        if (event.type() == QEvent.WindowStateChange and self.isMinimized()
+                and self.settings.minimize_to_tray and self.tray is not None):
+            QTimer.singleShot(0, self.hide)
+            if self.settings.lock_on_minimize:
+                self.lock("窗口已最小化到托盘，已自动锁定。")
+        super().changeEvent(event)
+
+    def closeEvent(self, event) -> None:
+        if not self._quitting and self.settings.minimize_to_tray and self.tray is not None:
+            event.ignore()
+            self._save_geometry()
+            self.settings.save()
+            self.hide()
+            if self.settings.lock_on_minimize:
+                self.lock("窗口已隐藏到托盘，已自动锁定。")
+            else:
+                self.tray.notify(APP_NAME, "已最小化到系统托盘，仍在后台收信。")
+            return
+        self.quit_app()
+
+    def quit_app(self) -> None:
+        """真正退出：停线程 → 关库 → 退出进程。"""
+        if self._quitting:
+            return
+        self._quitting = True
+        self._save_geometry()
+        try:
+            self.settings.save()
+        except OSError:
+            log.debug("保存设置失败", exc_info=True)
+
+        self.set_status("正在停止后台任务…")
+        QApplication.processEvents()
+        stragglers = []
+        try:
+            stragglers = self.ctx.shutdown()
+        except Exception:
+            log.exception("关闭时出错")
+        if stragglers:
+            QMessageBox.warning(
+                self, "仍有任务未结束",
+                "以下账号的同步任务未能在超时内结束，进程即将退出：\n"
+                + "\n".join(f"· {s}" for s in stragglers)
+                + "\n\n已提交的数据库事务不会丢失。",
+            )
+        if self.tray is not None:
+            self.tray.hide()
+        event_loop = QApplication.instance()
+        if event_loop is not None:
+            event_loop.quit()
+        self.close()
+
+    # ================================================================ 菜单动作
+    def _on_settings(self) -> None:
+        dlg = SettingsDialog(self.ctx, self.settings, self)
+        dlg.preview_requested.connect(self._preview_theme)
+        if dlg.exec() == SettingsDialog.Accepted:
+            self._apply_settings()
+            self.set_status("设置已保存")
+        else:
+            self._preview_theme(self.settings.theme_mode, self.settings.font_scale)
+
+    def _preview_theme(self, mode: str, scale: float) -> None:
+        """设置对话框里的即时预览（不落盘，取消时自动还原）。"""
+        self.theme.set_mode(mode)
+        self.theme.set_scale(scale)
+        self._apply_theme()
+
     def _on_about(self) -> None:
         level = self.ctx.db.encryption_level if self.ctx.db else "未知"
-        AboutDialog(level, self).exec()
+        kdf = ""
+        # 元数据读不到（驱动不匹配等）不该挡住「关于」对话框
+        with contextlib.suppress(Exception):
+            params, _v, _d = self.ctx._read_security_meta()      # noqa: SLF001
+            kdf = params.display
+        AboutDialog(level, self, kdf=kdf, ctx=self.ctx).exec()
 
     def _on_export_recovery(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
         default = str(self.ctx._sidecar.with_name("unimail-recovery.json"))  # noqa: SLF001
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出恢复包", default, "JSON 文件 (*.json)"
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "导出恢复包", default,
+                                             "JSON 文件 (*.json)")
         if not path:
             return
         try:
@@ -492,14 +1124,17 @@ class MainWindow(QMainWindow):
         if ret != QMessageBox.Yes:
             return
 
+        self.set_status("正在迁移数据库加密模式…")
+        QApplication.processEvents()
         try:
             driver = self.ctx.migrate_encryption(target)
         except (SecurityError, OSError, RuntimeError) as exc:
             QMessageBox.warning(self, "迁移失败", f"数据库保持原状。\n\n{exc}")
+            self.set_status("迁移失败")
             return
 
         level = self.ctx.db.encryption_level if self.ctx.db else driver
-        self.encryption_label.setText(f"🔒 {level}")
+        self._refresh_security_labels()
         QMessageBox.information(self, "迁移完成", f"当前加密等级：{level}")
 
     def _on_change_password(self) -> None:
@@ -542,10 +1177,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "无需修改", "新主密码与当前密码相同。")
             return
 
+        self.set_status("正在重新加密凭据与数据库…")
+        QApplication.processEvents()
         try:
             result = self.ctx.change_password(old, new)
         except SecurityError as exc:
             QMessageBox.warning(self, "修改失败", str(exc))
+            self.set_status("修改失败")
             return
 
         # 如实告知实际发生了什么，不笼统说"成功"
@@ -563,9 +1201,12 @@ class MainWindow(QMainWindow):
             )
         if result.kdf:
             lines.append(f"· 密钥派生参数已更新为：{result.kdf}")
+        if self.ctx.device_binding.is_bound():
+            lines.append("· 设备绑定的主密钥已失效，已自动解除（需重新绑定）")
         lines.append("\n请牢记新密码——遗忘将无法恢复任何数据。")
         QMessageBox.information(self, "主密码已更新", "\n".join(lines))
         self.set_status("主密码已更新，凭据已重新加密")
+        self._refresh_security_labels()
 
     def _offer_kdf_upgrade(self) -> None:
         """旧库的 KDF 弱于当前默认时提示升级（改密码即完成升级）。"""
@@ -582,27 +1223,16 @@ class MainWindow(QMainWindow):
         if ret == QMessageBox.Yes:
             self._on_change_password()
 
-    def _on_lock(self) -> None:
-        self.ctx.shutdown()
-        QMessageBox.information(self, "已锁定", "数据已锁定，程序即将退出。\n"
-                                               "下次启动需重新输入主密码。")
-        self.close()
-
-    def _check_auto_lock(self) -> None:
-        if self.ctx.security.idle_seconds() >= AUTO_LOCK_SECONDS:
-            log.info("空闲超时，自动锁定")
-            self.ctx.shutdown()
-            self.close()
-
+    # ================================================================ 杂项
     def set_status(self, text: str) -> None:
         self.status_text.setText(text)
 
-    def closeEvent(self, event) -> None:
-        try:
-            self.ctx.shutdown()
-        except Exception:
-            log.exception("关闭时出错")
-        event.accept()
+
+def _safe_name(text: str, limit: int = 80) -> str:
+    """把主题变成安全的文件名片段。"""
+    import re
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text or "").strip().rstrip(". ")
+    return (cleaned[:limit] or "mail")
 
 
 def QLineEdit_EchoMode_Password():
