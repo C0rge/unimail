@@ -1,0 +1,9 @@
+# UniMail 运行依赖
+# Python 3.10+
+
+PySide6>=6.6          # 桌面 UI 框架
+cryptography>=42.0    # Fernet 对称加密 + PBKDF2 密钥派生
+
+# 可选：整库加密（强烈推荐）
+# 未安装时程序会降级为「SQLite + 字段级加密」，启动时会明确提示
+# sqlcipher3-binary>=0.5
