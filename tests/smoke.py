@@ -2677,12 +2677,16 @@ def main() -> int:
     else:
         print("全部通过 ✓")
         code = 0
-    # 到这里所有断言都已执行并输出。套件里建过 QApplication，解释器
-    # 退出阶段 Qt 对象的销毁顺序不受我们控制，个别平台（Linux + py3.10）
-    # 会在收尾阶段崩掉并吞掉真实退出码——因此冲刷缓冲后直接退出，
-    # 让退出码只反映测试结果本身。
-    sys.stdout.flush()
-    sys.stderr.flush()
+    # --- 临时诊断：定位 Windows CI 收尾阶段的退出码异常（会移除）
+    print("DBG before-flush", flush=True)
+    try:
+        sys.stdout.flush()
+        print("DBG stdout-flushed", flush=True)
+        sys.stderr.flush()
+        print("DBG stderr-flushed", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"DBG flush-error {exc!r}", flush=True)
+    print(f"DBG calling os._exit({code})", flush=True)
     os._exit(code)
 
 
