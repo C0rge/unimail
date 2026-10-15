@@ -359,12 +359,27 @@ class MainWindow(QMainWindow):
         mail = self.ctx.mails.get(mail_id)
         if mail is None:
             return
+
+        # 正文尚未同步（列表只拉了头部）→ 后台补拉
+        if not mail.body_text and not mail.body_html:
+            if self.ctx.body_pool and self.ctx.body_pool.request(mail_id):
+                self.set_status("正在拉取邮件正文…")
+
         self.detail_panel.show_mail(mail)
         if not mail.is_read:
             self.ctx.mails.mark_read(mail_id, True)
             mail.is_read = True
             self.inbox_panel.refresh_row(mail)
             self.refresh_accounts()
+
+    def _on_mail_body_fetched(self, mail_id: str) -> None:
+        """正文补拉完成 → 若当前正选中该邮件则刷新详情。"""
+        if self.inbox_panel.current_mail_id() != mail_id:
+            return
+        mail = self.ctx.mails.get(mail_id)
+        if mail:
+            self.detail_panel.show_mail(mail)
+            self.set_status("正文已加载")
 
     def _on_mark_read(self, mail_id: str, is_read: bool) -> None:
         self.ctx.mails.mark_read(mail_id, is_read)
@@ -387,6 +402,7 @@ class MainWindow(QMainWindow):
     def _on_mail_updated(self, mail_id: str) -> None:
         if self.ctx.mails:
             self.refresh_accounts()
+        self._on_mail_body_fetched(mail_id)
 
     def _on_download_attachment(self, attachment_id: str) -> None:
         try:
@@ -412,14 +428,37 @@ class MainWindow(QMainWindow):
             return
         new, ok = QInputDialog.getText(self, "修改主密码", "新主密码（≥6 位）：",
                                        QLineEdit_EchoMode_Password())
-        if not ok or len(new) < 6:
+        if not ok:
+            return
+        if len(new) < 6:
             QMessageBox.warning(self, "修改失败", "新主密码至少 6 位")
             return
+        if new == old:
+            QMessageBox.information(self, "无需修改", "新主密码与当前密码相同。")
+            return
+
         try:
-            self.ctx.change_password(old, new)
-            QMessageBox.information(self, "成功", "主密码已更新，数据库已重新加密。")
+            result = self.ctx.change_password(old, new)
         except SecurityError as exc:
             QMessageBox.warning(self, "修改失败", str(exc))
+            return
+
+        # 如实告知实际发生了什么，不笼统说"成功"
+        lines = [
+            "主密码已更新。",
+            f"· 已重新加密 {result.credentials_rotated} 个账号的登录凭据",
+        ]
+        if result.database_rekeyed:
+            lines.append("· 数据库已整库重新加密（SQLCipher AES-256）")
+        else:
+            lines.append(
+                "· 数据库未整库重新加密：当前为降级模式（未安装 SQLCipher），"
+                "数据库本身为明文，仅登录凭据受字段级加密保护。\n"
+                "  如需整库加密，请先安装 sqlcipher3-binary 后重新初始化。"
+            )
+        lines.append("\n请牢记新密码——遗忘将无法恢复任何数据。")
+        QMessageBox.information(self, "主密码已更新", "\n".join(lines))
+        self.set_status("主密码已更新，凭据已重新加密")
 
     def _on_lock(self) -> None:
         self.ctx.shutdown()

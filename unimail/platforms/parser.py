@@ -133,30 +133,71 @@ def make_preview(text: str, limit: int = 200) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+def iter_imap_parts(msg: Message, prefix: str = ""):
+    """按 RFC 3501 规则遍历 MIME，产出 (imap_part_number, part)。
+
+    IMAP 的 part 编号规则：
+        - 非 multipart 的最顶层单部分 → "1"
+        - multipart 的各子部分 → 依次为 "1", "2", "3"…
+        - 嵌套 multipart → 父编号.子编号，如 "2.1"
+        - 内嵌 message/rfc822 → 追加 ".1"
+
+    注意：这与 email 库的 msg.walk() 顺序编号**完全不同**，
+    直接拿 walk() 的序号去 FETCH BODY[n] 会取到错误内容。
+    """
+    if msg.is_multipart():
+        if msg.get_content_type() == "message/rfc822":
+            # 内嵌邮件：其子部分从 .1 开始
+            for sub in msg.get_payload():
+                yield from iter_imap_parts(sub, f"{prefix}.1" if prefix else "1")
+            return
+        for i, part in enumerate(msg.get_payload(), start=1):
+            sub_prefix = f"{prefix}.{i}" if prefix else str(i)
+            yield from iter_imap_parts(part, sub_prefix)
+    else:
+        yield (prefix or "1"), msg
+
+
+def _extract_attachments(msg: Message) -> list[AttachmentMeta]:
+    """用 IMAP part 编号提取附件元数据。"""
+    out: list[AttachmentMeta] = []
+    for part_no, part in iter_imap_parts(msg):
+        ctype = part.get_content_type()
+        disp = (part.get_content_disposition() or "").lower()
+        filename = part.get_filename()
+
+        if not (filename or disp == "attachment"):
+            continue
+        payload = part.get_payload(decode=True)
+        size = len(payload) if payload else 0
+        if size == 0 and part.get("Content-Transfer-Encoding") is None:
+            # 未解码（如 base64 头缺失），用编码后长度估算
+            raw = part.get_payload()
+            size = len(raw) if isinstance(raw, str) else 0
+        out.append(AttachmentMeta(
+            filename=decode_header_value(filename) or f"attachment-{part_no}",
+            content_type=ctype,
+            size=size,
+            content_id=(part.get("Content-ID") or "").strip("<>") or None,
+            part_index=part_no,
+        ))
+    return out
+
+
 def parse_message(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> NormalizedMail:
     """把原始报文解析为 NormalizedMail。"""
     msg = email.message_from_bytes(raw_bytes)
 
     body_text = ""
     body_html = ""
-    attachments: list[AttachmentMeta] = []
+    attachments = _extract_attachments(msg)
 
     if msg.is_multipart():
-        for idx, part in enumerate(msg.walk()):
+        for _part_no, part in iter_imap_parts(msg):
             ctype = part.get_content_type()
             disp = (part.get_content_disposition() or "").lower()
-            filename = part.get_filename()
-
-            if filename or disp == "attachment":
-                attachments.append(AttachmentMeta(
-                    filename=decode_header_value(filename) or f"attachment-{idx}",
-                    content_type=ctype,
-                    size=len(part.get_payload(decode=True) or b""),
-                    content_id=(part.get("Content-ID") or "").strip("<>") or None,
-                    part_index=str(idx),
-                ))
+            if part.get_filename() or disp == "attachment":
                 continue
-
             if ctype == "text/plain" and not body_text:
                 body_text = decode_payload(part)
             elif ctype == "text/html" and not body_html:
@@ -196,17 +237,6 @@ def parse_headers_only(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Nor
     msg = email.message_from_bytes(raw_bytes)
     subject = decode_header_value(msg.get("Subject")) or "(无主题)"
     from_name, from_addr = parse_address(msg.get("From"))
-    attachments: list[AttachmentMeta] = []
-    if msg.is_multipart():
-        for idx, part in enumerate(msg.walk()):
-            fn = part.get_filename()
-            if fn:
-                attachments.append(AttachmentMeta(
-                    filename=decode_header_value(fn),
-                    content_type=part.get_content_type(),
-                    size=0,
-                    part_index=str(idx),
-                ))
     return NormalizedMail(
         uid=str(uid),
         folder=folder,
@@ -217,6 +247,6 @@ def parse_headers_only(raw_bytes: bytes, uid: str, folder: str = "INBOX") -> Nor
         to_addrs=parse_address_list(msg.get("To")),
         date=parse_date(msg.get("Date")),
         preview="",
-        attachments=attachments,
+        attachments=_extract_attachments(msg),
         raw_size=len(raw_bytes),
     )

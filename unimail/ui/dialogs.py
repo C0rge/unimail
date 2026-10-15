@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import PLATFORMS, platform_name
+from ..config import APP_NAME, APP_VERSION, PLATFORMS, platform_name
 from ..core.models import AccountDraft
 
 
@@ -248,7 +248,7 @@ class AboutDialog(QDialog):
         layout.setContentsMargins(26, 22, 26, 20)
         layout.setSpacing(10)
 
-        t = QLabel("UniMail v1.0.0")
+        t = QLabel(f"{APP_NAME} v{APP_VERSION}")
         t.setStyleSheet("font-size: 18px; font-weight: 600;")
         layout.addWidget(t)
 

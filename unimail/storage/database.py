@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS attachments (
     size         INTEGER,
     stored_path  TEXT,
     content_id   TEXT,
+    part_index   TEXT,
     FOREIGN KEY(mail_id) REFERENCES mails(id) ON DELETE CASCADE
 );
 
@@ -132,6 +133,11 @@ class Database:
             return "未提供密钥"
         return "字段级加密（未安装 SQLCipher，整库为明文）"
 
+    @property
+    def rekey_supported(self) -> bool:
+        """是否支持整库重加密（仅 SQLCipher 支持 PRAGMA rekey）。"""
+        return _SQLCIPHER_AVAILABLE
+
     def _new_connection(self):
         if _SQLCIPHER_AVAILABLE:
             conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
@@ -162,7 +168,24 @@ class Database:
             self.execute(
                 "INSERT INTO meta(key, value) VALUES(?, ?)", ("db_version", str(DB_VERSION))
             )
+        else:
+            self._migrate(int(row["value"] or 1))
         self.set_registered_driver()
+
+    def _migrate(self, from_version: int) -> None:
+        """按版本依次升级表结构。"""
+        current = from_version
+        if current < 2:
+            self._add_column_if_missing("attachments", "part_index", "TEXT")
+            current = 2
+            log.info("数据库已从 v%d 迁移到 v2（新增 attachments.part_index）", from_version)
+        if current != from_version:
+            self.set_meta("db_version", str(current))
+
+    def _add_column_if_missing(self, table: str, column: str, coltype: str) -> None:
+        cols = {r["name"] for r in self.query_all(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
     def set_registered_driver(self) -> None:
         self.execute(
@@ -243,10 +266,13 @@ class Database:
         )
 
     def rekey(self, new_key: bytes) -> None:
-        """更换整库加密密钥（仅 SQLCipher 支持）。"""
+        """更换整库加密密钥（仅 SQLCipher 支持）。
+
+        降级模式下数据库未加密，调用方应先用 rekey_supported 判断，
+        不要依赖本方法静默改内存变量的行为。
+        """
         if not _SQLCIPHER_AVAILABLE:
-            self._db_key = new_key
-            return
+            raise RuntimeError("当前未安装 SQLCipher，不支持整库重加密（rekey）")
         conn = self._conn()
         conn.execute(f"PRAGMA rekey = \"x'{new_key.hex()}'\"")
         conn.commit()

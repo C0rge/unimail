@@ -175,10 +175,11 @@ class MailRepository:
             for att in mail.attachments:
                 conn.execute(
                     """INSERT INTO attachments
-                       (id, mail_id, filename, content_type, size, stored_path, content_id)
-                       VALUES (?,?,?,?,?,?,?)""",
+                       (id, mail_id, filename, content_type, size, stored_path,
+                        content_id, part_index)
+                       VALUES (?,?,?,?,?,?,?,?)""",
                     (new_id(), mail_id, att.filename, att.content_type,
-                     att.size, None, att.content_id),
+                     att.size, None, att.content_id, att.part_index),
                 )
         return mail_id
 
@@ -223,6 +224,17 @@ class MailRepository:
             "SELECT * FROM attachments WHERE mail_id = ?", (mail_id,)
         )
         return [Attachment.from_row(r) for r in rows]
+
+    def mail_context_of_attachment(self, attachment_id: str) -> dict | None:
+        """取附件所属邮件的同步元信息（用于重连 IMAP 下载）。"""
+        return self.db.query_one(
+            """SELECT a.part_index, a.filename, m.account_id, m.platform,
+                      m.folder, m.uid
+               FROM attachments a
+               JOIN mails m ON m.id = a.mail_id
+               WHERE a.id = ?""",
+            (attachment_id,),
+        )
 
     def query(self, flt: MailFilter) -> list[Mail]:
         sql = ["SELECT * FROM mails WHERE 1=1"]

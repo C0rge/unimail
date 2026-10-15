@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
@@ -32,7 +32,7 @@ ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------- 安全参数
 KDF_ITERATIONS = 600_000          # PBKDF2-HMAC-SHA256 迭代次数
 KDF_SALT_BYTES = 16
-DB_VERSION = 1
+DB_VERSION = 2                    # v2: attachments.part_index
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
 
 # ---------------------------------------------------------------- 同步参数

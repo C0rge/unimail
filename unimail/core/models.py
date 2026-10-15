@@ -102,6 +102,7 @@ class Attachment:
     size: int
     stored_path: str | None = None
     content_id: str | None = None
+    part_index: str = ""      # IMAP part 编号，用于按需下载
 
     @classmethod
     def from_row(cls, row: dict) -> "Attachment":
@@ -113,6 +114,7 @@ class Attachment:
             size=row.get("size") or 0,
             stored_path=row.get("stored_path"),
             content_id=row.get("content_id"),
+            part_index=row.get("part_index") or "",
         )
 
 

@@ -9,6 +9,8 @@ import logging
 
 from .base import ImapAdapter
 
+from ..config import APP_VERSION
+
 log = logging.getLogger(__name__)
 
 
@@ -65,7 +67,7 @@ class Net163Adapter(ImapAdapter):
         try:
             imap.xatom(
                 "ID",
-                '("name" "UniMail" "version" "1.0.0" '
+                f'("name" "UniMail" "version" "{APP_VERSION}" '
                 '"vendor" "UniMail" "support-email" "unimail@example.com")',
             )
             log.debug("163: 已发送 IMAP ID")

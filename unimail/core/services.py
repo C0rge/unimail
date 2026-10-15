@@ -8,7 +8,12 @@ from pathlib import Path
 
 from ..config import ATTACHMENT_DIR, DEFAULT_SYNC_INTERVAL, PLATFORMS
 from ..platforms import ImapError, get_adapter, make_account_stub
-from ..storage import AccountRepository, AttachmentRepository, CursorRepository, MailRepository
+from ..storage import (
+    AccountRepository,
+    AttachmentRepository,
+    CursorRepository,
+    MailRepository,
+)
 from .events import EventBus
 from .models import Account, AccountDraft, AccountStatus, Mail, MailFilter
 from .security import SecurityError, SecurityService
@@ -162,23 +167,84 @@ class MailService:
 
     # ------------------------------------------------------------ 附件
     def download_attachment(self, attachment_id: str) -> Path:
-        """下载附件（此处以本地已有 stored_path 或占位文件为例）。
+        """从 IMAP 服务器拉取附件真实字节流并落盘。
 
-        真实实现：从 IMAP 按 part 拉取字节流后落盘。原型中若附件尚未落盘，
-        则在附件目录生成一个说明文件，保证 UI 流程可演示。
+        流程：查附件所属邮件的 account/folder/uid/part_index
+              → 取该账号凭据 → 连接 IMAP → FETCH BODY[part] → 解码 → 写盘
         """
         att = self.attachments.get(attachment_id)
         if att is None:
             raise FileNotFoundError("附件记录不存在")
+
+        # 已下载过则直接复用
         if att.stored_path and Path(att.stored_path).exists():
             return Path(att.stored_path)
 
+        ctx = self.mails.mail_context_of_attachment(attachment_id)
+        if ctx is None:
+            raise FileNotFoundError("找不到附件所属邮件")
+
+        part_index = (ctx.get("part_index") or "").strip()
+        if not part_index:
+            raise ValueError(
+                "该附件缺少 IMAP 部件编号，无法下载。\n"
+                "可能是旧版本同步的数据，请重新同步该邮件后再试。"
+            )
+
+        account = self.accounts.get(ctx["account_id"])
+        if account is None:
+            raise FileNotFoundError("附件所属账号已被删除")
+
+        ciphertext = self.accounts.get_credential(account.id)
+        if ciphertext is None:
+            raise SecurityError("无法获取该账号凭据，请重新添加账号")
+        password = self.security.decrypt_secret(ciphertext)
+
+        adapter = get_adapter(account.platform)
+        imap = None
+        try:
+            imap = adapter.connect(account, password)
+            try:
+                imap.select(ctx["folder"] or "INBOX", readonly=True)
+            except Exception:  # noqa: BLE001
+                pass
+            raw = adapter.fetch_attachment(imap, str(ctx["uid"]), part_index)
+        except ImapError as exc:
+            raise ImapError(f"从服务器下载附件失败：{exc}") from exc
+        finally:
+            if imap is not None:
+                adapter.disconnect(imap)
+
+        if not raw:
+            raise ValueError("服务器返回的附件内容为空")
+
+        # 按原始 MIME 重新解码（IMAP 返回的可能是 base64/quoted-printable）
+        data = self._decode_attachment_payload(raw, att.content_type)
+
         safe = _UNSAFE_FILENAME.sub("_", att.filename or "attachment.bin")
         target = ATTACHMENT_DIR / f"{att.id[:8]}_{safe}"
-        if not target.exists():
-            target.write_bytes(f"[UniMail] 附件 {att.filename} 占位内容".encode("utf-8"))
+        target.write_bytes(data)
         self.attachments.set_stored_path(attachment_id, str(target))
+        log.info("附件已下载：%s (%d 字节)", target.name, len(data))
         return target
+
+    @staticmethod
+    def _decode_attachment_payload(raw: bytes, content_type: str) -> bytes:
+        """IMAP BODY[part] 返回的是**已解码**内容，但部分服务器会返回带
+        Content-Transfer-Encoding 头的原文。这里做兼容处理。"""
+        # 多数情况：服务器已按 CTE 解码，直接用
+        if not raw.startswith(b"Content-"):
+            return raw
+        # 少数情况：返回了完整的 MIME 片段，交给 email 库解析
+        try:
+            import email as _email
+            msg = _email.message_from_bytes(raw)
+            payload = msg.get_payload(decode=True)
+            if payload:
+                return payload
+        except Exception:  # noqa: BLE001
+            log.warning("附件 MIME 解码失败，回退为原始字节")
+        return raw
 
 
 def humanize_time(dt: datetime | None) -> str:
