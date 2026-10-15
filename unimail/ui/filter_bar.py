@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from PySide6.QtCore import QDateTime, Qt, QTimer, Signal
+from PySide6.QtCore import QDateTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,

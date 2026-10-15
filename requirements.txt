@@ -2,8 +2,24 @@
 # Python 3.10+
 
 PySide6>=6.6          # 桌面 UI 框架
-cryptography>=42.0    # Fernet 对称加密 + PBKDF2 密钥派生
+# cryptography >= 44 才有 kdf.argon2.Argon2id。低版本会自动回退到 PBKDF2
+# （见 core/security.py 的 _ARGON2_AVAILABLE），但那等于失去内存硬性，
+# 因此这里把它作为硬下限。
+cryptography>=44.0    # Fernet 对称加密 + Argon2id / PBKDF2 密钥派生
 
-# 可选：整库加密（强烈推荐）
-# 未安装时程序会降级为「SQLite + 字段级加密」，启动时会明确提示
-# sqlcipher3-binary>=0.5
+# 整库加密（强烈推荐）。未安装时程序会降级为「SQLite + 字段级加密」，
+# 启动时会明确提示当前加密等级，并可在「文件 → 数据库加密设置」中一键迁移。
+#
+# 驱动选择说明：两个发行线都提供同名 sqlcipher3 模块，代码无需改动。
+#   * sqlcipher3-binary 只发布了 **Linux x86_64** 轮子——Windows 装不上，
+#     macOS 装不上，Linux aarch64 也装不上（会退化成从源码编译 SQLCipher）。
+#     因此**不要**再用 `sys_platform != "win32"` 这类标记，那会把 macOS 用户坑死。
+#   * sqlcipher3-wheels 覆盖 win32/win_amd64/win_arm64、macOS（x86_64 + arm64）、
+#     Linux（manylinux_2_28 与 musllinux 的 x86_64/aarch64/i686/ppc64le/s390x），
+#     是唯一能在三个平台上都装到预编译轮子的发行线，故全平台统一用它。
+#   * 上限锁 0.5.6：0.5.7（SQLite 3.51.1 构建）在 Windows 上启用
+#     `PRAGMA cipher_memory_security = ON` 会触发栈溢出直接崩溃进程；
+#     0.5.6（SQLite 3.50.4）经 10/10 轮验证稳定。
+#   * 注意 0.5.6 的 Linux 轮子是 manylinux_2_28，需要 glibc >= 2.28
+#     （CentOS 8 / Ubuntu 18.10 及更新的发行版都满足）。
+sqlcipher3-wheels==0.5.6

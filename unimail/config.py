@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
@@ -30,10 +30,24 @@ LOG_PATH: Path = DATA_DIR / "unimail.log"
 ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- 安全参数
-KDF_ITERATIONS = 600_000          # PBKDF2-HMAC-SHA256 迭代次数
+# 主密码派生：默认 Argon2id（内存硬，GPU 相对 CPU 的优势基本失效）。
+# PBKDF2 的参数保留，用于「旧库仍以 PBKDF2 派生」时的兼容校验与渐进升级。
+KDF_ALGORITHM = "argon2id"        # argon2id | pbkdf2
+KDF_ITERATIONS = 600_000          # 仅 PBKDF2 使用
 KDF_SALT_BYTES = 16
-KDF_ALGORITHM = "PBKDF2HMAC-SHA256"
-DB_VERSION = 3                    # v3: mails.uid_validity
+ARGON2_TIME_COST = 3
+ARGON2_MEMORY_COST_KIB = 64 * 1024    # 64 MiB
+ARGON2_PARALLELISM = 1
+ARGON2_HASH_LEN = 32
+
+# 主密码策略：下限 12 位。600k 次 PBKDF2 实测仅 0.069 s（单核 ~14 次/秒），
+# 6 位密码在字典攻击下是分钟级；这是「弱口令 = 全量邮件泄露」最现实的入口。
+PASSWORD_MIN_LENGTH = 12
+UNLOCK_MAX_ATTEMPTS = 5               # 单次运行内的尝试次数上限（配合退避）
+UNLOCK_BACKOFF_BASE = 1.0             # 退避基数（秒）：1,2,4,8… 上限见下
+UNLOCK_BACKOFF_MAX = 30.0
+
+DB_VERSION = 4                    # v4: 重建列表筛选相关索引
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
 
 # TLS 证书校验：默认强制校验。仅在明确知晓风险时（如企业自建服务器使用自签证书），
@@ -51,9 +65,34 @@ MAX_FETCH_PER_RUN = 5000          # 首次同步单次运行入库上限，0 = �
 SCHEDULER_TICK = 30               # 调度器心跳（秒）
 FETCH_TIMEOUT = 30                # IMAP 超时
 
+# ---------------------------------------------------------------- 附件
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024    # 单个附件下载上限，0 = 不限
+# 危险扩展名：下载后不还原成可执行后缀，而是保留 .download 并在 UI 显式警示，
+# 避免「双击附件即执行」这条最常见的诱导路径。
+DANGEROUS_EXTENSIONS = frozenset({
+    "exe", "com", "scr", "pif", "bat", "cmd", "ps1", "psm1", "vbs", "vbe",
+    "js", "jse", "wsf", "wsh", "hta", "jar", "msi", "msp", "cpl", "dll",
+    "lnk", "url", "iso", "img", "vhd", "reg", "apk", "app", "dmg", "sh",
+    "run", "desktop", "scf", "chm",
+})
+
 # ---------------------------------------------------------------- 数据库
 DB_BUSY_TIMEOUT_MS = 5000         # 并发写等待锁超时
 DB_CACHE_KIB = 8000               # 每连接页缓存（负值语义：KiB）
+
+
+def sqlcipher_pip_hint() -> str:
+    """SQLCipher 安装命令。
+
+    历史上这里按平台返回两个不同的包名，但 `sqlcipher3-binary` 实际只发布了
+    **Linux x86_64** 轮子——macOS 和 Linux aarch64 用户照着提示装必然失败。
+    `sqlcipher3-wheels` 是唯一在 Windows / macOS / Linux 三端都提供预编译轮子
+    的发行线，因此全平台统一提示它。
+
+    版本锁 0.5.6：0.5.7 与 `PRAGMA cipher_memory_security = ON` 组合在 Windows
+    上会栈溢出崩溃进程（requirements.txt 里同样锁定）。
+    """
+    return 'pip install "sqlcipher3-wheels==0.5.6"'
 
 # ---------------------------------------------------------------- 平台定义
 @dataclass(frozen=True)
@@ -130,6 +169,16 @@ def sidecar_path(db_path: Path | None = None) -> Path:
     return (db_path or DB_PATH).with_suffix(".meta.json")
 
 
+def guard_path(db_path: Path | None = None) -> Path:
+    """解锁失败退避的持久化文件路径。
+
+    文件里只有「失败次数 + 下次可用时间」，不含任何密钥或密文，
+    因此可以明文保存——它的作用是让退避**跨进程重启依然生效**
+    （否则「关掉再打开」就等于把尝试次数清零）。
+    """
+    return (db_path or DB_PATH).with_suffix(".guard.json")
+
+
 def data_file_paths(db_path: Path | None = None) -> list[Path]:
     """数据库相关的全部本地文件：主库、WAL/SHM/journal、侧车及其备份/临时文件。
 
@@ -145,6 +194,7 @@ def data_file_paths(db_path: Path | None = None) -> list[Path]:
     ]
     meta = sidecar_path(db)
     files += [meta, meta.with_name(meta.name + ".bak"), meta.with_name(meta.name + ".tmp")]
+    files.append(guard_path(db))
     return files
 
 

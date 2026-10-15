@@ -3,10 +3,10 @@ from .adapters import all_platforms, get_adapter
 from .base import Folder, ImapAdapter, ImapError, make_account_stub
 
 __all__ = [
-    "get_adapter",
-    "all_platforms",
+    "Folder",
     "ImapAdapter",
     "ImapError",
-    "Folder",
+    "all_platforms",
+    "get_adapter",
     "make_account_stub",
 ]

@@ -4,9 +4,9 @@ from .scheduler import Scheduler
 from .worker import SyncWorker, WorkerPool
 
 __all__ = [
+    "BodyFetchPool",
+    "BodyFetchWorker",
     "Scheduler",
     "SyncWorker",
     "WorkerPool",
-    "BodyFetchPool",
-    "BodyFetchWorker",
 ]

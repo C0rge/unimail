@@ -1,13 +1,14 @@
 """按需拉取邮件正文：在后台线程中补拉单封邮件的完整正文。"""
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from PySide6.QtCore import QThread, Signal
 
 from ..core.events import EventBus
 from ..core.security import SecurityError
-from ..core.services import AccountService
+from ..core.services import AccountService, unlink_attachment_file
 from ..platforms import ImapError, get_adapter
 from ..storage import MailRepository
 
@@ -46,17 +47,22 @@ class BodyFetchWorker(QThread):
         try:
             password = self.account_service.reload_password(account)
             imap = adapter.connect(account, password)
-            try:
+            # 只读 select 被拒绝不影响后续 FETCH（连接时通常已默认选中 INBOX）
+            with contextlib.suppress(Exception):
                 imap.select(self.folder, readonly=True)
-            except Exception:  # noqa: BLE001
-                pass
             mail = adapter.fetch_message(imap, self.uid, self.folder)
             self.mails.update_body(self.mail_id, mail.body_text, mail.body_html)
+            # 全文解析能给出最完整的附件信息（含 content_id / 精确文件名），
+            # 按 part 编号对齐回填；此前这里只写正文，附件元数据被直接丢弃，
+            # 导致「点开邮件也看不到附件列表」。
+            if mail.attachments:
+                for path in self.mails.replace_attachments(self.mail_id, mail.attachments):
+                    unlink_attachment_file(path)
             self.fetched.emit(self.mail_id, mail.body_text, mail.body_html)
             log.debug("已补拉正文：mail=%s uid=%s", self.mail_id[:8], self.uid)
         except (ImapError, SecurityError) as exc:
             self.failed.emit(self.mail_id, str(exc))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.exception("补拉正文失败")
             self.failed.emit(self.mail_id, f"补拉正文异常：{exc}")
         finally:

@@ -3,6 +3,7 @@ from .database import (
     SQLCIPHER_AVAILABLE,
     Database,
     DatabaseError,
+    sqlcipher_available,
 )
 from .repositories import (
     AccountRepository,
@@ -12,11 +13,12 @@ from .repositories import (
 )
 
 __all__ = [
-    "Database",
-    "DatabaseError",
     "SQLCIPHER_AVAILABLE",
     "AccountRepository",
-    "MailRepository",
     "AttachmentRepository",
     "CursorRepository",
+    "Database",
+    "DatabaseError",
+    "MailRepository",
+    "sqlcipher_available",
 ]

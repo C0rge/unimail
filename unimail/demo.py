@@ -8,7 +8,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from .core.models import AccountDraft, AttachmentMeta, NormalizedMail
-from .storage.repositories import utcnow_iso
 
 log = logging.getLogger(__name__)
 

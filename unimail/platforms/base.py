@@ -5,12 +5,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 import imaplib
 import logging
 import ssl
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import timedelta
 
 from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
 from ..core.models import Account, NormalizedMail
@@ -18,7 +17,9 @@ from . import parser
 
 log = logging.getLogger(__name__)
 
-imaplib._MAXLINE = 10_000_000  # type: ignore[attr-defined]  # 大邮件头
+# 大邮件头：imaplib 默认单行上限仅 10 KB，长 References / 长主题会被静默截断。
+# `_MAXLINE` 是 CPython 有意暴露的模块级开关，只能直接改模块属性。
+imaplib._MAXLINE = 10_000_000  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def tls_context(allow_invalid: bool = False) -> ssl.SSLContext:
@@ -51,8 +52,14 @@ class Folder:
     display: str
 
 
-class ImapAdapter(ABC):
-    """IMAP 平台适配器抽象基类。"""
+class ImapAdapter:
+    """IMAP 平台适配器。
+
+    刻意**不**继承 `abc.ABC`：`probe()` 等方法的默认实现是抛
+    `NotImplementedError`，而适配器的调用方只依赖 `connect/fetch_*/search_*`
+    这几个通用方法，抽象基类在这里只会造成「子类必须实现全部抽象方法」的
+    过度约束（例如仅用于解析单测的轻量子类）。
+    """
 
     platform: str = "custom"
 
@@ -72,6 +79,8 @@ class ImapAdapter(ABC):
         )
         ctx = tls_context(allow_invalid)
 
+        # 显式标注为基类：IMAP4_SSL 是 IMAP4 的子类，两个分支共用一个变量
+        imap: imaplib.IMAP4
         try:
             if account.use_ssl:
                 imap = imaplib.IMAP4_SSL(host, port, timeout=FETCH_TIMEOUT,
@@ -107,10 +116,9 @@ class ImapAdapter(ABC):
         except OSError as exc:
             raise ImapError(f"登录过程中连接中断：{exc}") from exc
 
-        try:
+        # select 失败不构成连接失败：后续操作会各自 select 到需要的文件夹
+        with contextlib.suppress(imaplib.IMAP4.error):
             imap.select("INBOX", readonly=True)
-        except imaplib.IMAP4.error:
-            pass
         self.post_login(imap)
         return imap
 
@@ -134,16 +142,13 @@ class ImapAdapter(ABC):
 
     @staticmethod
     def disconnect(imap: imaplib.IMAP4 | None) -> None:
+        """尽力优雅退出：连接可能已断，任何一步失败都不影响调用方。"""
         if imap is None:
             return
-        try:
+        with contextlib.suppress(imaplib.IMAP4.error, OSError):
             imap.close()
-        except (imaplib.IMAP4.error, OSError):
-            pass
-        try:
+        with contextlib.suppress(imaplib.IMAP4.error, OSError):
             imap.logout()
-        except (imaplib.IMAP4.error, OSError):
-            pass
 
     # ------------------------------------------------------------ 探测
     def verify(self, account: Account, password: str) -> None:
@@ -161,7 +166,7 @@ class ImapAdapter(ABC):
     # ------------------------------------------------------------ 文件夹
     def list_folders(self, imap: imaplib.IMAP4) -> list[Folder]:
         try:
-            typ, data = imap.list()
+            _typ, data = imap.list()
         except imaplib.IMAP4.error as exc:
             raise ImapError(f"获取文件夹失败：{exc}") from exc
         folders: list[Folder] = []
@@ -187,10 +192,11 @@ class ImapAdapter(ABC):
         """
         try:
             imap.select("INBOX", readonly=True)
+            # imaplib 的 uid() 会跳过 None 参数；这里直接给检索式即可
             if since_uid > 0:
-                typ, data = imap.uid("SEARCH", None, f"UID {since_uid + 1}:*")
+                typ, data = imap.uid("SEARCH", f"UID {since_uid + 1}:*")
             else:
-                typ, data = imap.uid("SEARCH", None, "ALL")
+                typ, data = imap.uid("SEARCH", "ALL")
         except imaplib.IMAP4.error as exc:
             raise ImapError(f"搜索邮件失败：{exc}") from exc
         if typ != "OK" or not data or not data[0]:
@@ -237,6 +243,56 @@ class ImapAdapter(ABC):
             if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], bytes):
                 return item[1]
         return b""
+
+    def fetch_attachment_meta(self, imap: imaplib.IMAP4, uids: list[str],
+                              folder: str = "INBOX") -> dict[str, list]:
+        """批量获取多封邮件的附件元数据（BODYSTRUCTURE，**不下载正文**）。
+
+        为什么需要它：列表同步只 FETCH `BODY.PEEK[HEADER]`，拿到的字节里没有
+        任何 MIME 部件，因此 `parse_headers_only` 永远解析不出附件——邮件在
+        列表里不显示 📎，也永远不会产生可下载的附件记录。BODYSTRUCTURE 由
+        服务器直接给出结构（类型/文件名/字节数），一次 FETCH 可覆盖整页 UID。
+
+        典型开销：每页 1 次往返（而不是每封 1 次）。任何失败都返回空字典，
+        绝不让「附件信息」这个附加项拖垮整次同步。
+        """
+        result: dict[str, list] = {}
+        if not uids:
+            return result
+        try:
+            imap.select(folder, readonly=True)
+            typ, data = imap.uid(
+                "FETCH", ",".join(str(u) for u in uids), "(UID BODYSTRUCTURE)"
+            )
+        except (imaplib.IMAP4.error, OSError) as exc:
+            log.debug("获取 BODYSTRUCTURE 失败（将退回无附件信息）：%s", exc)
+            return result
+        if typ != "OK" or not data:
+            return result
+
+        for item in data:
+            head = b""
+            tail = b""
+            if isinstance(item, tuple) and len(item) >= 2:
+                head = item[0] if isinstance(item[0], bytes) else b""
+                tail = item[1] if isinstance(item[1], bytes) else b""
+            elif isinstance(item, bytes):
+                head = item
+            if not head and not tail:
+                continue
+            if b"BODYSTRUCTURE" not in head.upper() and tail:
+                blob = tail          # 少数服务器把结构体放在第 2 项
+            elif tail:
+                # 字面量形式的响应：结构体被拆成「前缀 + {n}\r\n<字面量>」两段，
+                # 只取 head 会得到括号不配平的残缺文本，必须拼回去。
+                blob = head + tail
+            else:
+                blob = head
+            uid, structure = parser.extract_bodystructure_from_fetch(blob)
+            if uid is None or structure is None:
+                continue
+            result[uid] = parser.parse_bodystructure(structure)
+        return result
 
     def uid_validity(self, imap: imaplib.IMAP4) -> int | None:
         try:

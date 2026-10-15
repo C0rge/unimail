@@ -1,0 +1,94 @@
+# 工程基线配置（lint / 类型 / 测试）。
+#
+# 这里**只放工具配置**，不声明 [project]：UniMail 是一个应用（由 main.py 启动、
+# 用 PyInstaller 打包），不是一个需要 pip install 的分发包。运行依赖仍以
+# requirements.txt 为唯一事实源，开发依赖见 requirements-dev.txt。
+# 这样避免出现「两份依赖声明互相漂移」的经典问题。
+
+# ---------------------------------------------------------------- 代码风格
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "dist", "*.spec"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes（未使用变量 / 未定义名）
+    "W",    # pycodestyle warnings
+    "I",    # import 排序
+    "UP",   # pyupgrade（现代语法）
+    "B",    # bugbear（易错写法：可变默认值、except 里 raise 丢栈等）
+    "BLE",  # 盲捕异常 except Exception —— 代码里已有的 noqa: BLE001 就是为它写的
+    "SLF",  # 私有成员访问（测试里有意的白盒断言）
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "PIE",  # 杂项
+    "RUF",  # ruff 自有规则
+    "S",    # bandit：安全问题（本项目核心关注点之一）
+]
+ignore = [
+    "E501",    # 行长交给 formatter，硬断行反而更难读
+    "B008",    # 调用表达式作默认值（Qt 惯用法）
+    "S311",    # 非密码学随机（仅用于演示数据）
+    "RUF001",  # 全角标点：中文注释/文案的必然结果
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试用断言做校验、直接调私有方法构造场景，都是有意的
+"tests/*" = ["S101", "SLF001", "S105", "S106", "S108", "S110", "S608"]
+# UI 层不可避免要处理路径/子进程/环境变量
+"unimail/ui/*" = ["S603", "S607", "S101"]
+"unimail/platforms/*" = ["S324"]
+# 迁移与安全流程中必须能兜住任意异常
+"unimail/storage/*" = ["S110"]
+# 演示数据脚本：内置演示主密码是刻意的（且会在界面上明确告知），
+# 断言仅用于自检演示数据是否注入成功。
+"unimail/demo.py" = ["S105", "S101"]
+# 打包脚本要调用 PyInstaller 子进程
+"build_exe.py" = ["S603", "S607", "SIM108"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["unimail"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ---------------------------------------------------------------- 类型检查
+[tool.mypy]
+python_version = "3.10"
+files = ["unimail", "main.py"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+warn_redundant_casts = true
+no_implicit_optional = true
+# 逐模块收紧：先把已经干净的模块纳入严格检查，其余保持默认，
+# 避免一次性打开全部规则导致 CI 长期红着没人看。
+[[tool.mypy.overrides]]
+module = ["unimail.core.*", "unimail.storage.*", "unimail.sync.*", "unimail.platforms.*"]
+check_untyped_defs = true
+
+# PySide6 的类型桩与运行期行为不一致（`QMessageBox.Yes` / `QLineEdit.Password`
+# 这类 Qt6 枚举在运行期可用，但桩里报 attr-defined；`self.ctx.accounts` 的
+# Optional 收窄也跨不过属性访问）。在这些文件上把关没有收益，只会逼出
+# 一堆 `# type: ignore`——真正需要类型保护的是 core / storage / sync，
+# 它们仍然保持检查。
+[[tool.mypy.overrides]]
+module = ["unimail.ui.*", "main"]
+ignore_errors = true
+
+# ---------------------------------------------------------------- 测试
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["smoke.py"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    # 第三方库的弃用噪音不影响本项目（例如 cryptography 内部 API 演进）；
+    # 本项目自身的弃用警告则视为需要处理的问题。
+    "ignore::DeprecationWarning:cryptography.*",
+    "default::DeprecationWarning:unimail.*",
+]

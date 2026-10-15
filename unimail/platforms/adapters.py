@@ -7,9 +7,8 @@ from __future__ import annotations
 import imaplib
 import logging
 
-from .base import ImapAdapter
-
 from ..config import APP_VERSION
+from .base import ImapAdapter
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +25,7 @@ class QQMailAdapter(ImapAdapter):
 
     def list_folders(self, imap: imaplib.IMAP4):
         try:
-            typ, data = imap.list()
+            _typ, data = imap.list()
             folders = []
             for line in data or []:
                 if not line:

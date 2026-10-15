@@ -1,9 +1,6 @@
 """事件总线：解耦后台同步线程与 UI。"""
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Any, Callable
-
 from PySide6.QtCore import QObject, Signal
 
 

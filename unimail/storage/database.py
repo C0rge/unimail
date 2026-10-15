@@ -15,14 +15,21 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sqlite3
 import threading
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-from ..config import DB_BUSY_TIMEOUT_MS, DB_CACHE_KIB, DB_VERSION
+from ..config import (
+    DB_BUSY_TIMEOUT_MS,
+    DB_CACHE_KIB,
+    DB_VERSION,
+    sqlcipher_pip_hint,
+)
 
 log = logging.getLogger(__name__)
 
@@ -34,10 +41,30 @@ try:  # pragma: no cover - 依赖环境
 except ImportError:
     sqlcipher_db = None  # type: ignore
 
+def sqlcipher_available() -> bool:
+    """当前环境是否具备 SQLCipher 驱动。
+
+    **唯一的查询入口**。历史上同时存在「模块级常量 `SQLCIPHER_AVAILABLE`」与
+    「内部变量 `_SQLCIPHER_AVAILABLE`」两份事实源：前者在导入期被各模块按值绑定，
+    后者在本模块内实时读取。两者一旦不同步（例如测试中替换开关、或将来做运行时
+    探测），就会出现「Database 认为自己加密、调用方认为环境缺依赖」的分裂。
+    因此统一改成函数调用，取值永远反映当下状态。
+    """
+    return _SQLCIPHER_AVAILABLE
+
+
+# 兼容旧引用：新代码请使用 sqlcipher_available()。此名在导入期绑定，仅作兼容保留。
 SQLCIPHER_AVAILABLE = _SQLCIPHER_AVAILABLE
 
 DRIVER_SQLCIPHER = "sqlcipher"
 DRIVER_SQLITE3 = "sqlite3"
+
+# SQLCipher 与标准库 sqlite3 是两套彼此独立的 C 扩展：Row / Cursor / 异常类型
+# 之间不存在继承关系（sqlite3.Row 只接受 sqlite3.Cursor 作参数）。因此凡是两种
+# 驱动都要走的代码，都必须按当前连接实际使用的驱动取对应的类型，不能混用。
+_DB_ERRORS: tuple[type[Exception], ...] = (sqlite3.DatabaseError,)
+if _SQLCIPHER_AVAILABLE:
+    _DB_ERRORS += (sqlcipher_db.DatabaseError,)
 
 
 class DatabaseError(RuntimeError):
@@ -123,15 +150,31 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 # 索引与表分开：老库在迁移补齐列之前，引用新列的索引是无法建立的，
 # 因此索引必须**在所有迁移完成之后**再创建。
+#
+# 索引设计要点：
+#   * 列表排序统一是 `ORDER BY date DESC`，所以凡是带筛选维度的索引都把
+#     `date DESC` 放在末尾，才能既做过滤又免掉 `TEMP B-TREE` 排序。
+#   * 「仅未读」在历史实现里走 `idx_mails_read(is_read)`，取完全部未读再全量排序
+#     （实测 2 万封 14.8 ms）。改成 `(is_read, date DESC)` 后过滤与排序一次完成。
+#   * 账号维度是 UI 最常用的组合，补 `(account_id, is_read, date DESC)`，
+#     它同时能高效服务「按账号统计未读数」的 GROUP BY。
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_mails_date     ON mails(date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_account  ON mails(account_id, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_platform ON mails(platform, date DESC);
-CREATE INDEX IF NOT EXISTS idx_mails_read     ON mails(is_read);
+CREATE INDEX IF NOT EXISTS idx_mails_read     ON mails(is_read, date DESC);
+CREATE INDEX IF NOT EXISTS idx_mails_acc_read ON mails(account_id, is_read, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_folder   ON mails(account_id, folder, uid);
 CREATE INDEX IF NOT EXISTS idx_mails_validity ON mails(account_id, folder, uid_validity);
 CREATE INDEX IF NOT EXISTS idx_attach_mail    ON attachments(mail_id);
 """
+
+# 需要重建的索引：定义已变更，`CREATE INDEX IF NOT EXISTS` 对同名旧索引无效，
+# 必须先 DROP 再建，否则老库会一直沿用旧定义。
+REBUILT_INDEXES = {
+    "idx_mails_read": "CREATE INDEX IF NOT EXISTS idx_mails_read "
+                      "ON mails(is_read, date DESC)",
+}
 
 
 class Database:
@@ -162,7 +205,8 @@ class Database:
         if encrypted and not _SQLCIPHER_AVAILABLE:
             raise DatabaseError(
                 "该数据库使用 SQLCipher 整库加密，但当前环境未安装 sqlcipher3。\n"
-                "请先安装依赖后重新启动：pip install sqlcipher3-binary\n"
+                "请先安装依赖后重新启动：\n"
+                f"    {sqlcipher_pip_hint()}\n"
                 "（切勿删除数据库文件，安装依赖后即可正常打开。）"
             )
         if encrypted and db_key is None:
@@ -191,14 +235,29 @@ class Database:
         """是否支持整库重加密（仅以加密方式打开的库支持）。"""
         return self._encrypted
 
+    @property
+    def _key_hex(self) -> str:
+        """当前整库密钥的 hex（SQLCipher 用 `x'…'` 形式接收）。
+
+        构造函数已保证「encrypted ⇒ db_key 非空」，这里再兜一次：
+        密钥缺失时必须是可读错误，而不是 `None.hex()` 的 AttributeError。
+        """
+        if self._db_key is None:
+            raise DatabaseError("数据库为加密库，但未提供解锁密钥")
+        return self._db_key.hex()
+
     def _new_connection(self):
         if self._encrypted:
             conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
-            conn.execute(f"PRAGMA key = \"x'{self._db_key.hex()}'\"")
+            conn.execute(f"PRAGMA key = \"x'{self._key_hex}'\"")
             conn.execute("PRAGMA cipher_memory_security = ON")
+            # 必须用 SQLCipher 自己的 Row：sqlite3.Row 会拒绝 sqlcipher3 的 Cursor，
+            # 抛 "Row() argument 1 must be sqlite3.Cursor"。
+            row_factory = getattr(sqlcipher_db, "Row", sqlite3.Row)
         else:
             conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+            row_factory = sqlite3.Row
+        conn.row_factory = row_factory
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_MS)}")
@@ -223,7 +282,7 @@ class Database:
         try:
             # 触发一次真实读，尽早暴露「密钥错误 / 驱动不匹配 / 文件损坏」
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-        except sqlite3.DatabaseError as exc:
+        except _DB_ERRORS as exc:
             raise DatabaseError(self._open_error_hint(exc)) from exc
 
         conn.executescript(SCHEMA)
@@ -268,6 +327,14 @@ class Database:
             )
             current = 3
             log.info("数据库已从 v%d 迁移到 v3（新增 mails.uid_validity）", from_version)
+        if current < 4:
+            # 索引定义变更（v4：idx_mails_read 由单列改为 (is_read, date DESC)）。
+            # `CREATE INDEX IF NOT EXISTS` 遇到同名旧索引会直接跳过，因此必须
+            # 先显式删除；重建交给 `_init_connection` 里统一执行 INDEXES。
+            for name in REBUILT_INDEXES:
+                self.execute(f"DROP INDEX IF EXISTS {name}")
+            current = 4
+            log.info("数据库已从 v%d 迁移到 v4（重建列表筛选相关索引）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
 
@@ -296,14 +363,12 @@ class Database:
             conns = self._conns
             self._conns = []
         for conn in conns:
-            try:
+            # 关闭路径尽力而为：连接可能已因底层错误失效，
+            # 任何一步失败都不应阻止其余连接被回收。
+            with contextlib.suppress(Exception):
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:  # noqa: BLE001 - 关闭路径尽力而为
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 conn.close()
-            except Exception:  # noqa: BLE001
-                pass
         self._local.conn = None
         self._closed = True
 
@@ -414,7 +479,12 @@ class Database:
         """明文库 → SQLCipher 加密库（官方 sqlcipher_export 配方 + 原子替换）。
 
         迁移前会保留 `*.plaintext.bak`；迁移后的文件会先校验（能否用新密钥打开、
-        行数是否一致）再替换，任一步失败都保持原库不变。
+        行数是否一致）再替换，任一步失败都保持原库不变、并清掉半成品临时文件。
+
+        已知残留风险：最终是两次 `os.replace`（先备份原库、再把新库改名就位），
+        两者之间掉电会留下「原库已改名为 .bak、主文件缺失」的状态。这不是可以
+        用一次 rename 消除的问题（跨文件系统无法原子重命名两个文件），
+        但此时数据完整地躺在 `.plaintext.bak` 里，日志与错误提示都会给出该路径。
         """
         if not _SQLCIPHER_AVAILABLE:
             raise DatabaseError("未安装 sqlcipher3，无法启用整库加密")
@@ -441,7 +511,7 @@ class Database:
             conn.execute("SELECT sqlcipher_export('encrypted')")
             conn.execute("DETACH DATABASE encrypted")
             conn.commit()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if tmp.exists():
                 tmp.unlink()
             self._reopen()
@@ -449,7 +519,15 @@ class Database:
         finally:
             conn.close()
 
-        self._verify_migrated_file(tmp, new_key, expect, encrypted=True)
+        # 校验不通过时：清掉半成品、把连接恢复回原库。
+        # 不这样做的话，迁移失败会把 Database 对象永远留在「已关闭」状态，
+        # 用户看到的是「迁移失败」之后连原库也用不了，只能重启程序。
+        try:
+            self._verify_migrated_file(tmp, new_key, expect, encrypted=True)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            self._reopen()
+            raise
 
         backup = src.with_name(src.name + ".plaintext.bak")
         if backup.exists():
@@ -477,7 +555,7 @@ class Database:
         if not src.exists():
             raise DatabaseError("数据库文件不存在，无法迁移")
 
-        old_key = self._db_key
+        old_key = self._key_hex
         expect = self.scalar("SELECT COUNT(*) FROM mails") or 0
         self.close()
         self._remove_sidecar_files(src)
@@ -488,12 +566,12 @@ class Database:
 
         conn = sqlcipher_db.connect(str(src))
         try:
-            conn.execute(f"PRAGMA key = \"x'{old_key.hex()}'\"")
+            conn.execute(f"PRAGMA key = \"x'{old_key}'\"")
             conn.execute("ATTACH DATABASE ? AS plaintext KEY ''", (str(tmp),))
             conn.execute("SELECT sqlcipher_export('plaintext')")
             conn.execute("DETACH DATABASE plaintext")
             conn.commit()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if tmp.exists():
                 tmp.unlink()
             self._reopen()
@@ -501,7 +579,13 @@ class Database:
         finally:
             conn.close()
 
-        self._verify_migrated_file(tmp, None, expect, encrypted=False)
+        try:
+            self._verify_migrated_file(tmp, None, expect, encrypted=False)
+        except BaseException:
+            # 同 migrate_to_encrypted：失败要清临时文件并把连接恢复回原库
+            tmp.unlink(missing_ok=True)
+            self._reopen()
+            raise
 
         backup = src.with_name(src.name + ".encrypted.bak")
         if backup.exists():
@@ -528,13 +612,15 @@ class Database:
                               expect_rows: int, encrypted: bool) -> None:
         """替换前校验迁移结果：可打开、可读、行数一致。"""
         if encrypted:
+            if key is None:
+                raise DatabaseError("内部错误：校验加密库时缺少密钥")
             conn = sqlcipher_db.connect(str(path))
             conn.execute(f"PRAGMA key = \"x'{key.hex()}'\"")
         else:
             conn = sqlite3.connect(str(path))
         try:
             rows = conn.execute("SELECT COUNT(*) FROM mails").fetchone()[0]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             conn.close()
             path.unlink(missing_ok=True)
             raise DatabaseError(f"迁移结果校验失败（无法读取新库）：{exc}") from exc

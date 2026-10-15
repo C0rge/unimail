@@ -6,17 +6,28 @@
     3. 【回归】改主密码后凭据仍可解密（v1.0.0 严重 bug）
     4. 【回归】IMAP part 编号正确（v1.0.0 用 walk() 序号，取错附件）
     5. 【回归】附件下载返回真实字节流（v1.0.0 是占位文本）
-    6. 数据库迁移：v1 → v3 自动补列
+    6. 数据库迁移：v1 → 当前版本自动补列 / 重建索引
     7. TLS 证书校验（v1.2.0：修复 IMAP 不校验证书）
     8. 【回归】同步游标语义与 UIDVALIDITY 清理（v1.2.0：修复静默丢邮件）
     9. 侧车原子写 / 备份回退 / 恢复包（v1.2.0）
    10. 数据清理路径（--reset 覆盖真正的侧车文件名）
    11. 数据库并发三件套 + 加密模式 fail-closed（v1.2.0）
+   12. 批量写入 / 列投影 / LIKE 转义（v1.3.0）
+   13. 列表索引与查询计划（v1.3.0）
+   14. HTML 白名单清洗（v1.3.0：黑名单正则 → 白名单重建）
+   15. BODYSTRUCTURE 附件元数据（v1.3.0）
+   16. 【回归】同步回填附件信息（v1.3.0：修复附件永远进不了库）
+   17. 附件落盘安全策略（v1.3.0）
+   18. 孤儿附件清理（v1.3.0）
+   19. KDF 算法与密码策略（v1.3.0）
+   20. KDF 渐进升级（v1.3.0）
+   21. 解锁退避持久化（v1.3.0）
 
 运行：python tests/smoke.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import tempfile
@@ -48,8 +59,8 @@ def setup_env(prefix: str):
     cfg.ATTACHMENT_DIR = tmp / "attachments"
     cfg.ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
 
-    import unimail.ui.context as ctxmod
     import unimail.core.services as svcmod
+    import unimail.ui.context as ctxmod
     ctxmod.DB_PATH = cfg.DB_PATH
     svcmod.ATTACHMENT_DIR = cfg.ATTACHMENT_DIR
     return tmp, cfg, ctxmod, svcmod
@@ -62,7 +73,7 @@ def test_security():
     sec = SecurityService()
     params = SecurityService.new_kdf_params()
     sec.setup("hunter2", params)
-    verifier = SecurityService.make_verifier(sec._master_key)  # noqa: SLF001
+    verifier = SecurityService.make_verifier(sec._master_key)
 
     ct = sec.encrypt_secret("my-imap-password")
     check("凭据加解密", sec.decrypt_secret(ct) == "my-imap-password")
@@ -87,7 +98,11 @@ def test_storage():
     from unimail.core.models import AccountDraft, AttachmentMeta, MailFilter, NormalizedMail
     from unimail.core.security import SecurityService
     from unimail.storage import (
-        AccountRepository, AttachmentRepository, CursorRepository, Database, MailRepository,
+        AccountRepository,
+        AttachmentRepository,
+        CursorRepository,
+        Database,
+        MailRepository,
     )
 
     sec = SecurityService()
@@ -98,6 +113,7 @@ def test_storage():
     mails = MailRepository(db)
     cursors = CursorRepository(db)
     attaches = AttachmentRepository(db)
+    check("附件仓储可用", attaches is not None)
 
     acc = accounts.insert(AccountDraft(
         platform="qq", email="a@qq.com", password="x", display_name="测试"))
@@ -191,13 +207,21 @@ def test_change_password_regression():
 
     # 错误旧密码不能改密码
     try:
-        ctx2.change_password("wrong-old", "another-123")
+        ctx2.change_password("wrong-old", "another-123456")
         check("错误旧密码被拒绝", False, "竟然改成功了")
     except SecurityError:
         check("错误旧密码被拒绝", True)
 
+    # 新密码低于策略下限时必须在**动任何数据之前**被拒绝
+    try:
+        ctx2.change_password("new-password-456", "short")
+        check("改密码时新密码受策略约束", False, "竟然改成功了")
+    except SecurityError as exc:
+        check("改密码时新密码受策略约束", "12" in str(exc), f"实际 {exc}")
+
     check("失败后凭据未损坏",
           ctx2.accounts.reload_password(ctx2.accounts.get(a1.id)) == "SECRET-AAA")
+    check("改密码结果带回新的 KDF 描述", bool(res.kdf), f"实际 {res.kdf!r}")
     ctx2.db.close()
 
 
@@ -205,6 +229,7 @@ def test_change_password_regression():
 def test_imap_part_numbering():
     """v1.0.0 用 msg.walk() 序号当 IMAP part 编号，会取错附件。"""
     from email import message_from_bytes
+
     from unimail.platforms.parser import _extract_attachments, iter_imap_parts, parse_message
 
     raw = b"""From: =?utf-8?B?5byg5LiJ?= <zs@example.com>
@@ -295,7 +320,7 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
 --B--
 """
     ctx = AppContext()
-    ctx.bootstrap_new("pw123456")
+    ctx.bootstrap_new("pw1234567890")
     acc = ctx.accounts.add(AccountDraft(platform="qq", email="me@qq.com", password="code"))
 
     nm = parse_message(RAW, "200")
@@ -320,11 +345,13 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
     fake.disconnect = lambda x: None
 
     with patch.object(svcmod, "get_adapter", return_value=fake):
-        path = ctx.mails.download_attachment(atts[0].id)
+        result = ctx.mails.download_attachment(atts[0].id)
 
+    path = result.path
     content = path.read_bytes()
     check("下载的是真实字节流", content == FAKE_PDF, f"实际 {content[:40]!r}")
     check("不再是占位内容", "占位".encode() not in content)
+    check("普通附件不改名", not result.renamed and not result.danger)
 
     call = fake.fetch_attachment.call_args[0]
     check("FETCH 使用正确 part 编号", call[2] == "2", f"实际 {call[2]!r}")
@@ -332,18 +359,18 @@ JVBERi0xLjQgUkVBTCBQREYgQllURVM=
 
     fake.fetch_attachment.reset_mock()
     with patch.object(svcmod, "get_adapter", return_value=fake):
-        path2 = ctx.mails.download_attachment(atts[0].id)
+        result2 = ctx.mails.download_attachment(atts[0].id)
     check("二次下载命中缓存", fake.fetch_attachment.call_count == 0)
-    check("两次返回同一路径", path2 == path)
+    check("两次返回同一路径", result2.path == path)
 
     ctx.db.close()
 
 
 # ============================================================ 6. 数据库迁移
 def test_migration():
-    """v1 库（无 part_index / uid_validity 列）应能自动迁移到 v3。"""
+    """v1 库（无 part_index / uid_validity 列、旧索引定义）应能自动迁移到当前版本。"""
     import sqlite3
-    tmp, cfg, ctxmod, _svc = setup_env("mig_")
+    _tmp, cfg, _ctxmod, _svc = setup_env("mig_")
 
     conn = sqlite3.connect(str(cfg.DB_PATH))
     conn.executescript("""
@@ -379,7 +406,10 @@ def test_migration():
 
     sec = SecurityService()
     params = SecurityService.new_kdf_params()
-    db = Database(cfg.DB_PATH, sec.setup("pw123456", params))
+    # 显式声明明文：本用例用裸 sqlite3 造的是 v1 时代的明文库。不显式指定时，
+    # 装有 SQLCipher 的环境会把它推断为加密库 → `PRAGMA key` 打在明文库上 →
+    # `file is not a database`。这是「驱动必须显式」的正面验证，不能靠环境推断。
+    db = Database(cfg.DB_PATH, sec.setup("pw123456", params), encrypted=False)
 
     cols = {r["name"] for r in db.query_all("PRAGMA table_info(attachments)")}
     check("迁移后新增 part_index 列", "part_index" in cols, f"实际列: {sorted(cols)}")
@@ -388,8 +418,18 @@ def test_migration():
           f"实际列: {sorted(mail_cols)}")
     check("历史行按游标回填 uid_validity",
           int(db.query_one("SELECT uid_validity FROM mails WHERE id = 'm1'")["uid_validity"]) == 77)
-    check("db_version 升到 3", db.get_meta("db_version") == "3",
+    from unimail.config import DB_VERSION
+    check(f"db_version 升到 {DB_VERSION}", db.get_meta("db_version") == str(DB_VERSION),
           f"实际 {db.get_meta('db_version')}")
+
+    # v4 重建了 idx_mails_read（单列 → (is_read, date DESC)）。`CREATE INDEX
+    # IF NOT EXISTS` 对同名旧索引无效，必须 DROP 后再建，否则老库永远沿用旧定义。
+    read_idx = db.query_one(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_mails_read'")
+    check("v4 迁移重建了 idx_mails_read", read_idx is not None, "索引缺失")
+    check("重建后的索引带 date DESC 排序",
+          "date" in (read_idx or {}).get("sql", "").lower(),
+          f"实际 {(read_idx or {}).get('sql')!r}")
 
     db.close()
     db2 = Database(cfg.DB_PATH, None)
@@ -431,10 +471,8 @@ def test_tls_certificate_verification():
     original = imaplib.IMAP4_SSL
     imaplib.IMAP4_SSL = FakeSSL  # type: ignore[assignment]
     try:
-        try:
+        with contextlib.suppress(Exception):     # 只关心传参，连接必然失败
             get_adapter("custom").connect(acct, "pw")
-        except Exception:  # noqa: BLE001 - 只关心传参
-            pass
     finally:
         imaplib.IMAP4_SSL = original  # type: ignore[assignment]
 
@@ -484,6 +522,7 @@ class _FakeAdapter:
         self.fail_uids: set[int] = set()
         self.searches: list[tuple[int, int]] = []
         self.body_fetches: list[int] = []
+        self.meta_fetches: list[list[str]] = []
 
     def connect(self, account, password):
         return _FakeImap()
@@ -509,10 +548,24 @@ class _FakeAdapter:
                               date=datetime.now(timezone.utc))
 
     def fetch_message(self, imap, uid, folder="INBOX"):
-        from unimail.core.models import NormalizedMail
+        from unimail.core.models import AttachmentMeta, NormalizedMail
         self.body_fetches.append(int(uid))
+        # 完整解析比 BODYSTRUCTURE 多出 content_id：用于验证「按 part 对齐替换」
+        # 而不是「再插一行」。
+        atts = ([AttachmentMeta("page.pdf", "application/pdf", 128,
+                               content_id="cid-page", part_index="2")]
+                if int(uid) % 5 == 0 else [])
         return NormalizedMail(uid=str(uid), body_text=f"body {uid}",
-                              body_html=f"<p>body {uid}</p>")
+                              body_html=f"<p>body {uid}</p>", attachments=atts)
+
+    def fetch_attachment_meta(self, imap, uids, folder="INBOX"):
+        """模拟 BODYSTRUCTURE：每 5 封里有一封带附件。"""
+        from unimail.core.models import AttachmentMeta
+        self.meta_fetches.append([str(u) for u in uids])
+        return {
+            str(u): [AttachmentMeta("page.pdf", "application/pdf", 128, part_index="2")]
+            for u in uids if int(u) % 5 == 0
+        }
 
 
 def _make_sync_ctx(prefix):
@@ -521,7 +574,7 @@ def _make_sync_ctx(prefix):
     from unimail.ui.context import AppContext
 
     ctx = AppContext()
-    ctx.bootstrap_new("pw-123456")
+    ctx.bootstrap_new("pw-1234567890")
     account = ctx.accounts.add(AccountDraft(platform="qq", email="sync@qq.com",
                                             password="code"))
     return cfg, ctx, account
@@ -560,7 +613,7 @@ def test_sync_pagination_and_uidvalidity():
     """【回归】首同步必须分页追平（不再只入库最新 200 封），UIDVALIDITY 变化时清理旧副本。"""
     from unimail.core.models import MailFilter
 
-    cfg, ctx, account = _make_sync_ctx("sync_")
+    _cfg, ctx, account = _make_sync_ctx("sync_")
     mails = ctx.mails.mails
 
     # ---- 场景 A：450 封邮件，页大小 100 → 必须全部入库且游标推进到 450
@@ -590,7 +643,7 @@ def test_sync_pagination_and_uidvalidity():
           last_uid == 5 and validity == 999, f"实际 {last_uid}/{validity}")
 
     # ---- 场景 C：中途单封失败 → 游标停在该封之前，下次同步能续上
-    cfg2, ctx2, account2 = _make_sync_ctx("sync2_")
+    _cfg2, ctx2, account2 = _make_sync_ctx("sync2_")
     mails2 = ctx2.mails.mails
     adapter2 = _FakeAdapter(range(1, 11), validity=100)
     adapter2.fail_uids = {4}
@@ -620,15 +673,15 @@ def test_sidecar_atomicity_and_recovery():
     tmpfile = meta.with_name(meta.name + ".tmp")
 
     ctx = AppContext()
-    ctx.bootstrap_new("pw-123456")
+    ctx.bootstrap_new("pw-1234567890")
     check("首次建库后写入侧车", meta.exists())
     check("侧车记录数据库驱动",
           json.loads(meta.read_text("utf-8")).get("driver") == ctx.db.driver_name)
-    check("侧车不含明文密码", "pw-123456" not in meta.read_text("utf-8"))
+    check("侧车不含明文密码", "pw-1234567890" not in meta.read_text("utf-8"))
     ctx.db.close()
 
     ctx = AppContext()
-    ctx.unlock("pw-123456")            # 第二次写入 → 产生 .bak
+    ctx.unlock("pw-1234567890")            # 第二次写入 → 产生 .bak
     check("旧侧车已备份为 .bak", bak.exists())
     check("写入后无 .tmp 残留", not tmpfile.exists())
 
@@ -637,7 +690,7 @@ def test_sidecar_atomicity_and_recovery():
     ctx.db.close()
     ctx2 = AppContext()
     ctx2.is_first_run = False
-    ctx2.unlock("pw-123456")
+    ctx2.unlock("pw-1234567890")
     check("主侧车损坏时自动回退备份", ctx2.security.is_unlocked)
     healed = json.loads(meta.read_text("utf-8"))
     check("回退后主侧车已自愈", bool(healed.get("verifier")))
@@ -658,7 +711,7 @@ def test_sidecar_atomicity_and_recovery():
     ctx3 = AppContext()
     ctx3.is_first_run = False
     try:
-        ctx3.unlock("pw-123456")
+        ctx3.unlock("pw-1234567890")
         check("主备均损坏时拒绝解锁", False, "竟然解锁成功")
     except SecurityError as exc:
         check("主备均损坏时给出可操作提示",
@@ -698,7 +751,7 @@ def test_reset_data_paths():
 # ============================================================ 11. 数据库并发与加密模式
 def test_database_concurrency_and_mode():
     from unimail.core.security import SecurityService
-    from unimail.storage import Database, DatabaseError, SQLCIPHER_AVAILABLE
+    from unimail.storage import SQLCIPHER_AVAILABLE, Database, DatabaseError
 
     tmp, _cfg, _ctxmod, _svc = setup_env("conc_")
     sec = SecurityService()
@@ -778,16 +831,28 @@ def test_database_concurrency_and_mode():
         check("加密库以加密方式打开", enc.encrypted and enc.driver_name == "sqlcipher")
         enc.close()
 
+    # 可用性开关必须是「实时读取」的单一事实源：历史上它同时以模块常量与内部变量
+    # 两份形式存在，前者在导入期被各模块按值绑定，会造成判断分裂。
+    import unimail.storage.database as dbmod
+    from unimail.storage import sqlcipher_available
+
+    real = dbmod._SQLCIPHER_AVAILABLE
+    with patch.object(dbmod, "_SQLCIPHER_AVAILABLE", not real):
+        check("SQLCipher 可用性是实时读取的单一事实源",
+              sqlcipher_available() is (not real),
+              f"实际 {sqlcipher_available()}")
+    check("退出补丁后恢复真实值", sqlcipher_available() is real)
+
 
 def test_legacy_sidecar_and_driver_mismatch():
     """旧版侧车没有 driver 字段；记录与实际不符时也必须给出可读结论。"""
-    tmp, cfg, _ctxmod, _svc = setup_env("legacy_")
+    _tmp, cfg, _ctxmod, _svc = setup_env("legacy_")
     from unimail.core.security import SecurityError
-    from unimail.storage import DatabaseError, SQLCIPHER_AVAILABLE
+    from unimail.storage import SQLCIPHER_AVAILABLE, DatabaseError
     from unimail.ui.context import AppContext
 
     ctx = AppContext()
-    ctx.bootstrap_new("pw-123456")
+    ctx.bootstrap_new("pw-1234567890")
     ctx.db.close()
     meta = cfg.DB_PATH.with_suffix(".meta.json")
 
@@ -798,7 +863,7 @@ def test_legacy_sidecar_and_driver_mismatch():
 
     ctx2 = AppContext()
     ctx2.is_first_run = False
-    ctx2.unlock("pw-123456")
+    ctx2.unlock("pw-1234567890")
     expected = "sqlcipher" if SQLCIPHER_AVAILABLE else "sqlite3"
     check("旧侧车可自动探测出实际加密模式",
           ctx2.db.driver_name == expected, f"实际 {ctx2.db.driver_name}")
@@ -808,41 +873,1009 @@ def test_legacy_sidecar_and_driver_mismatch():
           ctx2.db.registered_driver() == expected)
     ctx2.db.close()
 
-    # sidecar 声称是加密库，但（本机）并未安装 SQLCipher → 必须是可读错误，而不是打不开
+    # sidecar 声称是加密库，但本机没有 SQLCipher → 必须是可读错误，而不是打不开。
+    # 这里显式把可用性开关置为 False，否则在已装 SQLCipher 的环境里「声称加密」恰好
+    # 与事实相符，用例前提不成立（本用例验证的是**记录与实际不符**时的行为）。
     data = json.loads(meta.read_text("utf-8"))
     data["driver"] = "sqlcipher"
     meta.write_text(json.dumps(data), "utf-8")
     ctx3 = AppContext()
     ctx3.is_first_run = False
+    with patch("unimail.storage.database._SQLCIPHER_AVAILABLE", False):
+        try:
+            ctx3.unlock("pw-1234567890")
+            check("驱动记录与库不符时不静默失败", False, "竟然解锁成功")
+        except (DatabaseError, SecurityError) as exc:
+            text = str(exc)
+            check("驱动记录与库不符时给出可操作提示",
+                  "sqlcipher3" in text or "加密" in text, f"实际 {text[:120]}")
+
+
+# ============================================================ 12. 批量写入与列表投影
+def test_batch_write_and_projection():
+    """G1：批量写入、冲突精确记账、列表列投影、LIKE 通配符转义。"""
+    from unimail.core.models import (
+        MAIL_SUMMARY_COLUMNS,
+        AccountDraft,
+        AttachmentMeta,
+        MailFilter,
+        MailSummary,
+        NormalizedMail,
+    )
+    from unimail.core.security import SecurityService
+    from unimail.storage import AccountRepository, Database, MailRepository
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("batch_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "b.db", sec.db_key(), encrypted=False)
+    accounts, mails = AccountRepository(db), MailRepository(db)
+    acc = accounts.insert(AccountDraft(platform="qq", email="b@qq.com", password="x"))
+
+    now = datetime.now(timezone.utc)
+    body = "正文" * 600
+    batch = [
+        NormalizedMail(
+            uid=str(i), subject=f"批量 {i}", from_addr=f"s{i}@example.com",
+            date=now - timedelta(minutes=i), body_text=body, body_html=f"<p>{body}</p>",
+            preview="预览",
+            attachments=[AttachmentMeta("a.pdf", "application/pdf", 10, part_index="2")]
+            if i == 1 else [],
+        )
+        for i in range(1, 201)
+    ]
+    res = mails.insert_mails_batch(acc.id, "qq", batch, uid_validity=5)
+    check("批量写入全部落库", res.new_count == 200, f"实际 {res.new_count}")
+    check("批量写入不误判冲突/重复", res.conflicts == 0 and res.existing == 0,
+          f"conflicts={res.conflicts} existing={res.existing}")
+    check("批量写入的附件行随邮件事务一起写入",
+          int(db.scalar("SELECT COUNT(*) FROM attachments")) == 1)
+
+    again = mails.insert_mails_batch(acc.id, "qq", batch, uid_validity=5)
+    check("重复同步计入 existing 而非 inserted",
+          again.new_count == 0 and again.existing == 200,
+          f"{again.new_count}/{again.existing}")
+
+    dup = mails.insert_mails_batch(
+        acc.id, "qq",
+        [NormalizedMail(uid="999", subject="d"), NormalizedMail(uid="999", subject="d")],
+        uid_validity=5)
+    check("同批内 UID 自去重", dup.new_count == 1 and dup.existing == 1,
+          f"{dup.new_count}/{dup.existing}")
+
+    # 唯一键是 (account_id, folder, uid)：同 UID 换一个 UIDVALIDITY 必然冲突。
+    # 这类行被 INSERT OR IGNORE 跳过，其附件行必须一起剔除——否则会写入指向
+    # 不存在邮件的附件行（外键开启时甚至直接抛 IntegrityError 让整页同步失败）。
+    #
+    # 必须显式传 known_uids（同步线程传的是「按 UIDVALIDITY 过滤后的集合」）：
+    # 只传 None 时方法会取回该文件夹的**全部** UID，冲突会在内存去重阶段
+    # 就被消化掉，根本走不到数据库的唯一键。
+    conflict = mails.insert_mails_batch(
+        acc.id, "qq",
+        [NormalizedMail(uid="1", subject="撞号",
+                        attachments=[AttachmentMeta("c.pdf", "application/pdf", 1,
+                                                    part_index="2")])],
+        uid_validity=6, known_uids=set())
+    check("唯一键冲突被精确记账",
+          conflict.conflicts == 1 and conflict.new_count == 0,
+          f"conflicts={conflict.conflicts} inserted={conflict.new_count}")
+    orphans = db.scalar(
+        "SELECT COUNT(*) FROM attachments a WHERE NOT EXISTS "
+        "(SELECT 1 FROM mails m WHERE m.id = a.mail_id)")
+    check("冲突邮件不留下孤儿附件行", int(orphans) == 0, f"实际 {orphans}")
+    check("冲突邮件自身未入库",
+          int(db.scalar("SELECT COUNT(*) FROM mails WHERE uid = '1' AND uid_validity = 6")) == 0)
+
+    # ---- 列投影：列表不再把正文搬进内存
+    check("列表查询返回 MailSummary 投影",
+          all(isinstance(r, MailSummary)
+              for r in mails.query_summaries(MailFilter(limit=5))))
+    row = mails.query_summaries(MailFilter(limit=1))[0]
+    check("列表投影不含正文字段",
+          not hasattr(row, "body_text") and not hasattr(row, "body_html"))
+    sql, _params = mails._select_sql(MailFilter(), ", ".join(MAIL_SUMMARY_COLUMNS))
+    check("投影 SQL 未选取正文列",
+          "body_text" not in sql and "body_html" not in sql, sql)
+    full = mails.get(res.inserted[0][1])
+    check("按 id 取详情仍带正文", bool(full and full.body_text),
+          f"实际 {len(full.body_text) if full else 'None'} 字")
+    check("按 id 取详情会带上附件明细", bool(full) and len(full.attachments) == 1,
+          f"实际 {len(full.attachments) if full else 'None'}")
+    check("to_summary() 丢弃正文", not hasattr(full.to_summary(), "body_html"))
+
+    # ---- LIKE 转义：用户输入的 % / _ 不能变成通配符
+    mails.insert_mails_batch(acc.id, "qq", [
+        NormalizedMail(uid="1001", subject="100%纯棉", date=now),
+        NormalizedMail(uid="1002", subject="axb", date=now),
+        NormalizedMail(uid="1003", subject="a_b", date=now),
+    ], uid_validity=5)
+    width = mails.query_summaries(MailFilter(keyword="%", limit=5000))
+    check("关键词 % 被转义（不再匹配全库）", len(width) == 1, f"实际 {len(width)}")
+    exact = mails.query_summaries(MailFilter(keyword="a_b", limit=5000))
+    check("关键词 _ 被转义（不再匹配任意字符）", len(exact) == 1, f"实际 {len(exact)}")
+    check("命中的就是字面量那条", bool(exact) and exact[0].uid == "1003",
+          f"实际 {[r.uid for r in exact]}")
+    db.close()
+
+
+# ============================================================ 13. 索引与查询计划
+def test_indexes_and_query_plan():
+    """G1：列表筛选的复合索引必须真被用上，否则排序要建临时 B 树。"""
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.core.security import SecurityService
+    from unimail.storage import AccountRepository, Database, MailRepository
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("idx_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "i.db", sec.db_key(), encrypted=False)
+    accounts, mails = AccountRepository(db), MailRepository(db)
+    acc = accounts.insert(AccountDraft(platform="qq", email="i@qq.com", password="x"))
+
+    now = datetime.now(timezone.utc)
+    mails.insert_mails_batch(acc.id, "qq", [
+        NormalizedMail(uid=str(i), subject=f"m{i}", from_addr="s@e.com",
+                       date=now - timedelta(minutes=i), body_text="x")
+        for i in range(1, 601)
+    ], uid_validity=1)
+
+    names = {r["name"] for r in db.query_all(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='mails'")}
+    for expected in ("idx_mails_read", "idx_mails_acc_read", "idx_mails_validity"):
+        check(f"索引 {expected} 已建立", expected in names, f"实际 {sorted(names)}")
+
+    def _plan(sql, params=()):
+        return " | ".join(
+            str(r.get("detail") or "") for r in db.query_all("EXPLAIN QUERY PLAN " + sql, params))
+
+    detail = _plan("SELECT id, subject, date FROM mails WHERE is_read = 0 "
+                   "ORDER BY date DESC LIMIT 50")
+    check("仅未读列表走 (is_read, date DESC) 索引",
+          "idx_mails_read" in detail, detail)
+    check("仅未读列表不再为排序建临时 B 树",
+          "TEMP B-TREE" not in detail.upper(), detail)
+
+    detail2 = _plan("SELECT id FROM mails WHERE account_id = ? AND is_read = 0 "
+                    "ORDER BY date DESC LIMIT 50", (acc.id,))
+    check("按账号 + 未读走复合索引", "idx_mails_acc_read" in detail2, detail2)
+    check("按账号 + 未读不需要临时 B 树",
+          "TEMP B-TREE" not in detail2.upper(), detail2)
+    db.close()
+
+
+# ============================================================ 14. HTML 白名单清洗
+def test_html_whitelist_sanitizer():
+    """G3：白名单重建取代黑名单正则——未来出现新向量时默认是丢弃而不是放过。"""
+    from unimail.platforms.parser import sanitize_html
+
+    html = (
+        '<div onclick="steal()">'
+        '<script>alert(1)</script>'
+        '<style>body{background:url(http://evil/t.png)}</style>'
+        '<iframe src="http://evil/f"></iframe>'
+        '<p>正文一</p>'
+        '<a href="javascript:alert(1)">xss</a>'
+        '<a href="http://example.com/ok">ok</a>'
+        '<img src="http://tracker.example/p.gif" srcset="a 1x" '
+        'style="background:url(http://t)">'
+        '</div>'
+    )
+    clean = sanitize_html(html)
+    low = clean.lower()
+    check("script 子树被整棵丢弃", "alert(1)" not in clean and "script" not in low)
+    check("style 子树被丢弃（远程背景图不落地）", "background" not in low)
+    check("iframe 子树被丢弃", "iframe" not in low)
+    check("正文完整保留", "正文一" in clean, clean)
+    check("javascript: 链接被丢弃", "javascript" not in low)
+    check("合法链接保留并补 rel",
+          'href="http://example.com/ok"' in clean and 'rel="noopener noreferrer"' in clean,
+          clean)
+    check("远程图片连 DOM 都不留",
+          "tracker.example" not in clean and "<img" not in clean, clean)
+    check("未列入白名单的属性（srcset/style）一律丢弃",
+          "srcset" not in low and "style=" not in low, clean)
+    check("事件属性丢弃", "onclick" not in low)
+
+    # 【回归】<meta>/<input> 这类无结束标签的元素不能压入「丢弃栈」，
+    # 否则它们之后的整篇正文都会被吞掉。
+    swallowed = sanitize_html(
+        '<head><meta charset="utf-8"><title>t</title></head>'
+        '<body><p>关键正文</p></body>')
+    check("自闭合类标签不吞掉后续正文", "关键正文" in swallowed, repr(swallowed))
+    check("title 文本不作为正文输出", "t" not in swallowed.replace("关键正文", ""),
+          repr(swallowed))
+
+    check("文本被转义为实体",
+          "&lt;b&gt;" in sanitize_html("<p>&lt;b&gt;</p>"))
+    check("空输入安全返回", sanitize_html("") == "")
+
+    # 清洗必须与解析链路串起来：parse_message 的 body_html 已经是清洗后的结果
+    from unimail.platforms.parser import parse_message
+    raw = (b"From: a@b.com\nSubject: t\nMIME-Version: 1.0\n"
+           b'Content-Type: text/html; charset="utf-8"\n\n'
+           b'<p>hi</p><script>alert(1)</script>')
+    nm = parse_message(raw, "1")
+    check("解析链路中 HTML 已清洗", "script" not in nm.body_html.lower(), nm.body_html)
+    check("清洗后仍保留纯文本摘要", "hi" in nm.body_text, repr(nm.body_text))
+
+
+# ============================================================ 15. BODYSTRUCTURE
+def test_bodystructure_attachment_meta():
+    """G1：只取邮件头拿不到部件信息 → 用 BODYSTRUCTURE 补附件元数据（不下正文）。"""
+    from unimail.platforms.base import ImapAdapter
+    from unimail.platforms.parser import (
+        extract_bodystructure_from_fetch,
+        parse_bodystructure,
+    )
+
+    struct = (
+        '(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 12 1)'
+        ' ("APPLICATION" "PDF" ("NAME" "=?utf-8?B?5oql5ZGK?=.pdf") NIL NIL "BASE64" 2048'
+        '  ("ATTACHMENT" ("FILENAME" "=?utf-8?B?5oql5ZGK?=.pdf")))'
+        ' "MIXED")'
+    )
+    metas = parse_bodystructure(struct)
+    check("从 BODYSTRUCTURE 识出 1 个附件", len(metas) == 1, f"实际 {len(metas)}")
+    check("part 编号来自结构位置而非遍历序号",
+          metas and metas[0].part_index == "2", f"实际 {metas and metas[0].part_index!r}")
+    check("编码文件名被解码", metas and metas[0].filename == "报告.pdf",
+          f"实际 {metas and metas[0].filename!r}")
+    check("附件字节数取自服务器（无需下载）", metas and metas[0].size == 2048,
+          f"实际 {metas and metas[0].size}")
+    check("content-type 归一化", metas and metas[0].content_type == "application/pdf")
+
+    nested = (
+        '(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 5 1)'
+        ' (("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 5 1)'
+        '  ("APPLICATION" "ZIP" ("NAME" "pkg.zip") NIL NIL "BASE64" 77'
+        '   ("ATTACHMENT" ("FILENAME" "pkg.zip")))'
+        '  "ALTERNATIVE")'
+        ' "MIXED")'
+    )
+    deep = parse_bodystructure(nested)
+    check("嵌套 multipart 的 part 编号逐层拼接",
+          len(deep) == 1 and deep[0].part_index == "2.2",
+          f"实际 {[(m.filename, m.part_index) for m in deep]}")
+
+    rfc = ('("MESSAGE" "RFC822" ("NAME" "fwd.eml") NIL NIL "7BIT" 4096'
+           ' NIL ("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 5 1) 7)')
+    fwd = parse_bodystructure(rfc)
+    check("内嵌邮件本身作为可下载附件",
+          len(fwd) == 1 and fwd[0].part_index == "1" and fwd[0].filename == "fwd.eml",
+          f"实际 {[(m.filename, m.part_index) for m in fwd]}")
+
+    plain = parse_bodystructure('("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 5 1)')
+    check("无附件的单部分邮件返回空列表", plain == [], f"实际 {plain}")
+    check("空输入安全返回空列表", parse_bodystructure("") == [])
+    check("畸形括号安全返回空列表", parse_bodystructure("((((( ") == [])
+    check("非结构文本安全返回空列表", parse_bodystructure("NO [SERVERBUG] error") == [])
+
+    full = b'12 (UID 345 BODYSTRUCTURE ' + struct.encode() + b')'
+    uid, structure = extract_bodystructure_from_fetch(full)
+    check("从 FETCH 响应取出 UID", uid == "345", f"实际 {uid!r}")
+    check("按括号配平取出完整结构",
+          bool(structure) and structure.startswith("(") and structure.endswith(")"),
+          f"实际 {structure!r}")
+    check("取出的结构可再次解析出附件", len(parse_bodystructure(structure)) == 1)
+
+    # 字面量形式的 FETCH 响应：前缀/字面量被拆成两项，必须拼回去才能配平括号
+    cut = full.index(b"BODYSTRUCTURE") + len(b"BODYSTRUCTURE")
+
+    class _BsImap:
+        def __init__(self, payload):
+            self.payload = payload
+            self.selected: list[str] = []
+
+        def select(self, folder, readonly=False):
+            self.selected.append(folder)
+            return ("OK", [b""])
+
+        def uid(self, command, *args):
+            return ("OK", [self.payload])
+
+    class _Adapter(ImapAdapter):
+        platform = "custom"
+
+    adapter = _Adapter()
+    fake = _BsImap(full)
+    got = adapter.fetch_attachment_meta(fake, ["345"], "INBOX")
+    check("批量接口按 UID 归集附件元数据",
+          list(got) == ["345"] and len(got["345"]) == 1, f"实际 {got}")
+    check("一次 FETCH 覆盖整页 UID（0 次正文下载）", fake.selected == ["INBOX"])
+
+    literal = _BsImap((full[:cut], full[cut:]))
+    got2 = adapter.fetch_attachment_meta(literal, ["345"], "INBOX")
+    check("字面量响应拼回后可解析出附件",
+          list(got2) == ["345"] and len(got2["345"]) == 1, f"实际 {got2}")
+
+    class _Boom:
+        def select(self, *a, **k):
+            raise OSError("connection reset")
+
+        def uid(self, *a, **k):
+            raise AssertionError("不应走到这里")
+
+    check("BODYSTRUCTURE 失败不抛异常（附件信息只是附加项）",
+          adapter.fetch_attachment_meta(_Boom(), ["1"], "INBOX") == {})
+    check("空 UID 列表不发起请求", adapter.fetch_attachment_meta(_BsImap(full), []) == {})
+
+
+def test_sync_backfills_attachment_meta():
+    """【回归】只取邮件头的同步路径此前永远拿不到附件信息。
+
+    `fetch_headers()` 走的是 `BODY.PEEK[HEADER]`，拿到的字节里没有任何 MIME
+    部件，`parse_headers_only()` 必然解析出 0 个附件 → 列表永远不显示 📎、
+    也永远不会产生可下载的附件记录。修复方式是用 BODYSTRUCTURE 每页补一次。
+    """
+    _cfg, ctx, account = _make_sync_ctx("attmeta_")
+    adapter = _FakeAdapter(range(1, 31), validity=100)
+    _run_sync(ctx, account, adapter)
+
+    check("整页只调用一次 BODYSTRUCTURE（不是每封一次）",
+          len(adapter.meta_fetches) == 1, f"实际 {len(adapter.meta_fetches)}")
+    check("这一次请求覆盖了整页 UID",
+          adapter.meta_fetches and len(adapter.meta_fetches[0]) == 30,
+          f"实际 {adapter.meta_fetches}")
+
+    rows = ctx.db.query_all(
+        "SELECT uid, has_attachments FROM mails WHERE account_id = ?", (account.id,))
+    with_att = {r["uid"] for r in rows if r["has_attachments"]}
+    check("附件元数据已回填到邮件行",
+          with_att == {"5", "10", "15", "20", "25", "30"}, f"实际 {sorted(with_att)}")
+    count = int(ctx.db.scalar("SELECT COUNT(*) FROM attachments"))
+    check("附件行数与元数据一致（无重复、无遗漏）", count == 6, f"实际 {count}")
+
+    check("补正文数量受 fetch_body_limit 约束（不是每封都拉全文）",
+          len(adapter.body_fetches) == 20, f"实际 {len(adapter.body_fetches)}")
+    check("两个来源的附件元数据按 part 对齐替换、未翻倍",
+          int(ctx.db.scalar("SELECT COUNT(*) FROM attachments")) == 6,
+          f"实际 {ctx.db.scalar('SELECT COUNT(*) FROM attachments')}")
+    filled = int(ctx.db.scalar(
+        "SELECT COUNT(*) FROM attachments WHERE content_id = 'cid-page'"))
+    covered = {u for u in adapter.body_fetches if u % 5 == 0}
+    check("完整解析补上了 BODYSTRUCTURE 拿不到的 content_id",
+          filled == len(covered), f"实际 {filled}，补正文覆盖 {sorted(covered)}")
+
+    # 手动再走一次 BODYSTRUCTURE，模拟「同一封邮件两次拿到元数据」→ 不应翻倍
+    from unimail.sync.worker import SyncWorker
+    worker = SyncWorker(account, ctx.accounts, ctx.mails.mails,
+                        ctx.accounts.cursors, ctx.security, ctx.bus)
+    worker._attach_meta_for_page(adapter, None, account.id, ["5", "10"])
+    check("重复回填附件元数据不会产生重复行",
+          int(ctx.db.scalar("SELECT COUNT(*) FROM attachments")) == 6,
+          f"实际 {ctx.db.scalar('SELECT COUNT(*) FROM attachments')}")
+    ctx.db.close()
+
+
+# ============================================================ 16. 附件落盘安全策略
+def test_attachment_safety_policy():
+    """G4：大小上限、危险扩展名不还原可执行后缀、独占创建、删除同步清盘。"""
+    _tmp, _cfg, _ctxmod, svcmod = setup_env("attsafe_")
+    from unimail.config import MAX_ATTACHMENT_BYTES
+    from unimail.core.models import AccountDraft, AttachmentMeta, NormalizedMail
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="safe@qq.com", password="code"))
+
+    def _add(uid, filename, size):
+        nm = NormalizedMail(uid=str(uid), subject=f"att {uid}", attachments=[
+            AttachmentMeta(filename, "application/octet-stream", size, part_index="2")])
+        return ctx.mails.mails.insert_mail(acc.id, "qq", nm)
+
+    class _Imap:
+        def select(self, *a, **k):
+            return ("OK", [b""])
+
+        def close(self):
+            pass
+
+        def logout(self):
+            pass
+
+    fake = MagicMock()
+    fake.connect.return_value = _Imap()
+    fake.fetch_attachment.return_value = b"MZ\x90\x00evil-bytes"
+    fake.disconnect = lambda x: None
+
+    bom = _add(1, "bom.exe", 1024)
+    att = ctx.mails.mails.attachments_of(bom)[0]
+    with patch.object(svcmod, "get_adapter", return_value=fake):
+        res = ctx.mails.download_attachment(att.id)
+    check("危险扩展名不还原为可执行后缀",
+          res.path.name.endswith(".exe.download"), f"实际 {res.path.name}")
+    check("危险扩展名被标记为已改写", res.renamed is True)
+    check("给出可执行的警示文案", res.danger and "可执行" in res.name_hint,
+          repr(res.name_hint))
+    check("文件确实落盘且内容完整",
+          res.path.exists() and res.path.read_bytes() == b"MZ\x90\x00evil-bytes")
+
+    # 独占创建：同名文件已存在时绝不覆盖
+    target = svcmod.ATTACHMENT_DIR / "deadbeef_keep.bin"
+    target.write_bytes(b"orig")
+    written = svcmod.MailService._atomic_write_exclusive(target, b"new")
+    check("同名文件不被覆盖", written != target and target.read_bytes() == b"orig",
+          f"实际 {written.name}")
+    check("改用序号后缀而不是覆盖", "(1)" in written.name, f"实际 {written.name}")
+    check("不回落到改写原文件", target.read_bytes() == b"orig")
+
+    # 超过单文件上限：必须在连接服务器之前就拒绝（元数据预检）
+    big = _add(2, "huge.bin", MAX_ATTACHMENT_BYTES + 1)
+    att_big = ctx.mails.mails.attachments_of(big)[0]
+    fake.connect.reset_mock()
     try:
-        ctx3.unlock("pw-123456")
-        check("驱动记录与库不符时不静默失败", False, "竟然解锁成功")
-    except (DatabaseError, SecurityError) as exc:
-        text = str(exc)
-        check("驱动记录与库不符时给出可操作提示",
-              "sqlcipher3" in text or "加密" in text, f"实际 {text[:120]}")
+        with patch.object(svcmod, "get_adapter", return_value=fake):
+            ctx.mails.download_attachment(att_big.id)
+        check("超过单文件上限时拒绝下载", False, "竟然下载了")
+    except ValueError as exc:
+        check("超过单文件上限时给出上限提示", "上限" in str(exc), f"实际 {exc}")
+    check("超限时根本不发起 IMAP 连接", fake.connect.call_count == 0,
+          f"实际 {fake.connect.call_count} 次")
+
+    # 删除邮件 / 删除账号都必须同步清掉磁盘明文副本
+    att_path = res.path
+    ctx.mails.delete(bom)
+    check("删除邮件时一并删除磁盘副本", not att_path.exists())
+
+    keep = _add(3, "doc.pdf", 10)
+    att_keep = ctx.mails.mails.attachments_of(keep)[0]
+    with patch.object(svcmod, "get_adapter", return_value=fake):
+        res3 = ctx.mails.download_attachment(att_keep.id)
+    check("普通扩展名保持原样", res3.path.name.endswith("doc.pdf") and not res3.renamed,
+          f"实际 {res3.path.name}")
+    ctx.accounts.remove(acc.id)
+    check("删除账号时清掉其全部附件副本", not res3.path.exists())
+    check("附件目录无 .part 残留",
+          not list(svcmod.ATTACHMENT_DIR.glob("*.part")),
+          f"实际 {list(svcmod.ATTACHMENT_DIR.glob('*.part'))}")
+    ctx.db.close()
+
+
+def test_orphan_attachment_cleanup():
+    """G4：异常退出/历史版本只删库行不删文件 → 启动时清理孤儿文件。"""
+    _tmp, _cfg, _ctxmod, svcmod = setup_env("orphan_")
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="o@qq.com", password="code"))
+    mid = ctx.mails.mails.insert_mail(acc.id, "qq", NormalizedMail(uid="1", subject="s"))
+
+    # 手工制造：一个「数据库不认识」的附件文件（符合本程序命名规则）
+    orphan = svcmod.ATTACHMENT_DIR / "abcdef12_orphan.bin"
+    orphan.write_bytes(b"leftover")
+    # 以及一个不属于本程序命名规则的文件——不能误删用户自己放的东西
+    keep = svcmod.ATTACHMENT_DIR / "用户自己的文件.txt"
+    keep.write_text("mine", "utf-8")
+
+    # 让数据库"认识"一个已落盘文件，确认它不会被误删
+    known = svcmod.ATTACHMENT_DIR / "01234567_known.bin"
+    known.write_bytes(b"known")
+    ctx.db.execute(
+        "INSERT INTO attachments(id, mail_id, filename, content_type, size, stored_path) "
+        "VALUES(?,?,?,?,?,?)",
+        ("a1", mid, "known.bin", "application/octet-stream", 5, str(known)))
+
+    removed = ctx.mails.cleanup_orphan_attachments()
+    check("孤儿附件文件被清理", not orphan.exists() and removed == 1, f"实际 removed={removed}")
+    check("数据库仍引用的文件不被误删", known.exists())
+    check("不属于本程序命名规则的文件保持不动", keep.exists())
+    ctx.db.close()
+
+
+# ============================================================ 17. KDF 与密码策略
+def test_kdf_algorithms_and_password_policy():
+    """G2：Argon2id 为默认；旧 PBKDF2 库仍可解锁、可识别为待升级。"""
+    from unimail.config import KDF_ALGORITHM, PASSWORD_MIN_LENGTH
+    from unimail.core.security import (
+        KdfParams,
+        SecurityError,
+        SecurityService,
+        derive_master_key,
+        password_policy_error,
+        password_strength,
+    )
+
+    params = SecurityService.new_kdf_params()
+    check("新建库默认使用 Argon2id", params.algorithm == KDF_ALGORITHM,
+          f"实际 {params.algorithm}")
+    check("Argon2id 内存代价不低于 64 MiB", params.memory_cost >= 64 * 1024,
+          f"实际 {params.memory_cost} KiB")
+    check("Argon2id 参数有可读描述", "Argon2id" in params.display, params.display)
+
+    sec = SecurityService()
+    sec.setup("a-strong-passphrase", params)
+    verifier = SecurityService.make_verifier(sec._master_key)
+    check("Argon2id 派生 + 校验通过",
+          SecurityService().unlock("a-strong-passphrase", params, verifier) is not None)
+
+    legacy = KdfParams(salt=b"0" * 16, iterations=1000, algorithm="pbkdf2", hash_len=32)
+    own = SecurityService()
+    own.setup("legacy-passphrase", legacy)
+    legacy_verifier = SecurityService.make_verifier(own._master_key)
+    check("PBKDF2 旧参数仍可解锁（不破坏已有库）",
+          SecurityService().unlock("legacy-passphrase", legacy, legacy_verifier) is not None)
+    check("同参数派生结果确定",
+          derive_master_key("p", legacy) == derive_master_key("p", legacy))
+    check("弱参数被识别为需要升级", SecurityService.needs_upgrade(legacy) is True)
+    check("当前默认参数不需升级", SecurityService.needs_upgrade(params) is False)
+
+    rt = KdfParams.from_dict(params.to_dict())
+    check("KDF 参数可无损往返（sidecar 是明文 JSON）",
+          rt.algorithm == params.algorithm and rt.salt == params.salt
+          and rt.memory_cost == params.memory_cost and rt.hash_len == params.hash_len,
+          f"实际 {rt.to_dict()}")
+
+    try:
+        KdfParams.from_dict({"salt": "AAAA", "algorithm": "scrypt"})
+        check("未知算法被显式拒绝", False, "竟然接受了 scrypt")
+    except SecurityError as exc:
+        check("未知算法给出可读提示（而不是当成密码错）", "不支持" in str(exc), f"实际 {exc}")
+
+    # 环境缺少 Argon2id 时必须优雅回退，而不是让整个应用起不来
+    import unimail.core.security as secmod
+    with patch.object(secmod, "_ARGON2_AVAILABLE", False):
+        fallback = SecurityService.new_kdf_params()
+        check("缺 Argon2id 时回退 PBKDF2 而非崩溃",
+              fallback.algorithm == "pbkdf2", f"实际 {fallback.algorithm}")
+        try:
+            derive_master_key("x", params)
+            check("无法派生 Argon2id 时提示升级依赖", False, "竟然派生成功")
+        except SecurityError as exc:
+            check("无法派生 Argon2id 时提示升级依赖", "cryptography" in str(exc),
+                  f"实际 {exc}")
+
+    # 密码策略
+    check("低于下限的密码被拒绝",
+          password_policy_error("a" * (PASSWORD_MIN_LENGTH - 1)) is not None)
+    check("达到下限的密码通过",
+          password_policy_error("a" * PASSWORD_MIN_LENGTH) is None)
+    check("太短给 0 分并说明原因", password_strength("abc")[0] == 0)
+    check("足够复杂的密码评分较高", password_strength("Xk7#mQ2$pL9@wZ4!")[0] >= 3,
+          f"实际 {password_strength('Xk7#mQ2$pL9@wZ4!')}")
+
+
+def test_kdf_upgrade_on_password_change():
+    """G2：改密码是唯一能安全更换 salt 的时机 → 旧 PBKDF2 库借此升级。"""
+    _tmp, cfg, _ctxmod, _svc = setup_env("kdfup_")
+    import unimail.core.security as secmod
+    from unimail.config import KDF_ALGORITHM, KDF_ALGORITHM as _cfg_algo
+    from unimail.ui.context import AppContext
+
+    meta = cfg.DB_PATH.with_suffix(".meta.json")
+
+    with patch.object(secmod, "KDF_ALGORITHM", "pbkdf2"):
+        ctx = AppContext()
+        ctx.bootstrap_new("pw-1234567890")
+        check("模拟旧库：以 PBKDF2 建库",
+              json.loads(meta.read_text("utf-8"))["algorithm"] == "pbkdf2",
+              json.loads(meta.read_text("utf-8")).get("algorithm"))
+        ctx.db.close()
+
+    ctx2 = AppContext()
+    ctx2.is_first_run = False
+    ctx2.unlock("pw-1234567890")
+    check("旧 PBKDF2 库仍能正常解锁", ctx2.security.is_unlocked)
+    check("检测到 KDF 需要升级", ctx2.kdf_upgrade_pending is True)
+
+    res = ctx2.change_password("pw-1234567890", "pw-9876543210")
+    check("改密码后 KDF 已升级到当前默认（Argon2id）",
+          "Argon2id" in res.kdf, f"实际 {res.kdf!r}")
+    check("升级后不再提示", ctx2.kdf_upgrade_pending is False)
+    check("侧车已记录新算法",
+          json.loads(meta.read_text("utf-8"))["algorithm"] == _cfg_algo,
+          json.loads(meta.read_text("utf-8")).get("algorithm"))
+    check("当前默认算法确实是 argon2id", KDF_ALGORITHM == "argon2id", KDF_ALGORITHM)
+    ctx2.db.close()
+
+    ctx3 = AppContext()
+    ctx3.is_first_run = False
+    ctx3.unlock("pw-9876543210")
+    check("升级后重启仍可解锁", ctx3.security.is_unlocked)
+    ctx3.db.close()
+
+
+# ============================================================ 18. 解锁退避持久化
+def test_unlock_guard_backoff():
+    """G2：解锁退避必须持久化，否则「关掉再开」等于把尝试次数清零。"""
+    _tmp, cfg, _ctxmod, _svc = setup_env("guard_")
+    from unimail.core.security import SecurityError, UnlockGuard
+
+    path = cfg.guard_path(cfg.DB_PATH)
+    check("退避文件与数据库同目录", path.parent == cfg.DB_PATH.parent)
+
+    guard = UnlockGuard(path)
+    check("初始无失败记录", guard.failures == 0 and guard.remaining_wait() == 0)
+    guard.check()                      # 不应抛错
+
+    d1 = guard.record_failure()
+    d2 = guard.record_failure()
+    d3 = guard.record_failure()
+    check("退避按 1/2/4 秒递增", (round(d1), round(d2), round(d3)) == (1, 2, 4),
+          f"实际 {d1}/{d2}/{d3}")
+    check("退避文件已落盘", path.exists())
+    blob = path.read_text("utf-8")
+    check("退避文件不含任何凭据或密文",
+          "password" not in blob and "verifier" not in blob and "salt" not in blob, blob)
+
+    fresh = UnlockGuard(path)          # 模拟重启进程
+    check("失败次数跨进程保留", fresh.failures == 3, f"实际 {fresh.failures}")
+    try:
+        fresh.check()
+        check("冷却期内拒绝再次尝试", False, "竟然通过了")
+    except SecurityError as exc:
+        check("冷却期内给出等待提示", "等待" in str(exc), f"实际 {exc}")
+
+    for _ in range(10):
+        guard.record_failure()
+    check("退避有上限（不会无限增长）",
+          guard.remaining_wait() <= cfg.UNLOCK_BACKOFF_MAX + 1.0,
+          f"实际 {guard.remaining_wait():.1f}s")
+
+    guard.reset()
+    check("清零后失败次数归零", UnlockGuard(path).failures == 0)
+    UnlockGuard(path).check()
+
+    # 端到端：AppContext.unlock 失败要写入退避，且新进程立刻受同一限制
+    _tmp2, cfg2, _c2, _s2 = setup_env("guard2_")
+    from unimail.ui.context import AppContext
+
+    c = AppContext()
+    c.bootstrap_new("pw-1234567890")
+    check("新建库会重置退避（不继承上一个库的失败计数）",
+          UnlockGuard(cfg2.guard_path(cfg2.DB_PATH)).failures == 0)
+    c.db.close()
+
+    gp = cfg2.guard_path(cfg2.DB_PATH)
+
+    def _let_cooldown_expire() -> None:
+        """模拟「时间流逝」：只清掉冷却截止时间，**保留失败次数**。
+
+        不能用 `reset()`——那等于把计数清零，反而绕过了本用例要验证的东西。
+        """
+        data = json.loads(gp.read_text("utf-8"))
+        data["next_allowed"] = 0.0
+        gp.write_text(json.dumps(data), "utf-8")
+
+    c2 = AppContext()
+    c2.is_first_run = False
+    for _ in range(2):
+        _let_cooldown_expire()
+        with contextlib.suppress(SecurityError):
+            c2.unlock("wrong-password")
+    check("解锁失败被持久化", json.loads(gp.read_text("utf-8"))["failures"] == 2,
+          gp.read_text("utf-8"))
+    check("新进程立即处于冷却期", UnlockGuard(gp).remaining_wait() > 0)
+
+    _let_cooldown_expire()             # 等价于用户等待结束
+    c3 = AppContext()
+    c3.is_first_run = False
+    c3.unlock("pw-1234567890")
+    check("冷却结束后正确密码可解锁", c3.security.is_unlocked)
+    check("成功解锁后退避已清零", UnlockGuard(gp).failures == 0)
+    c3.db.close()
+
+
+# ============================================================ 19. 恶意 MIME 语料
+def _hostile_mime_corpus() -> list[tuple[str, bytes]]:
+    """真实世界里会遇到的坏输入：不是「构造精巧的攻击」，而是**每天都会出现**
+    的畸形报文。解析链路必须逐个扛住——它们来自不可信的第三方。"""
+    nested = b""
+    depth = 40
+    for i in range(depth):
+        nested += (b'Content-Type: multipart/mixed; boundary="B%d"\r\n\r\n--B%d\r\n' % (i, i))
+    nested += b"Content-Type: text/plain\r\n\r\nbody\r\n"
+    for i in reversed(range(depth)):
+        nested += b"--B%d--\r\n" % i
+
+    return [
+        ("空报文", b""),
+        ("只有头部没有正文", b"Subject: only-headers\r\n"),
+        ("只有正文没有头部", b"\r\njust a body without headers"),
+        ("boundary 声明但从不闭合",
+         b'Subject: unclosed\r\nMIME-Version: 1.0\r\n'
+         b'Content-Type: multipart/mixed; boundary="NEVER"\r\n\r\n--NEVER\r\n'
+         b"Content-Type: text/plain\r\n\r\nhi\r\n"),
+        ("multipart 声明却给了单个字符串正文",
+         b"Subject: s\r\nContent-Type: multipart/mixed\r\n\r\nplain text, no boundary"),
+        (f"深嵌套 multipart（{depth} 层）",
+         b"Subject: deep\r\nMIME-Version: 1.0\r\n" + nested),
+        ("charset 声明 gb2312 但字节是 utf-8",
+         b"Subject: =?gb2312?B?5L2g5aW9?=\r\n"
+         b'Content-Type: text/plain; charset="gb2312"\r\n\r\n'
+         + "中文正文".encode()),
+        ("base64 声明却是垃圾数据",
+         b'Subject: bad-b64\r\nContent-Type: text/plain; charset="utf-8"\r\n'
+         b"Content-Transfer-Encoding: base64\r\n\r\n!!!not base64 at all!!!"),
+        ("截断的编码头",
+         b"Subject: =?utf-8?B?5LiN5a6M5pW0?=\r\n"
+         b"From: =?utf-8?Q?unfinished\r\n\r\nbody"),
+        ("头部 CRLF 注入（伪造额外头）",
+         b"Subject: safe\r\nX-Injected: 1\r\n\r\nbody"),
+        ("超长主题（10 万字符）",
+         b"Subject: " + b"A" * 100_000 + b"\r\n\r\nbody"),
+        ("路径穿越式附件名",
+         b'Subject: traverse\r\nMIME-Version: 1.0\r\n'
+         b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n--B\r\n'
+         b'Content-Type: application/octet-stream; name="../../../../etc/passwd"\r\n'
+         b'Content-Disposition: attachment; filename="../../../.bashrc"\r\n'
+         b"Content-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--B--\r\n"),
+        ("HTML 正文里的 XSS / 跟踪像素",
+         b'Subject: hostile-html\r\nMIME-Version: 1.0\r\n'
+         b'Content-Type: text/html; charset="utf-8"\r\n\r\n'
+         + (
+             '<script>fetch("http://evil.example/x")</script>'
+             '<img src="http://tracker.example/p.gif">'
+             '<a href="javascript:alert(1)">click</a>'
+             "<p>正常内容</p>"
+         ).encode()),
+    ]
+
+
+def test_hostile_mime_corpus():
+    """G5：畸形/恶意 MIME 不能让解析链路抛异常，也不能漏出可执行内容。"""
+    from unimail.platforms.parser import (
+        parse_headers_only,
+        parse_message,
+        sanitize_html,
+    )
+
+    crashed: list[str] = []
+    for name, raw in _hostile_mime_corpus():
+        try:
+            nm = parse_message(raw, "1")
+            hd = parse_headers_only(raw, "1")
+        except Exception as exc:  # noqa: BLE001 - 这里就是要证明「不会抛」
+            crashed.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if not isinstance(nm.subject, str) or not isinstance(hd.subject, str):
+            crashed.append(f"{name}: subject 不是字符串")
+    check("全部畸形报文都能安全解析（不抛异常）", not crashed, "；".join(crashed))
+
+    # 深嵌套：必须能解析完，而不是 RecursionError
+    deep = dict(_hostile_mime_corpus())["深嵌套 multipart（40 层）"]
+    nm_deep = parse_message(deep, "1")
+    check("深嵌套 multipart 不会栈溢出",
+          isinstance(nm_deep.body_html, str) and isinstance(nm_deep.body_text, str))
+
+    # 编码声明与实际字节不符时：必须回落到能解码的尝试序列，而不是抛 UnicodeError
+    wrong_cs = dict(_hostile_mime_corpus())["charset 声明 gb2312 但字节是 utf-8"]
+    nm_cs = parse_message(wrong_cs, "1")
+    check("charset 谎言不会导致解码失败", "中文" in nm_cs.body_text,
+          f"实际 {nm_cs.body_text!r}")
+
+    # 垃圾 base64：不能抛，也不能把正文当附件
+    bad_b64 = dict(_hostile_mime_corpus())["base64 声明却是垃圾数据"]
+    nm_b64 = parse_message(bad_b64, "1")
+    check("垃圾 base64 不会导致解析失败", isinstance(nm_b64.body_text, str))
+
+    # XSS / 跟踪像素：这是最需要被守住的一条
+    hostile = dict(_hostile_mime_corpus())["HTML 正文里的 XSS / 跟踪像素"]
+    nm_html = parse_message(hostile, "1")
+    low = nm_html.body_html.lower()
+    check("恶意 HTML 中的 script 已被剥离", "script" not in low, nm_html.body_html)
+    check("恶意 HTML 中的跟踪像素已剥离", "tracker.example" not in low, nm_html.body_html)
+    check("恶意 HTML 中的 javascript: 链已剥离", "javascript" not in low, nm_html.body_html)
+    check("正常内容保留", "正常内容" in nm_html.body_html, nm_html.body_html)
+
+    # 路径穿越式文件名：解析阶段**如实保留**（邮件里写的是什么就是什么，
+    # 这样 UI 能原样展示给用户看），真正的防线在落盘阶段——这里验证那道防线。
+    traverse = dict(_hostile_mime_corpus())["路径穿越式附件名"]
+    nm_tr = parse_message(traverse, "1")
+    check("路径穿越式文件名被如实解析（Content-Disposition 优先）",
+          bool(nm_tr.attachments) and nm_tr.attachments[0].filename.startswith("../"),
+          f"实际 {[a.filename for a in nm_tr.attachments]}")
+    from unimail.core.services import safe_attachment_name
+    hostile_names = [
+        nm_tr.attachments[0].filename,
+        "../../../../etc/passwd",
+        "..\\..\\Windows\\System32\\cmd.exe",
+        "/etc/shadow",
+        "C:\\Windows\\notepad.exe",
+        "NUL",
+        "CON.txt",
+        "com1.bat",
+        "....",
+        "   ",
+        "report" + ".pdf" * 100,
+        "bad\x00name\x1f.txt",
+    ]
+    leaks = []
+    for bad in hostile_names:
+        got = safe_attachment_name(bad)
+        if "/" in got or "\\" in got or got in {"", ".", ".."}:
+            leaks.append(f"{bad!r} → {got!r}")
+        if len(got) > 120:
+            leaks.append(f"{bad!r} → 超长 {len(got)}")
+        if got.split(".", 1)[0].lower() in {"con", "prn", "aux", "nul", "com1"}:
+            leaks.append(f"{bad!r} → 命中保留设备名 {got!r}")
+    check("附件名净化不留任何路径分隔符 / 保留设备名", not leaks, "；".join(leaks))
+    check("净化后的名字等于自身 basename（拼不出跨目录路径）",
+          all(Path(safe_attachment_name(n)).name == safe_attachment_name(n)
+              for n in hostile_names))
+    check("空名字回落到中性占位名", safe_attachment_name("") == "attachment.bin")
+
+    # 清洗器本身：单独再过一遍「白名单之外的标签/属性一律不输出」
+    check("sanitize_html 对畸形输入不抛异常",
+          isinstance(sanitize_html("<div><p>a<script>b<!-- c"), str))
+
+
+# ============================================================ 20. 中断注入
+def test_interruption_injection():
+    """G5：在关键写入路径上注入中断，验证「要么完整落盘、要么保持原状」。
+
+    这些路径的共同点是「写入过程中掉电/崩溃会造成不可逆损坏」：
+    批量入库、附件落盘、侧车写入、整库加密迁移。
+    """
+    _tmp, _cfg, _ctxmod, svcmod = setup_env("crash_")
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.core.security import SecurityService
+    from unimail.storage import AccountRepository, Database, MailRepository
+    from unimail.ui.context import atomic_write_json
+
+    tmp, _cfg2, _ctxmod2, _svc2 = setup_env("crash_tx_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "t.db", sec.db_key(), encrypted=False)
+    accounts, mails = AccountRepository(db), MailRepository(db)
+    acc = accounts.insert(AccountDraft(platform="qq", email="c@qq.com", password="x"))
+    now = datetime.now(timezone.utc)
+    base = [NormalizedMail(uid=str(i), subject=f"m{i}", date=now) for i in range(1, 11)]
+
+    # ---- ① 批量入库事务中途中断 → 整批回滚，不留「半页」
+    sql_insert = (
+        "INSERT INTO mails (id, account_id, platform, folder, uid, uid_validity, "
+        "subject, date, created_at) VALUES (?,?,?,?,?,?,?,?,?)"
+    )
+
+    def _row(mail: NormalizedMail) -> tuple:
+        return ("id-" + mail.uid, acc.id, "qq", "INBOX", mail.uid, 1,
+                mail.subject, now.isoformat(), now.isoformat())
+
+    with contextlib.suppress(RuntimeError), db.transaction() as conn:
+        conn.executemany(sql_insert, [_row(m) for m in base[:5]])
+        raise RuntimeError("注入中断：模拟写入中途掉电")
+    check("事务中断后整批回滚，不留半页数据",
+          int(db.scalar("SELECT COUNT(*) FROM mails")) == 0,
+          f"实际 {db.scalar('SELECT COUNT(*) FROM mails')}")
+
+    ok = mails.insert_mails_batch(acc.id, "qq", base, uid_validity=1)
+    check("中断后事务仍可正常使用", ok.new_count == 10, f"实际 {ok.new_count}")
+
+    # ---- ② 附件落盘中途中断 → 原文件不被改写、不留 .part 残骸
+    target = svcmod.ATTACHMENT_DIR / "cafebabe_partial.bin"
+    target.write_bytes(b"original")
+    with patch("os.fsync", side_effect=OSError("模拟断电")):
+        try:
+            svcmod.MailService._atomic_write_exclusive(target, b"new-bytes")
+            check("附件写入中断时抛错而不是静默成功", False, "竟然没抛错")
+        except OSError:
+            check("附件写入中断时抛错而不是静默成功", True)
+    check("中断后原文件内容未被改写", target.read_bytes() == b"original")
+    check("中断后不留 .part 残骸",
+          not list(svcmod.ATTACHMENT_DIR.glob("*.part")),
+          f"实际 {[p.name for p in svcmod.ATTACHMENT_DIR.glob('*.part')]}")
+    check("中断后不留占位空文件",
+          sorted(p.name for p in svcmod.ATTACHMENT_DIR.iterdir()) == [target.name],
+          f"实际 {sorted(p.name for p in svcmod.ATTACHMENT_DIR.iterdir())}")
+
+    # ---- ③ 侧车写入中途中断 → 旧侧车完好、不留 .tmp
+    meta = _cfg.DB_PATH.with_suffix(".meta.json")
+    atomic_write_json(meta, {"verifier": "v1", "salt": "s1"})
+    before = meta.read_text("utf-8")
+    with patch("os.replace", side_effect=OSError("模拟断电")):
+        try:
+            atomic_write_json(meta, {"verifier": "v2", "salt": "s2"})
+            check("侧车写入中断时抛错而不是静默成功", False, "竟然没抛错")
+        except OSError:
+            check("侧车写入中断时抛错而不是静默成功", True)
+    check("中断后旧侧车内容完好", meta.read_text("utf-8") == before)
+    check("中断后不留 .tmp 残骸", not list(meta.parent.glob("*.tmp")),
+          f"实际 {[p.name for p in meta.parent.glob('*.tmp')]}")
+    check("旧侧车仍可被读回", json.loads(meta.read_text("utf-8"))["verifier"] == "v1")
+
+    db.close()
+    _assert_migration_failure_keeps_source()
+
+
+def _assert_migration_failure_keeps_source() -> None:
+    """④ 整库加密迁移在校验环节中断 → 原库保持可读，且不留 *.enc-tmp。"""
+    from unimail.core.models import AccountDraft, NormalizedMail
+    from unimail.core.security import SecurityService
+    from unimail.storage import (
+        AccountRepository,
+        Database,
+        DatabaseError,
+        MailRepository,
+        sqlcipher_available,
+    )
+
+    if not sqlcipher_available():
+        # 降级模式（无 SQLCipher）下迁移入口本身就会明确拒绝，这里只验证这一点
+        tmp, _cfg, _ctxmod, _svc = setup_env("crash_mig_")
+        sec = SecurityService()
+        sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+        plain = Database(tmp / "m.db", sec.db_key(), encrypted=False)
+        try:
+            plain.migrate_to_encrypted(b"k" * 32)
+            check("无 SQLCipher 时迁移被明确拒绝", False, "竟然开始迁移了")
+        except DatabaseError as exc:
+            check("无 SQLCipher 时迁移被明确拒绝", "sqlcipher3" in str(exc), str(exc))
+        plain.close()
+        return
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("crash_mig_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    plain = Database(tmp / "m.db", sec.db_key(), encrypted=False)
+    accounts = AccountRepository(plain)
+    mails = MailRepository(plain)
+    acc = accounts.insert(AccountDraft(platform="qq", email="m@qq.com", password="x"))
+    mails.insert_mails_batch(acc.id, "qq", [
+        NormalizedMail(uid=str(i), subject=f"m{i}",
+                       date=datetime.now(timezone.utc)) for i in range(1, 4)
+    ], uid_validity=1)
+
+    with patch.object(Database, "_verify_migrated_file",
+                      side_effect=DatabaseError("注入中断：迁移校验失败")):
+        try:
+            plain.migrate_to_encrypted(b"k" * 32)
+            check("迁移校验失败时不替换原库", False, "竟然替换了")
+        except DatabaseError:
+            check("迁移校验失败时不替换原库", True)
+
+    check("中断后不留 .enc-tmp 半成品", not list(tmp.glob("*.enc-tmp")),
+          f"实际 {[p.name for p in tmp.glob('*.enc-tmp')]}")
+    check("中断后数据库对象被恢复为可用（无需重启程序）",
+          int(plain.scalar("SELECT COUNT(*) FROM mails")) == 3,
+          f"实际 {plain.scalar('SELECT COUNT(*) FROM mails')}")
+    plain.close()
+
+    # 用裸 sqlite3 回读原文件，确认它仍是原来那个明文库
+    import sqlite3
+    conn = sqlite3.connect(str(tmp / "m.db"))
+    rows = conn.execute("SELECT COUNT(*) FROM mails").fetchone()[0]
+    conn.close()
+    check("中断后磁盘上的原库文件仍是可读的明文库", int(rows) == 3, f"实际 {rows}")
+
+
+SUITES = [
+    ("安全层", test_security),
+    ("存储层", test_storage),
+    ("【回归】改主密码后凭据可用性", test_change_password_regression),
+    ("【回归】IMAP part 编号", test_imap_part_numbering),
+    ("【回归】附件真实下载", test_attachment_download),
+    ("数据库迁移与版本", test_migration),
+    ("TLS 证书校验", test_tls_certificate_verification),
+    ("【回归】同步游标与 UIDVALIDITY", test_sync_pagination_and_uidvalidity),
+    ("侧车原子性与恢复包", test_sidecar_atomicity_and_recovery),
+    ("旧版侧车与驱动不一致", test_legacy_sidecar_and_driver_mismatch),
+    ("数据清理路径", test_reset_data_paths),
+    ("数据库并发与加密模式", test_database_concurrency_and_mode),
+    # ---- 第二批（v1.3.0）
+    ("批量写入与列表投影", test_batch_write_and_projection),
+    ("列表索引与查询计划", test_indexes_and_query_plan),
+    ("HTML 白名单清洗", test_html_whitelist_sanitizer),
+    ("BODYSTRUCTURE 附件元数据", test_bodystructure_attachment_meta),
+    ("【回归】同步回填附件信息", test_sync_backfills_attachment_meta),
+    ("附件落盘安全策略", test_attachment_safety_policy),
+    ("孤儿附件清理", test_orphan_attachment_cleanup),
+    ("KDF 算法与密码策略", test_kdf_algorithms_and_password_policy),
+    ("KDF 渐进升级", test_kdf_upgrade_on_password_change),
+    ("解锁退避持久化", test_unlock_guard_backoff),
+    ("恶意 MIME 语料", test_hostile_mime_corpus),
+    ("关键路径中断注入", test_interruption_injection),
+]
 
 
 def main() -> int:
     print("=" * 60)
     print("UniMail 回归测试套件")
     print("=" * 60)
-    suites = [
-        ("安全层", test_security),
-        ("存储层", test_storage),
-        ("【回归】改主密码后凭据可用性", test_change_password_regression),
-        ("【回归】IMAP part 编号", test_imap_part_numbering),
-        ("【回归】附件真实下载", test_attachment_download),
-        ("数据库迁移 v1→v3", test_migration),
-        ("TLS 证书校验", test_tls_certificate_verification),
-        ("【回归】同步游标与 UIDVALIDITY", test_sync_pagination_and_uidvalidity),
-        ("侧车原子性与恢复包", test_sidecar_atomicity_and_recovery),
-        ("旧版侧车与驱动不一致", test_legacy_sidecar_and_driver_mismatch),
-        ("数据清理路径", test_reset_data_paths),
-        ("数据库并发与加密模式", test_database_concurrency_and_mode),
-    ]
     failed = 0
-    for title, fn in suites:
+    for title, fn in SUITES:
         print(f"\n▸ {title}")
         try:
             fn()

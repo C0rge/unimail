@@ -46,7 +46,7 @@ class Account:
     total_count: int = 0
 
     @classmethod
-    def from_row(cls, row: dict) -> "Account":
+    def from_row(cls, row: dict) -> Account:
         return cls(
             id=row["id"],
             platform=row["platform"],
@@ -105,7 +105,7 @@ class Attachment:
     part_index: str = ""      # IMAP part 编号，用于按需下载
 
     @classmethod
-    def from_row(cls, row: dict) -> "Attachment":
+    def from_row(cls, row: dict) -> Attachment:
         return cls(
             id=row["id"],
             mail_id=row["mail_id"],
@@ -142,7 +142,7 @@ class Mail:
     attachments: list[Attachment] = field(default_factory=list)
 
     @classmethod
-    def from_row(cls, row: dict) -> "Mail":
+    def from_row(cls, row: dict) -> Mail:
         import json
         try:
             to_addrs = json.loads(row.get("to_addrs") or "[]")
@@ -172,6 +172,81 @@ class Mail:
     @property
     def sender_display(self) -> str:
         return self.from_name or self.from_addr or "(未知发件人)"
+
+    def to_summary(self) -> MailSummary:
+        """降级为列表投影（丢弃正文与附件明细）。"""
+        return MailSummary(
+            id=self.id,
+            account_id=self.account_id,
+            platform=self.platform,
+            folder=self.folder,
+            uid=self.uid,
+            subject=self.subject,
+            from_name=self.from_name,
+            from_addr=self.from_addr,
+            date=self.date,
+            preview=self.preview,
+            has_attachments=self.has_attachments,
+            is_read=self.is_read,
+            is_starred=self.is_starred,
+            raw_size=self.raw_size,
+        )
+
+
+@dataclass
+class MailSummary:
+    """列表投影：只含表格渲染需要的字段，**不含正文与附件明细**。
+
+    列表是应用里刷新最频繁的视图，而 `body_html` 单封可达上百 KB。
+    此前列表直接持有完整 `Mail`，300 行即是数十 MB 常驻内存，且每次筛选
+    都要重新反序列化这些大字段。列表只需要下面这十几个标量字段；
+    正文/附件在真正点开某封邮件时按 id 单独取（`MailService.get`）。
+    """
+    id: str
+    account_id: str
+    platform: str
+    folder: str
+    uid: str
+    subject: str = ""
+    from_name: str = ""
+    from_addr: str = ""
+    date: datetime | None = None
+    preview: str = ""
+    has_attachments: bool = False
+    is_read: bool = False
+    is_starred: bool = False
+    raw_size: int = 0
+
+    @classmethod
+    def from_row(cls, row: dict) -> MailSummary:
+        return cls(
+            id=row["id"],
+            account_id=row["account_id"],
+            platform=row["platform"],
+            folder=row.get("folder") or "INBOX",
+            uid=str(row["uid"]),
+            subject=row.get("subject") or "(无主题)",
+            from_name=row.get("from_name") or "",
+            from_addr=row.get("from_addr") or "",
+            date=_parse_dt(row.get("date")),
+            preview=row.get("preview") or "",
+            has_attachments=bool(row.get("has_attachments")),
+            is_read=bool(row.get("is_read")),
+            is_starred=bool(row.get("is_starred")),
+            raw_size=row.get("raw_size") or 0,
+        )
+
+    @property
+    def sender_display(self) -> str:
+        return self.from_name or self.from_addr or "(未知发件人)"
+
+
+# 列表投影所需的列（与 MailSummary.from_row 一一对应）。
+MAIL_SUMMARY_COLUMNS = (
+    "id", "account_id", "platform", "folder", "uid", "subject",
+    "from_name", "from_addr", "date", "preview",
+    "has_attachments", "is_read", "is_starred", "raw_size",
+)
 
 
 @dataclass

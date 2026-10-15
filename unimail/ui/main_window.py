@@ -6,11 +6,9 @@ import logging
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QSplitter,
     QStatusBar,
@@ -18,13 +16,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import APP_NAME, APP_VERSION, AUTO_LOCK_SECONDS
+from ..config import APP_NAME, AUTO_LOCK_SECONDS
 from ..core.models import MailFilter
 from ..core.security import SecurityError
 from .account_panel import AccountPanel
 from .context import AppContext
 from .detail_panel import DetailPanel
-from .dialogs import AboutDialog, AddAccountDialog, LoginDialog
+from .dialogs import AboutDialog, AddAccountDialog
 from .filter_bar import FilterBar
 from .inbox_panel import InboxPanel
 
@@ -54,6 +52,7 @@ class MainWindow(QMainWindow):
         # 立即渲染本地已有数据，再延迟触发网络同步
         self.refresh_accounts()
         self.reload_mails()
+        QTimer.singleShot(200, self._offer_kdf_upgrade)
         QTimer.singleShot(400, self._initial_sync)
 
     # ------------------------------------------------------------ UI
@@ -369,15 +368,15 @@ class MainWindow(QMainWindow):
             return
 
         # 正文尚未同步（列表只拉了头部）→ 后台补拉
-        if not mail.body_text and not mail.body_html:
-            if self.ctx.body_pool and self.ctx.body_pool.request(mail_id):
-                self.set_status("正在拉取邮件正文…")
+        if (not mail.body_text and not mail.body_html
+                and self.ctx.body_pool and self.ctx.body_pool.request(mail_id)):
+            self.set_status("正在拉取邮件正文…")
 
         self.detail_panel.show_mail(mail)
         if not mail.is_read:
             self.ctx.mails.mark_read(mail_id, True)
             mail.is_read = True
-            self.inbox_panel.refresh_row(mail)
+            self.inbox_panel.refresh_row(mail.to_summary())
             self.refresh_accounts()
 
     def _on_mail_body_fetched(self, mail_id: str) -> None:
@@ -397,7 +396,7 @@ class MainWindow(QMainWindow):
         self.ctx.mails.toggle_star(mail_id)
         mail = self.ctx.mails.get(mail_id)
         if mail:
-            self.inbox_panel.refresh_row(mail)
+            self.inbox_panel.refresh_row(mail.to_summary())
             if self.inbox_panel.current_mail_id() == mail_id:
                 self.detail_panel.show_mail(mail)
 
@@ -414,14 +413,21 @@ class MainWindow(QMainWindow):
 
     def _on_download_attachment(self, attachment_id: str) -> None:
         try:
-            path = self.ctx.mails.download_attachment(attachment_id)
-            self.set_status(f"附件已保存到：{path}")
-            QMessageBox.information(
-                self, "附件已下载",
-                f"附件已保存到：\n{path}",
-            )
-        except (FileNotFoundError, OSError) as exc:
+            result = self.ctx.mails.download_attachment(attachment_id)
+        except (FileNotFoundError, OSError, ValueError, SecurityError) as exc:
             QMessageBox.warning(self, "下载失败", str(exc))
+            return
+
+        self.set_status(f"附件已保存到：{result.path}")
+        lines = [f"附件已保存到：\n{result.path}"]
+        if result.size:
+            lines.append(f"\n大小：{result.size / 1024:.1f} KB")
+        if result.danger and result.name_hint:
+            lines.append(f"\n⚠️ {result.name_hint}")
+        QMessageBox.information(
+            self, "附件已下载" + ("（已做安全处理）" if result.danger else ""),
+            "\n".join(lines),
+        )
 
     # ------------------------------------------------------------ 其他
     def _on_about(self) -> None:
@@ -449,17 +455,18 @@ class MainWindow(QMainWindow):
         )
 
     def _on_encryption_settings(self) -> None:
-        from ..storage import SQLCIPHER_AVAILABLE
+        from ..storage import sqlcipher_available
         db = self.ctx.db
         if db is None:
             return
-        if not SQLCIPHER_AVAILABLE:
+        if not sqlcipher_available():
+            from ..config import sqlcipher_pip_hint
             QMessageBox.information(
                 self, "数据库加密",
                 f"当前加密等级：{db.encryption_level}\n\n"
                 "环境未安装 sqlcipher3，无法启用整库加密。\n"
                 "安装依赖后重启即可在启动时选择迁移：\n"
-                "    pip install sqlcipher3-binary",
+                f"    {sqlcipher_pip_hint()}",
             )
             return
 
@@ -497,17 +504,40 @@ class MainWindow(QMainWindow):
 
     def _on_change_password(self) -> None:
         from PySide6.QtWidgets import QInputDialog
+
+        from ..config import PASSWORD_MIN_LENGTH
+        from ..core.security import password_strength
+
         old, ok = QInputDialog.getText(self, "修改主密码", "当前主密码：",
                                        QLineEdit_EchoMode_Password())
         if not ok or not old:
             return
-        new, ok = QInputDialog.getText(self, "修改主密码", "新主密码（≥6 位）：",
-                                       QLineEdit_EchoMode_Password())
+        new, ok = QInputDialog.getText(
+            self, "修改主密码",
+            f"新主密码（至少 {PASSWORD_MIN_LENGTH} 位，建议混合大小写、数字与符号）：",
+            QLineEdit_EchoMode_Password(),
+        )
         if not ok:
             return
-        if len(new) < 6:
-            QMessageBox.warning(self, "修改失败", "新主密码至少 6 位")
+        if len(new) < PASSWORD_MIN_LENGTH:
+            QMessageBox.warning(
+                self, "修改失败",
+                f"新主密码至少 {PASSWORD_MIN_LENGTH} 位。\n\n"
+                "主密码是保护全部邮件与登录凭据的唯一屏障，"
+                "且离线爆破不受尝试次数限制——长度是最有效的强度来源。",
+            )
             return
+        score, label = password_strength(new)
+        if score <= 1:
+            ret = QMessageBox.warning(
+                self, "密码强度偏低",
+                f"当前强度评估：{label}\n\n"
+                "建议再加入大写字母、数字或符号，或进一步加长。\n"
+                "仍要使用这个密码吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
         if new == old:
             QMessageBox.information(self, "无需修改", "新主密码与当前密码相同。")
             return
@@ -529,11 +559,28 @@ class MainWindow(QMainWindow):
             lines.append(
                 "· 数据库未整库重新加密：当前为降级模式（未安装 SQLCipher），"
                 "数据库本身为明文，仅登录凭据受字段级加密保护。\n"
-                "  如需整库加密，请先安装 sqlcipher3-binary 后重新初始化。"
+                "  如需整库加密，请在「文件 → 数据库加密设置」中迁移。"
             )
+        if result.kdf:
+            lines.append(f"· 密钥派生参数已更新为：{result.kdf}")
         lines.append("\n请牢记新密码——遗忘将无法恢复任何数据。")
         QMessageBox.information(self, "主密码已更新", "\n".join(lines))
         self.set_status("主密码已更新，凭据已重新加密")
+
+    def _offer_kdf_upgrade(self) -> None:
+        """旧库的 KDF 弱于当前默认时提示升级（改密码即完成升级）。"""
+        if not getattr(self.ctx, "kdf_upgrade_pending", False):
+            return
+        ret = QMessageBox.question(
+            self, "建议升级密钥派生参数",
+            "当前数据库使用的是较早的密钥派生参数（PBKDF2），"
+            "在显卡上被暴力破解的成本明显低于现在的默认算法（Argon2id，内存硬）。\n\n"
+            "是否现在通过「修改主密码」升级？\n"
+            "（不升级也能正常使用，但建议尽快完成。）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if ret == QMessageBox.Yes:
+            self._on_change_password()
 
     def _on_lock(self) -> None:
         self.ctx.shutdown()
@@ -553,7 +600,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         try:
             self.ctx.shutdown()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("关闭时出错")
         event.accept()
 

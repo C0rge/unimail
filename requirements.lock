@@ -1,0 +1,38 @@
+# UniMail 依赖锁文件（已验证版本组合）
+#
+# 作用：把「跑通过测试的那一组确切版本」固定下来，避免 requirements.txt 的
+# 开放区间在某次全新安装时解析出一组没人验证过的版本。
+#
+# 更新方式：改 requirements.txt 的约束 → 重新安装 → 跑 tests/smoke.py（两种
+# 环境：有/无 SQLCipher）→ 通过后把新版本抄到这里，并在 CHANGELOG 里记一笔。
+# 版本号必须是 `pip list` 里的**实测值**，不要凭记忆填。
+#
+# 本文件记录的组合已在 Windows / Python 3.13 上跑通 249 项断言：
+#   · 无 SQLCipher：SQLite + 字段级加密（降级模式），246 项
+#   · 有 SQLCipher：整库加密（AES-256），249 项
+# 注意：Linux/macOS 上的 `sqlcipher3-wheels` 与 `cffi` 需要各自平台的轮子，
+# 未在本机验证过，CI（.github/workflows/ci.yml）会在两头各跑一遍。
+
+# ---- 运行依赖 ----------------------------------------------------------
+PySide6-Essentials==6.12.0
+shiboken6==6.12.0
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.11
+
+# ---- 整库加密驱动 -------------------------------------------------------
+# 全平台统一用 sqlcipher3-wheels：只有它在 Windows / macOS / Linux 三端都
+# 发布了预编译轮子（sqlcipher3-binary 只有 Linux x86_64）。
+# 上限锁 0.5.6：0.5.7 与 `PRAGMA cipher_memory_security = ON` 组合在 Windows
+# 上会栈溢出崩溃进程。
+sqlcipher3-wheels==0.5.6
+
+# ---- 开发/CI 依赖 ------------------------------------------------------
+ruff==0.17.0
+mypy==2.4.0
+mypy_extensions==1.1.0
+pytest==9.1.1
+pluggy==1.7.0
+iniconfig==2.3.1
+packaging==26.3
+pip-audit==2.10.1

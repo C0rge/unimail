@@ -13,16 +13,16 @@ import argparse
 import logging
 import shutil
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from unimail.config import APP_NAME, ATTACHMENT_DIR, DB_PATH, LOG_PATH, data_file_paths
 from unimail.core.security import SecurityError
-from unimail.storage import DatabaseError, SQLCIPHER_AVAILABLE
+from unimail.storage import DatabaseError, sqlcipher_available
 from unimail.ui.context import AppContext
 from unimail.ui.dialogs import LoginDialog
 from unimail.ui.main_window import MainWindow
@@ -63,10 +63,36 @@ def reset_data(db_path: Path | None = None, attachment_dir: Path | None = None) 
     print(f"已清空数据目录（删除 {removed} 项）：{(db_path or DB_PATH).parent}")
 
 
+def _wait_with_ui(seconds: float) -> None:
+    """在冷却期内等待，同时保持界面响应（sleep 会整窗口卡死）。"""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.05)
+
+
 def run_login(ctx: AppContext) -> bool:
-    """弹出登录对话框并解锁数据库。返回是否成功。"""
+    """弹出登录对话框并解锁数据库。返回是否成功。
+
+    尝试次数用尽后不再通过重启绕过：退避状态由 `UnlockGuard` 持久化在
+    数据目录里，「关掉再开」不会把计数清零。
+
+    冷却期在这里**先等完再弹对话框**：否则用户会被提示「请等待 N 秒」，
+    却又立刻拿到一次注定被拒的尝试机会，白扣一次尝试次数。
+    """
+    from unimail.config import UNLOCK_MAX_ATTEMPTS
+    from unimail.core.security import UnlockGuard
+
     attempts = 0
-    while attempts < 3:
+    while attempts < UNLOCK_MAX_ATTEMPTS:
+        wait = UnlockGuard().remaining_wait()
+        if wait > 0:
+            QMessageBox.information(
+                None, "请稍候",
+                f"由于多次输入错误，解锁已被暂时限制。\n\n请等待 {wait:.0f} 秒后自动继续。",
+            )
+            _wait_with_ui(wait)
+            continue
         dlg = LoginDialog(ctx.is_first_run)
         if dlg.exec() != QDialog.Accepted:
             return False
@@ -83,17 +109,23 @@ def run_login(ctx: AppContext) -> bool:
         except SecurityError as exc:
             attempts += 1
             ctx.is_first_run = False
+            left = UNLOCK_MAX_ATTEMPTS - attempts
             QMessageBox.warning(
                 None, "解锁失败",
-                f"{exc}\n\n还可以尝试 {3 - attempts} 次。",
+                f"{exc}\n\n本次运行还可以尝试 {left} 次。\n"
+                "（连续失败会触发递增等待，重启程序不会重置该限制。）",
             )
-    QMessageBox.critical(None, "已锁定", "连续多次输入错误，程序退出。")
+    QMessageBox.critical(
+        None, "已锁定",
+        "连续多次输入错误，程序退出。\n\n"
+        "请稍后重新启动再试；如果确实忘记了主密码，数据无法通过任何方式恢复。",
+    )
     return False
 
 
 def offer_encryption_upgrade(ctx: AppContext) -> None:
     """已安装 SQLCipher 但库仍为明文时，提供一次性迁移入口。"""
-    if not SQLCIPHER_AVAILABLE or ctx.db is None or ctx.db.encrypted:
+    if not sqlcipher_available() or ctx.db is None or ctx.db.encrypted:
         return
     ret = QMessageBox.question(
         None, "启用整库加密",

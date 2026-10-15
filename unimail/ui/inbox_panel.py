@@ -14,9 +14,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.models import Mail
-from .mail_model import COL_PLATFORM, COL_SENDER, COL_SUBJECT, COL_TIME, COL_UNREAD
-from .mail_model import MailTableModel
+from ..core.models import Mail, MailSummary
+from .mail_model import COL_PLATFORM, COL_SENDER, COL_SUBJECT, COL_TIME, COL_UNREAD, MailTableModel
 
 
 class EmptyState(QWidget):
@@ -93,7 +92,7 @@ class InboxPanel(QFrame):
         self.stack.addWidget(self.empty)
 
     # ------------------------------------------------------------ 数据
-    def set_mails(self, mails: list[Mail], empty_hint: str | None = None) -> None:
+    def set_mails(self, mails: list[MailSummary], empty_hint: str | None = None) -> None:
         selected = self.current_mail_id()
         self.model.set_mails(mails)
         if mails:
@@ -120,7 +119,7 @@ class InboxPanel(QFrame):
         if row >= 0:
             self.table.selectRow(row)
 
-    def refresh_row(self, mail: Mail) -> None:
+    def refresh_row(self, mail: MailSummary | Mail) -> None:
         self.model.replace_mail(mail)
 
     # ------------------------------------------------------------ 事件

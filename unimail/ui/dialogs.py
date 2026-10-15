@@ -8,17 +8,16 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from ..config import APP_NAME, APP_VERSION, PLATFORMS, platform_name
+from ..config import APP_NAME, APP_VERSION, PASSWORD_MIN_LENGTH, PLATFORMS
 from ..core.models import AccountDraft
+from ..core.security import password_policy_error, password_strength
 
 
 class LoginDialog(QDialog):
@@ -60,6 +59,15 @@ class LoginDialog(QDialog):
         if is_first_run:
             layout.addWidget(self.pwd2)
 
+        # 实时强度提示：只在「首次设置」时出现，避免解锁流程里暴露
+        # 「你的密码很弱」这种反向信息（攻击者不需要知道）。
+        self.strength = QLabel("")
+        self.strength.setObjectName("Hint")
+        self.strength.setWordWrap(True)
+        if is_first_run:
+            layout.addWidget(self.strength)
+            self.pwd.textChanged.connect(self._update_strength)
+
         self.err = QLabel("")
         self.err.setStyleSheet("color: #f2545b; font-size: 12px;")
         self.err.setWordWrap(True)
@@ -81,13 +89,28 @@ class LoginDialog(QDialog):
             self.pwd2.returnPressed.connect(self._on_accept)
         self.pwd.setFocus()
 
+    def _update_strength(self) -> None:
+        pwd = self.pwd.text()
+        if not pwd:
+            self.strength.setText(f"至少 {PASSWORD_MIN_LENGTH} 位；建议混合大小写、数字与符号。")
+            return
+        _, label = password_strength(pwd)
+        self.strength.setText(f"强度：{label}")
+
     def _on_accept(self) -> None:
         pwd = self.pwd.text()
-        if len(pwd) < 6:
-            self.err.setText("主密码至少 6 位")
-            return
-        if self.is_first_run and pwd != self.pwd2.text():
-            self.err.setText("两次输入不一致")
+        # 只在「首次设置」时施加长度策略。解锁流程绝不校验策略——
+        # 老库的主密码可能短于当前下限，卡住就等于用户被自己锁在门外。
+        if self.is_first_run:
+            policy_error = password_policy_error(pwd)
+            if policy_error:
+                self.err.setText(policy_error)
+                return
+            if pwd != self.pwd2.text():
+                self.err.setText("两次输入不一致")
+                return
+        elif not pwd:
+            self.err.setText("请输入主密码")
             return
         self.password = pwd
         self.accept()

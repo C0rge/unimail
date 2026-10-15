@@ -1,4 +1,8 @@
-"""收件箱表格模型：虚拟化渲染，支持万级邮件。"""
+"""收件箱表格模型：虚拟化渲染，支持万级邮件。
+
+模型只持有 `MailSummary`（列表投影），**不持有正文**——正文单封可达上百 KB，
+300 行就是数十 MB 常驻内存；点开某封时再按 id 取完整 `Mail`。
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -7,7 +11,7 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
 from ..config import platform_color, platform_name
-from ..core.models import Mail
+from ..core.models import Mail, MailSummary
 
 COL_UNREAD = 0
 COL_SENDER = 1
@@ -17,30 +21,33 @@ COL_TIME = 4
 
 HEADERS = ["", "发件人", "主题", "平台", "时间"]
 
+Row = MailSummary | Mail
+
 
 class MailTableModel(QAbstractTableModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._mails: list[Mail] = []
+        self._mails: list[Row] = []
+        self._row_index: dict[str, int] = {}     # id -> row，替代 O(n) 线性查找
 
     # ------------------------------------------------------------ 数据
-    def set_mails(self, mails: list[Mail]) -> None:
+    def set_mails(self, mails: list[Row]) -> None:
         self.beginResetModel()
         self._mails = mails
+        self._row_index = {m.id: i for i, m in enumerate(mails)}
         self.endResetModel()
 
-    def mail_at(self, row: int) -> Mail | None:
+    def mail_at(self, row: int) -> Row | None:
         if 0 <= row < len(self._mails):
             return self._mails[row]
         return None
 
     def row_of(self, mail_id: str) -> int:
-        for i, m in enumerate(self._mails):
-            if m.id == mail_id:
-                return i
-        return -1
+        """O(1) 命中（此前是每次 O(n) 扫描整表）。"""
+        return self._row_index.get(mail_id, -1)
 
-    def replace_mail(self, mail: Mail) -> None:
+    def replace_mail(self, mail: Row) -> None:
+        """就地替换一行，只重绘该行（不再整表 reset）。"""
         row = self.row_of(mail.id)
         if row >= 0:
             self._mails[row] = mail
@@ -48,7 +55,7 @@ class MailTableModel(QAbstractTableModel):
                                   self.index(row, len(HEADERS) - 1))
 
     @property
-    def mails(self) -> list[Mail]:
+    def mails(self) -> list[Row]:
         return self._mails
 
     # ------------------------------------------------------------ Qt 接口
@@ -71,7 +78,7 @@ class MailTableModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             if col == COL_UNREAD:
-                return "" 
+                return ""
             if col == COL_SENDER:
                 return mail.sender_display
             if col == COL_SUBJECT:
