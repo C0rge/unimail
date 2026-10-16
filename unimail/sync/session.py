@@ -36,7 +36,23 @@ v1.5.0–v1.6.0 用 `BoundedSemaphore` 限制连接数，写法是：
 WARNING，等这一批结束后在 `_release()` 里回落到上限。池锁**绝不跨越任何阻塞
 调用**：所有 `close()`（内含 `LOGOUT` 网络往返）都挪到锁外执行。
 
-为什么用 `NOOP` 探活：TCP 连接可能在服务器侧已经被单方面关闭（NAT 超时、
+为什么还要一个「回收线程」（v1.6.1 复审补丁）
+---------------------------------------------
+上一轮只修掉了「持锁等待」那半边：锁不再跨越 `close()` 了。但 `close()` 本身
+仍然在**调用它的那个线程**上跑，而 `Scheduler.tick` 是 `QTimer` 在主线程上
+触发的：
+
+    Scheduler.tick → sweep() → close_account() → session.close()
+    → adapter.disconnect() → imap.close() + imap.logout()   ← 真实网络往返
+
+`disconnect()` 会发 `CLOSE` 与 `LOGOUT` 两个命令并等应答，每次最长等
+`FETCH_TIMEOUT`（默认 30 秒）——连接已死时（NAT 超时、代理掐掉空闲连接、
+服务器单方面关闭）就是**主线程干等 0–60 秒**。表现是「列表和详情突然一起
+无响应，几秒后自己恢复」，且每隔几分钟来一次（`sweep` 每 10 个心跳跑一次，
+即 300 秒）。因此断开连接的动作统一交给一条后台回收线程，
+池的**记账**（从 `_sessions` 摘除）仍然是同步完成的，复用语义不变。
+
+为什么用 NOOP 探活：TCP 连接可能在服务器侧已经被单方面关闭（NAT 超时、
 服务端 `IDLE` 超时），此时本地 socket 看起来仍是「已连接」，直到下一次读写
 才发现。`NOOP` 是一次极轻量的往返，能在真正取数据前发现这点。
 """
@@ -44,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import queue
 import threading
 import time
 from collections.abc import Iterator
@@ -56,6 +73,54 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_SESSIONS = 8
 DEFAULT_IDLE_TIMEOUT = 240.0     # 秒；超过则回收，避免长期占用服务器连接配额
+
+
+class _CloseReaper:
+    """把「带网络往返的断开」挪出调用线程的后台执行器。
+
+    只做一件事：按提交顺序对每个对象调用 `close()`。用一条线程而不是
+    线程池 —— 断开是低频动作（空闲回收 / 超额回落），排队执行即可，
+    并发断开只会在服务器侧制造无谓的握手峰值。
+    """
+
+    def __init__(self, name: str = "unimail-imap-reaper") -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._name = name
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def submit(self, item: Any) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, name=self._name,
+                                                daemon=True)
+                self._thread.start()
+        self._queue.put(item)
+
+    def _loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                item.close()
+            # 盲捕是有意的，且这里不需要 noqa：BLE001 对「无限循环里的兜底
+            # 捕获」本就豁免（见 ruff 文档），回收线程必须能吞下任何异常——
+            # 一旦让它冒出去，线程就死了，后续所有会话再也没人断开。
+            except Exception:
+                log.debug("后台断开 IMAP 连接失败", exc_info=True)
+            finally:
+                self._queue.task_done()
+
+    def pending(self) -> int:
+        return int(self._queue.unfinished_tasks)
+
+    def drain(self, timeout: float = 5.0) -> bool:
+        """等待队列排空；返回是否真的排空。超时不抛异常。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return self._queue.unfinished_tasks == 0
 
 
 class ImapSession:
@@ -173,6 +238,17 @@ class SessionPool:
         self._borrows: dict[str, int] = {}
         # 临时超额的次数，仅供诊断（正常应为 0，或只在「一次派发很多账号」时短暂 > 0）
         self._over_capacity = 0
+        # 真正的断开（CLOSE + LOGOUT 网络往返）交给它，绝不阻塞调用线程 ——
+        # 调用线程可能是 GUI 主线程（见模块顶部「为什么还要一个回收线程」）。
+        self._reaper = _CloseReaper()
+
+    def _retire(self, session: ImapSession) -> None:
+        """把一条已从池中摘除的会话交给后台线程断开。
+
+        摘除与断开必须分开：**摘除是同步的**（否则 `_detach_lru_locked`
+        之外的并发借用会拿到一条已经不属于池的连接），而**断开是异步的**。
+        """
+        self._reaper.submit(session)
 
     # ------------------------------------------------------------ 内部
     def _get_or_create(self, account: Account, password: str) -> ImapSession:
@@ -202,9 +278,9 @@ class SessionPool:
                 session = ImapSession(account, password)
                 self._sessions[account.id] = session
             self._borrows[account.id] = self._borrows.get(account.id, 0) + 1
-        # close() 内含 LOGOUT 网络往返，必须在池锁之外执行
+        # 断开包含网络往返（CLOSE + LOGOUT），必须在池锁之外、且不在调用线程上执行
         if victim is not None:
-            victim.close()
+            self._retire(victim)
         return session
 
     def _detach_lru_locked(self, exclude: str | None = None) -> ImapSession | None:
@@ -235,7 +311,7 @@ class SessionPool:
                 # 优先保留刚用过的会话（它最可能被立刻复用）
                 victim = self._detach_lru_locked(exclude=account_id)
         if victim is not None:
-            victim.close()
+            self._retire(victim)
 
     # ------------------------------------------------------------ 对外
     @contextlib.contextmanager
@@ -248,12 +324,18 @@ class SessionPool:
             self._release(account.id)
 
     def close_account(self, account_id: str) -> None:
+        """摘除该账号的会话并**异步**断开。
+
+        刻意不在调用线程上等 `LOGOUT`：本方法的两条主要调用路径
+        （`sweep()` 的调度器心跳、界面的「删除账号」）都在主线程上，
+        等一次死连接的 `LOGOUT` 就是几十秒的界面冻结。
+        """
         with self._lock:
             session = self._sessions.pop(account_id, None)
             self._borrows.pop(account_id, None)
         if session is None:
             return
-        session.close()
+        self._retire(session)
 
     def interrupt_account(self, account_id: str) -> None:
         """打断该账号正在阻塞的调用（取消/退出用，不影响会话的存续）。"""
@@ -278,11 +360,21 @@ class SessionPool:
             self.close_account(aid)
         return len(stale)
 
-    def close_all(self) -> None:
+    def close_all(self, wait: bool = False, timeout: float = 5.0) -> bool:
+        """摘除全部会话并异步断开。
+
+        `wait=True` 用于进程退出：此时愿意等一等优雅的 `LOGOUT`，
+        但要**有上界**（返回是否等到），否则一条死连接就能把退出拖满超时。
+        维护窗口（改主密码 / 迁移加密）不需要等：会话已经从池里摘掉，
+        旧凭据不可能再被任何借用取到，剩下的只是 socket 何时关闭。
+        """
         with self._lock:
             ids = list(self._sessions)
         for aid in ids:
             self.close_account(aid)
+        if not wait:
+            return True
+        return self._reaper.drain(timeout)
 
     def stats(self) -> dict[str, float | int]:
         with self._lock:
@@ -291,6 +383,8 @@ class SessionPool:
                 "max_sessions": self.max_sessions,
                 "in_use": len(self._borrows),
                 "over_capacity": self._over_capacity,
+                # 已摘除、正在后台断开的会话数（正常应迅速回落到 0）
+                "closing": self._reaper.pending(),
             }
 
     def __len__(self) -> int:
@@ -299,7 +393,6 @@ class SessionPool:
 
 
 __all__ = ["DEFAULT_IDLE_TIMEOUT", "DEFAULT_MAX_SESSIONS", "ImapSession", "SessionPool"]
-
 
 # 供调用方捕获：会话层统一把连接类失败归一成 ImapError
 SESSION_ERRORS = (ImapError, OSError)

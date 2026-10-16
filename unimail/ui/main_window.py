@@ -477,14 +477,31 @@ class MainWindow(QMainWindow):
 
         if dlg.should_verify:
             self.set_status(f"正在验证 {draft.email} 的凭据…")
-            QApplication.processEvents()
-            ok, msg = self.ctx.accounts.verify(draft)
-            if not ok:
-                QMessageBox.warning(self, "连接失败", f"无法使用该凭据登录：\n\n{msg}")
-                self.set_status("凭据验证失败")
-                return
-            self.set_status("凭据验证通过")
 
+            def done(result, error) -> None:
+                if error is not None:
+                    self.set_status("凭据验证失败")
+                    QMessageBox.warning(self, "连接失败",
+                                        f"无法使用该凭据登录：\n\n{_io_error_text(error)}")
+                    return
+                ok, msg = result
+                if not ok:
+                    self.set_status("凭据验证失败")
+                    QMessageBox.warning(self, "连接失败", f"无法使用该凭据登录：\n\n{msg}")
+                    return
+                self.set_status("凭据验证通过")
+                self._finish_add_account(draft)
+
+            # 「试连校验」= TCP + TLS 握手 + LOGIN，是一整串网络往返（最长 30 秒）。
+            # 此前它在 GUI 线程上同步执行，配合 `processEvents()` 只能把一次长阻塞
+            # 切成很多次短阻塞：窗口期间不重绘、点不动，正是「界面无响应」的一种。
+            self._run_io(lambda: self.ctx.accounts.verify(draft), done,
+                         key=f"verify:{draft.platform}:{draft.email}")
+            return
+
+        self._finish_add_account(draft)
+
+    def _finish_add_account(self, draft) -> None:
         try:
             account = self.ctx.accounts.add(draft)
         except (ValueError, SecurityError) as exc:

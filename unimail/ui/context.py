@@ -336,6 +336,9 @@ class AppContext:
             self.body_pool.cancel_running(timeout=4.0)
         # 保活连接里带着**用旧主密码解出来的明文凭据**，必须一并丢弃：
         # 否则改完密码后这些连接仍能以旧凭据继续访问邮箱。
+        # `close_all()` 是**同步摘除 + 异步断开**：一旦摘除，旧凭据就不可能再被
+        # 任何 `borrow()` 取到（安全目标已达成），而带着网络往返的 `LOGOUT`
+        # 交给后台线程，避免在这里再冻住主线程一次。
         self.sessions.close_all()
         return resume
 
@@ -522,7 +525,9 @@ class AppContext:
             stragglers = self.pool.stop_all(timeout_ms=stop_timeout_ms)
         if self.body_pool:
             self.body_pool.shutdown(timeout=stop_timeout_ms / 1000.0)
-        self.sessions.close_all()
+        # 断开连接可能会等 `LOGOUT` 的应答（死连接要等到 socket 超时），
+        # 这里愿意等一小会儿，但**必须有上界** —— 否则一条连接就能把退出拖住。
+        self.sessions.close_all(wait=True, timeout=3.0)
         if self.db:
             self.db.close()
         self.security.lock()

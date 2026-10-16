@@ -18,6 +18,14 @@ from dataclasses import dataclass, field
 from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
 from ..core.models import Account, NormalizedMail
 from . import parser
+from .proxy import (
+    ProxyConfig,
+    ProxyError,
+    describe_active_proxy,
+    open_proxy_tunnel,
+    resolve_proxy,
+    system_proxy,
+)
 
 log = logging.getLogger(__name__)
 
@@ -210,6 +218,57 @@ def _iter_fetch_literals(data) -> Iterator[tuple[str, bytes]]:
         yield match.group(1).decode("ascii"), body
 
 
+# typeshed 没有为 imaplib 声明这两个端口常量（运行期确实存在，分别是 143/993）。
+# 用 getattr 取一次：既不必硬编码数字，也不会让类型检查报 attr-defined。
+_IMAP4_PORT: int = int(getattr(imaplib, "IMAP4_PORT", 143))
+_IMAP4_SSL_PORT: int = int(getattr(imaplib, "IMAP4_SSL_PORT", 993))
+
+
+class _ProxiedIMAP4(imaplib.IMAP4):
+    """把 `imaplib` 的建连钩子换成「经代理隧道」。
+
+    `imaplib` 把「怎么拿到 socket」抽成了 `_create_socket()`，`open()` 在
+    设置好 `self.host` / `self.port` 之后调用它。因此覆写这一个方法就足以
+    让全部 IMAP 流量走代理，不必改协议的任何一个字节。
+
+    `self.proxy` 必须在 `super().__init__()` **之前**赋值：父类构造函数里
+    会立刻调用 `_create_socket()`。
+    """
+
+    def __init__(self, host: str = "", port: int = _IMAP4_PORT,
+                 timeout: float | None = None, *,
+                 proxy: ProxyConfig | None = None) -> None:
+        self.proxy = proxy
+        super().__init__(host, port, timeout)
+
+    def _create_socket(self, timeout=None):
+        if self.proxy is None:
+            # typeshed 未声明 `_create_socket`，运行期它一定在
+            return super()._create_socket(timeout)  # type: ignore[misc]
+        return open_proxy_tunnel(self.proxy, self.host, self.port, timeout)
+
+
+class _ProxiedIMAP4SSL(imaplib.IMAP4_SSL):
+    """同上，但先建隧道再**在隧道上**做 TLS。
+
+    关键点：`server_hostname` 传的是**真实 IMAP 主机**而不是代理地址，
+    因此 SNI 与 `check_hostname=True` 的证书校验完全不受代理影响 ——
+    代理只搬字节，没有机会冒充服务器（除非它主动 MITM，那会被校验拦下）。
+    """
+
+    def __init__(self, host: str = "", port: int = _IMAP4_SSL_PORT,
+                 *, ssl_context=None, timeout: float | None = None,
+                 proxy: ProxyConfig | None = None) -> None:
+        self.proxy = proxy
+        super().__init__(host, port, ssl_context=ssl_context, timeout=timeout)
+
+    def _create_socket(self, timeout=None):
+        if self.proxy is None:
+            return super()._create_socket(timeout)  # type: ignore[misc]
+        sock = open_proxy_tunnel(self.proxy, self.host, self.port, timeout)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
 class ImapAdapter:
     """IMAP 平台适配器。
 
@@ -236,6 +295,18 @@ class ImapAdapter:
         if not host:
             raise ImapError("未配置 IMAP 服务器地址")
 
+        # 代理：**只能来自显式配置**（UNIMAIL_PROXY / ALL_PROXY / HTTPS_PROXY…）。
+        # 这里如果什么都不做，用户「已开启系统代理」对本程序是完全无效的 ——
+        # imaplib 只做直连，既不读注册表里的系统代理，也不读 HTTP_PROXY。
+        # 详见 platforms/proxy.py 顶部。
+        try:
+            proxy = resolve_proxy(host)
+        except ProxyError as exc:
+            raise ImapError(
+                f"{exc}\n"
+                "（代理来自环境变量 UNIMAIL_PROXY；未设置该变量时一律直连）"
+            ) from exc
+
         # 默认强制校验证书；仅由环境变量显式放行时才允许不校验
         allow_invalid = ALLOW_INVALID_TLS_CERT or bool(
             getattr(account, "allow_invalid_cert", False)
@@ -246,10 +317,19 @@ class ImapAdapter:
         imap: imaplib.IMAP4
         try:
             if account.use_ssl:
-                imap = imaplib.IMAP4_SSL(host, port, timeout=FETCH_TIMEOUT,
-                                         ssl_context=ctx)
+                # 直连分支刻意保留标准库类：没有理由偏离它的实现，
+                # 也便于既有测试继续用 monkeypatch 校验 TLS 参数。
+                imap = (
+                    imaplib.IMAP4_SSL(host, port, timeout=FETCH_TIMEOUT,
+                                      ssl_context=ctx) if proxy is None else
+                    _ProxiedIMAP4SSL(host, port, timeout=FETCH_TIMEOUT,
+                                     ssl_context=ctx, proxy=proxy)
+                )
             else:
-                imap = imaplib.IMAP4(host, port, timeout=FETCH_TIMEOUT)
+                imap = (
+                    imaplib.IMAP4(host, port, timeout=FETCH_TIMEOUT) if proxy is None
+                    else _ProxiedIMAP4(host, port, timeout=FETCH_TIMEOUT, proxy=proxy)
+                )
                 if port == 143:
                     try:
                         imap.starttls(ssl_context=ctx)
@@ -263,12 +343,23 @@ class ImapAdapter:
                             "为避免明文传输凭据，已中止连接。若该服务器仅支持明文 IMAP，"
                             "请在账号中改用对应端口并关闭 SSL。"
                         ) from exc
+        except ProxyError as exc:
+            raise ImapError(
+                f"经代理连接 {host}:{port} 失败：{exc}\n"
+                f"{describe_active_proxy(host=host)}"
+            ) from exc
         except ssl.SSLCertVerificationError as exc:
-            raise ImapError(self._cert_error_hint(host, exc)) from exc
+            raise ImapError(self._cert_error_hint(host, exc, proxy)) from exc
         except ssl.SSLError as exc:
-            raise ImapError(f"与 {host}:{port} 的 TLS 握手失败：{exc}") from exc
+            raise ImapError(
+                f"与 {host}:{port} 的 TLS 握手失败：{exc}\n"
+                + self._proxy_context_hint(host, proxy)
+            ) from exc
         except OSError as exc:
-            raise ImapError(f"无法连接 {host}:{port} — {exc}") from exc
+            raise ImapError(
+                f"无法连接 {host}:{port} — {exc}\n"
+                + self._proxy_context_hint(host, proxy)
+            ) from exc
         except imaplib.IMAP4.error as exc:
             raise ImapError(f"IMAP 握手失败：{exc}") from exc
 
@@ -286,15 +377,58 @@ class ImapAdapter:
         return imap
 
     @staticmethod
-    def _cert_error_hint(host: str, exc: Exception) -> str:
+    def _proxy_context_hint(host: str, proxy: ProxyConfig | None) -> str:
+        """握手失败时补一句「这次到底走没走代理」。
+
+        没有这句话，用户会看到「TLS 握手失败」而去怀疑服务器、密码、防火墙，
+        唯独不会想到「我开的那个系统代理，本程序根本没用上」—— 而这恰恰是
+        最常见的原因。
+        """
+        if proxy is not None:
+            return (f"当前经代理 {proxy.display} 连接。\n"
+                    "若代理软件本身工作正常，请检查它的规则是否允许转发 IMAP 端口"
+                    "（993 / 143）；部分客户端默认只代理 80/443。")
+        hint = [
+            "当前为**直连**：本程序不会自动使用系统代理"
+            "（系统代理只作用于 HTTP(S)，而 IMAP 走的是独立端口）。"
+        ]
+        detected = None
+        with contextlib.suppress(Exception):
+            detected = system_proxy()
+        if detected is not None:
+            hint.append(
+                f"\n检测到系统里已启用代理 {detected.display}。"
+                "如果你正需要靠它才能访问外网（或访问 Gmail），"
+                "可以这样让本程序也走它：\n"
+                f"    设置环境变量 UNIMAIL_PROXY={detected.display}\n"
+                "或把代理客户端切到「TUN / 增强 / 全局路由」模式（详见 使用说明.md）。"
+            )
+        else:
+            hint.append(
+                "\n若你确实需要使用代理，请查阅 使用说明.md 的「网络与代理」一节。"
+            )
+        return "\n".join(hint)
+
+    @staticmethod
+    def _cert_error_hint(host: str, exc: Exception,
+                         proxy: ProxyConfig | None = None) -> str:
         detail = getattr(exc, "verify_message", None) or str(exc)
-        return (
-            f"无法验证 {host} 的服务器证书，已中止连接。\n"
-            f"失败原因：{detail}\n"
-            "这通常意味着网络被劫持、存在代理中间设备，或对方使用了自签证书。\n"
+        lines = [
+            f"无法验证 {host} 的服务器证书，已中止连接。",
+            f"失败原因：{detail}",
+            "这通常意味着网络被劫持、存在解密型（MITM）代理，或对方使用了自签证书。",
+        ]
+        if proxy is not None:
+            lines.append(
+                f"当前经代理 {proxy.display} 连接 —— 若该代理开启了「HTTPS 解密」，"
+                "它就会替换服务器证书，从而必然触发本错误。"
+                "请关掉代理的解密功能，或改用不解密的 SOCKS5 隧道。"
+            )
+        lines.append(
             "如确认是企业自建服务器且使用自签证书，可设置环境变量 "
             "UNIMAIL_ALLOW_INVALID_CERT=1 后重启（会失去中间人防护，请谨慎）。"
         )
+        return "\n".join(lines)
 
     def _login_error_hint(self, exc: Exception) -> str:
         return (f"登录被拒绝：{exc}\n提示：{self.config.auth_hint}")

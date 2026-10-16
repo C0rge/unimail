@@ -36,6 +36,9 @@
    33. 【回归】并发与性能（v1.6.1）：会话池不持锁阻塞、worker 回调线程归属、
        补拉池可恢复、连接关闭竞态、删账号取消同步、退避时钟、锁屏限速、
        网络 IO 移出主线程、邮件头批量 FETCH、批量标记 SQL 恒定、mmap
+   34. 【回归】代理通道与拉取上限（v1.6.2）：SOCKS5 / HTTP CONNECT 隧道字节级握手、
+       隧道上的 TLS 仍严格校验主机名、预置的 HTTP_PROXY 不得改道 IMAP、
+       会话断开不在调用线程、单次拉取上限是硬上限且每次运行都生效
 
 运行：python tests/smoke.py
 """
@@ -44,6 +47,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
+import ssl
+import struct
 import sys
 import tempfile
 import threading
@@ -526,7 +532,13 @@ def test_tls_certificate_verification():
     original = imaplib.IMAP4_SSL
     imaplib.IMAP4_SSL = FakeSSL  # type: ignore[assignment]
     try:
-        with contextlib.suppress(Exception):     # 只关心传参，连接必然失败
+        # 显式清掉代理配置：本组验证的是「直连时的 TLS 参数」，
+        # 在 shell 里设了 UNIMAIL_PROXY 的开发者不该因此看到莫名失败。
+        # suppress 必须放在最后（进入顺序即左→右），语义才与嵌套写法一致。
+        with (
+            patch.dict(os.environ, {"UNIMAIL_PROXY": ""}),
+            contextlib.suppress(Exception),     # 只关心传参，连接必然失败
+        ):
             get_adapter("custom").connect(acct, "pw")
     finally:
         imaplib.IMAP4_SSL = original  # type: ignore[assignment]
@@ -546,7 +558,8 @@ def test_tls_certificate_verification():
     imaplib.IMAP4_SSL = CertFailingSSL  # type: ignore[assignment]
     try:
         try:
-            get_adapter("custom").connect(acct, "pw")
+            with patch.dict(os.environ, {"UNIMAIL_PROXY": ""}):
+                get_adapter("custom").connect(acct, "pw")
             check("证书校验失败被拦截", False, "竟然没有抛错")
         except ImapError as exc:
             check("证书校验失败给出可读提示", "证书" in str(exc), f"实际 {exc}")
@@ -3869,6 +3882,607 @@ def test_sqlite_mmap_enabled():
           f"实际 {value}，期望 {DB_MMAP_BYTES}")
     db.close()
 
+# ============================================================ 代理通道
+def _recv_exact(sock, count: int) -> bytes:
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise ConnectionError("对端提前关闭了连接")
+        buf += chunk
+    return buf
+
+
+def _pump_both(a, b) -> None:
+    """双向转发，任一侧关闭即结束（隧道打通后用）。"""
+    def one(src, dst) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                dst.shutdown(socket.SHUT_WR)
+
+    helper = threading.Thread(target=one, args=(a, b), daemon=True)
+    helper.start()
+    one(b, a)
+    helper.join(5)
+    for s in (a, b):
+        with contextlib.suppress(OSError):
+            s.close()
+
+
+class _LoopbackServer(threading.Thread):
+    """回环服务器：逐个接受连接并交给处理函数。
+
+    默认只服务一条连接（够用且最容易看懂）；隧道类用例要反复借同一个后端，
+    把 `max_connections` 调大即可。
+
+    注意停止标志刻意**不叫** `_stop`：`threading.Thread` 内部有一个同名方法
+    （`_stop()`），在实例上挂同名属性会把它覆盖掉，线程收尾时
+    `self._stop()` 变成「Event 不可调用」，整个线程直接崩掉。
+    """
+
+    def __init__(self, handler, max_connections: int = 1) -> None:
+        super().__init__(daemon=True)
+        self._handler = handler
+        self._max_connections = max(1, max_connections)
+        self._halt = threading.Event()
+        self.error = None
+        self.ready = threading.Event()
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self.port = self._listener.getsockname()[1]
+
+    def halt(self) -> None:
+        self._halt.set()
+        with contextlib.suppress(OSError):
+            self._listener.close()
+
+    def run(self) -> None:
+        served = 0
+        while served < self._max_connections and not self._halt.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except OSError:
+                break
+            served += 1
+            try:
+                with conn:
+                    self._handler(conn)
+            except Exception as exc:      # noqa: BLE001 - 记录下来供断言使用
+                self.error = exc
+                self.ready.set()
+        with contextlib.suppress(OSError):
+            self._listener.close()
+
+
+class _Socks5Server(_LoopbackServer):
+    """最小可用的 SOCKS5 服务端（RFC 1928 + RFC 1929），只实现 CONNECT。
+
+    刻意手写而不是 mock 掉 socket：要验证的正是**握手字节序列本身**
+    （版本、方法协商、ATYP=域名、REP 错误码），把这些抹平就等于没测。
+    """
+
+    def __init__(self, bridge, *, require_auth: bool = False, user: str = "",
+                 password: str = "", reject_code: int | None = None) -> None:
+        self.bridge = bridge
+        self.require_auth = require_auth
+        self.user = user
+        self.password = password
+        self.reject_code = reject_code
+        self.seen: dict = {}
+        super().__init__(self._handle)
+
+    def _handle(self, conn) -> None:
+        _ver, count = _recv_exact(conn, 2)
+        self.seen["methods"] = _recv_exact(conn, count)
+        if self.require_auth:
+            conn.sendall(b"\x05\x02")
+            _v, ulen = _recv_exact(conn, 2)
+            got_user = _recv_exact(conn, ulen).decode()
+            plen = _recv_exact(conn, 1)[0]
+            got_pass = _recv_exact(conn, plen).decode()
+            self.seen["auth"] = (got_user, got_pass)
+            conn.sendall(b"\x01\x00")
+        else:
+            conn.sendall(b"\x05\x00")
+
+        ver, cmd, _rsv, atyp = _recv_exact(conn, 4)
+        if atyp == 0x03:
+            host = _recv_exact(conn, _recv_exact(conn, 1)[0]).decode()
+        elif atyp == 0x01:
+            host = socket.inet_ntoa(_recv_exact(conn, 4))
+        else:
+            host = socket.inet_ntop(socket.AF_INET6, _recv_exact(conn, 16))
+        port = struct.unpack("!H", _recv_exact(conn, 2))[0]
+        self.seen["ver"], self.seen["cmd"], self.seen["atyp"] = ver, cmd, atyp
+        self.seen["target"] = (host, port)
+
+        if self.reject_code is not None:
+            # BND.ADDR 在失败应答里没有意义（RFC 1928），这里照真实服务端的
+            # 惯例填 0.0.0.0；不是 bind，故显式豁免 S104。
+            conn.sendall(b"\x05" + bytes([self.reject_code]) + b"\x00\x01"
+                         + socket.inet_aton("0.0.0.0")  # noqa: S104
+                         + struct.pack("!H", 0))
+            self.ready.set()
+            return
+
+        conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("127.0.0.1")
+                     + struct.pack("!H", 0))
+        self.ready.set()
+        upstream = socket.create_connection(self.bridge, 5)
+        _pump_both(conn, upstream)
+
+
+class _HttpConnectServer(_LoopbackServer):
+    """最小可用的 HTTP 代理：只实现 CONNECT。"""
+
+    def __init__(self, bridge, *, status: int = 200) -> None:
+        self.bridge = bridge
+        self.status = status
+        self.seen: dict = {}
+        super().__init__(self._handle)
+
+    def _handle(self, conn) -> None:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        lines = head.split("\r\n")
+        self.seen["request_line"] = lines[0]
+        self.seen["headers"] = {
+            k.strip().lower(): v.strip()
+            for k, _, v in (line.partition(":") for line in lines[1:]) if k
+        }
+        if self.status != 200:
+            body = b"denied"
+            conn.sendall(f"HTTP/1.1 {self.status} Denied\r\n"
+                         f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            self.ready.set()
+            return
+        conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        self.ready.set()
+        upstream = socket.create_connection(self.bridge, 5)
+        _pump_both(conn, upstream)
+
+
+class _EchoServer(_LoopbackServer):
+    """收到什么回什么（前缀 echo:），用于验证隧道真的能双向搬字节。"""
+
+    def __init__(self, max_connections: int = 8) -> None:
+        super().__init__(self._handle, max_connections=max_connections)
+
+    def _handle(self, conn) -> None:
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+            conn.sendall(b"echo:" + data)
+
+
+class _TlsImapStub(_LoopbackServer):
+    """假 IMAP 服务器：TLS 握手成功后发一句问候语。"""
+
+    def __init__(self, cert: Path, key: Path) -> None:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert), str(key))
+        self._ctx = ctx
+        super().__init__(self._handle)
+
+    def _handle(self, conn) -> None:
+        tls = self._ctx.wrap_socket(conn, server_side=True)
+        self.ready.set()
+        with contextlib.suppress(OSError):
+            tls.sendall(b"* OK UniMail test IMAP ready\r\n")
+            time.sleep(0.2)
+        with contextlib.suppress(OSError):
+            tls.close()
+
+
+def _make_self_signed_cert(target_dir: Path, common_name: str) -> tuple[Path, Path]:
+    """生成一张自签证书（SAN = common_name），用于验证主机名校验仍然生效。"""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    now = datetime.now(timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name).issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=30))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(common_name)]),
+                       critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = target_dir / f"{common_name}.crt"
+    key_path = target_dir / f"{common_name}.key"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()))
+    return cert_path, key_path
+
+
+def test_proxy_tunnel_and_tls():
+    """代理通道：SOCKS5 / HTTP CONNECT 隧道，以及隧道上的 TLS 仍严格校验主机名。
+
+    这一组对应「开了系统代理却报 TLS 握手失败」：`imaplib` 只做直连，
+    既不看系统代理也不看 `HTTP_PROXY`，于是代理形同虚设。修复后必须有
+    「显式配置 → 真的走隧道 → 且安全性不降级」三件事同时成立。
+    """
+    import ssl as ssl_mod
+
+    from unimail.platforms import proxy as px
+    from unimail.platforms.base import _ProxiedIMAP4SSL
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("proxy_")
+
+    # ---- 1) 地址解析
+    cfg = px.parse_proxy("socks5://127.0.0.1:7890")
+    check("解析 SOCKS5 地址", cfg.scheme == "socks5" and cfg.port == 7890,
+          f"实际 {cfg}")
+    cfg = px.parse_proxy("socks5h://user:p%40ss@127.0.0.1:1080")
+    check("解析带凭据的地址（百分号解码）",
+          cfg.username == "user" and cfg.password == "p@ss", f"实际 {cfg}")
+    check("展示形式不含密码", "p@ss" not in cfg.display, f"实际 {cfg.display}")
+    check("裸 host:port 按 http 处理",
+          px.parse_proxy("127.0.0.1:8080").scheme == "http")
+    check("端口非法时回落到协议默认端口",
+          px.parse_proxy("http://127.0.0.1:0").port == 8080)
+    try:
+        px.parse_proxy("ftp://127.0.0.1:21")
+        check("无法承载 TCP 隧道的协议被拒绝", False, "竟然接受了 ftp")
+    except px.ProxyError as exc:
+        check("无法承载 TCP 隧道的协议被拒绝", "socks5" in str(exc), f"实际 {exc}")
+
+    # ---- 2) 只认专用变量：预置的 HTTP_PROXY 绝不能悄悄改道 IMAP
+    generic_only = {"HTTP_PROXY": "http://127.0.0.1:9",
+                    "HTTPS_PROXY": "http://127.0.0.1:9"}
+    check("未设置 UNIMAIL_PROXY 时绝不隐式使用 HTTP_PROXY",
+          px.resolve_proxy("imap.gmail.com", generic_only) is None)
+    got = px.resolve_proxy("imap.gmail.com",
+                           {**generic_only, "UNIMAIL_PROXY": "env"})
+    check("UNIMAIL_PROXY=env 时才复用通用变量",
+          got is not None and got.port == 9, f"实际 {got}")
+    explicit = {"UNIMAIL_PROXY": "socks5://127.0.0.1:7890",
+                "NO_PROXY": "imap.gmail.com,imap.qq.com"}
+    check("显式地址模式下不受通用 NO_PROXY 影响",
+          px.resolve_proxy("imap.gmail.com", explicit) is not None)
+    check("UNIMAIL_NO_PROXY 命中则直连",
+          px.resolve_proxy("imap.gmail.com",
+                           {**explicit, "UNIMAIL_NO_PROXY": ".gmail.com"}) is None)
+    check("NO_PROXY 支持精确主机与通配",
+          px.host_in_no_proxy("imap.qq.com", "a.com, imap.qq.com")
+          and px.host_in_no_proxy("x.y.z", "*")
+          and not px.host_in_no_proxy("imap.qq.com", "qq.org"))
+
+    # ---- 3) SOCKS5 隧道：真实握手 + 字节往返
+    echo = _EchoServer()
+    echo.start()
+    socks = _Socks5Server(("127.0.0.1", echo.port))
+    socks.start()
+    tunnel = px.open_proxy_tunnel(
+        px.ProxyConfig("socks5", "127.0.0.1", socks.port),
+        "imap.gmail.com", 993, timeout=5)
+    tunnel.sendall(b"ping")
+    echoed = tunnel.recv(64)
+    tunnel.close()
+    check("SOCKS5 隧道可双向搬字节", echoed == b"echo:ping", f"实际 {echoed!r}")
+    check("代理看到的正是真实 IMAP 目标",
+          socks.seen.get("target") == ("imap.gmail.com", 993),
+          f"实际 {socks.seen.get('target')}")
+    check("使用 CONNECT 命令与域名形式地址（ATYP=3）",
+          socks.seen.get("cmd") == 1 and socks.seen.get("atyp") == 3
+          and socks.seen.get("ver") == 5, f"实际 {socks.seen}")
+
+    # ---- 4) 需要认证的 SOCKS5（RFC 1929）
+    socks_auth = _Socks5Server(("127.0.0.1", echo.port),
+                               require_auth=True, user="alice", password="s3cret")
+    socks_auth.start()
+    tunnel = px.open_proxy_tunnel(
+        px.ProxyConfig("socks5", "127.0.0.1", socks_auth.port, "alice", "s3cret"),
+        "imap.gmail.com", 993, timeout=5)
+    tunnel.close()
+    check("SOCKS5 用户名/密码认证被正确发送",
+          socks_auth.seen.get("auth") == ("alice", "s3cret"),
+          f"实际 {socks_auth.seen.get('auth')}")
+
+    # ---- 5) 代理拒绝时必须是人话，而不是笼统的「握手失败」
+    deny = _Socks5Server(("127.0.0.1", echo.port), reject_code=0x02)
+    deny.start()
+    try:
+        px.open_proxy_tunnel(px.ProxyConfig("socks5", "127.0.0.1", deny.port),
+                             "imap.gmail.com", 993, timeout=5)
+        check("代理拒绝连接时抛 ProxyError", False, "竟然连上了")
+    except px.ProxyError as exc:
+        check("代理拒绝连接时抛 ProxyError", True)
+        check("拒绝原因被翻成人话（含端口与规则提示）",
+              "规则" in str(exc) and "993" in str(exc), f"实际 {exc}")
+
+    # ---- 6) HTTP CONNECT 隧道
+    http_proxy = _HttpConnectServer(("127.0.0.1", echo.port))
+    http_proxy.start()
+    tunnel = px.open_proxy_tunnel(
+        px.ProxyConfig("http", "127.0.0.1", http_proxy.port),
+        "imap.gmail.com", 993, timeout=5)
+    tunnel.sendall(b"hi")
+    echoed = tunnel.recv(64)
+    tunnel.close()
+    check("HTTP CONNECT 隧道可双向搬字节", echoed == b"echo:hi", f"实际 {echoed!r}")
+    check("CONNECT 请求行形如 CONNECT host:port HTTP/1.1",
+          http_proxy.seen.get("request_line", "").startswith(
+              "CONNECT imap.gmail.com:993 "),
+          f"实际 {http_proxy.seen.get('request_line')!r}")
+
+    # ---- 7) 407 要提示补凭据
+    http_deny = _HttpConnectServer(None, status=407)
+    http_deny.start()
+    try:
+        px.open_proxy_tunnel(px.ProxyConfig("http", "127.0.0.1", http_deny.port),
+                             "imap.gmail.com", 993, timeout=5)
+        check("代理要求认证时抛 ProxyError", False, "竟然连上了")
+    except px.ProxyError as exc:
+        check("代理要求认证时抛出可读错误", "认证" in str(exc), f"实际 {exc}")
+
+    # ---- 8) 隧道上的 TLS：主机名校验照旧生效
+    cert, key = _make_self_signed_cert(tmp, "imap.gmail.com")
+    client_ctx = ssl_mod.create_default_context(cafile=str(cert))
+    check("测试用 TLS 上下文仍强制校验证书与主机名",
+          client_ctx.verify_mode == ssl_mod.CERT_REQUIRED
+          and client_ctx.check_hostname is True)
+
+    origin = _TlsImapStub(cert, key)
+    origin.start()
+    front = _Socks5Server(("127.0.0.1", origin.port))
+    front.start()
+
+    proxied = _ProxiedIMAP4SSL.__new__(_ProxiedIMAP4SSL)
+    proxied.proxy = px.ProxyConfig("socks5", "127.0.0.1", front.port)
+    proxied.host, proxied.port, proxied.ssl_context = "imap.gmail.com", 993, client_ctx
+    sock = proxied._create_socket(5)
+    greeting = sock.recv(128)
+    sock.close()
+    check("经代理完成 TLS 握手并读到 IMAP 问候语",
+          greeting.startswith(b"* OK"), f"实际 {greeting!r}")
+
+    # 目标名与证书不匹配 → 必须被拒。这条断言的含义是：代理**不能**替服务器背书，
+    # 走隧道并不等于放宽证书校验。
+    origin2 = _TlsImapStub(cert, key)
+    origin2.start()
+    front2 = _Socks5Server(("127.0.0.1", origin2.port))
+    front2.start()
+    mismatched = _ProxiedIMAP4SSL.__new__(_ProxiedIMAP4SSL)
+    mismatched.proxy = px.ProxyConfig("socks5", "127.0.0.1", front2.port)
+    mismatched.host, mismatched.port = "evil.example.com", 993
+    mismatched.ssl_context = client_ctx
+    try:
+        mismatched._create_socket(5)
+        check("主机名与证书不符时仍被拒绝（走代理不放宽校验）", False, "竟然握手成功")
+    except ssl_mod.SSLCertVerificationError:
+        check("主机名与证书不符时仍被拒绝（走代理不放宽校验）", True)
+    except Exception as exc:      # noqa: BLE001
+        check("主机名与证书不符时仍被拒绝（走代理不放宽校验）",
+              False, f"抛出了 {type(exc).__name__}: {exc}")
+
+    for server in (echo, socks, socks_auth, deny, http_proxy, http_deny,
+                   origin, front, origin2, front2):
+        server.halt()
+
+
+def test_connect_uses_proxy_when_configured():
+    """`connect()` 的接线：配置了代理就必须走隧道类，且错误信息要说清走没走代理。"""
+    from unimail.core.models import Account
+    from unimail.platforms import base as basemod, get_adapter
+    from unimail.platforms.base import ImapError
+    from unimail.platforms.proxy import ProxyConfig
+
+    acct = Account(id="px1", platform="custom", email="a@b.c",
+                   imap_host="imap.example.com", imap_port=993, username="a@b.c")
+
+    captured: list = []
+
+    class _Recorder:
+        def __init__(self, host, port, *, ssl_context=None, timeout=None, proxy=None):
+            captured.append(proxy)
+            raise OSError("stop-here")
+
+    with patch.object(basemod, "_ProxiedIMAP4SSL", _Recorder), \
+            patch.dict(os.environ, {"UNIMAIL_PROXY": "socks5://127.0.0.1:7890"}):
+        try:
+            get_adapter("custom").connect(acct, "pw")
+            check("配置代理后 connect() 不再静默直连", False, "竟然成功了")
+        except ImapError as exc:
+            check("配置代理后 connect() 走隧道连接类",
+                  len(captured) == 1 and captured[0] is not None
+                  and captured[0].scheme == "socks5", f"实际 {captured}")
+            check("失败信息里写明了当前经哪条代理",
+                  "socks5://127.0.0.1:7890" in str(exc), f"实际 {exc}")
+
+    # 直连分支：不设置 UNIMAIL_PROXY 时必须仍然使用标准库类（历史行为不变）
+    used_stdlib: list = []
+
+    class _StdRecorder:
+        def __init__(self, host, port, *, ssl_context=None, timeout=None):
+            used_stdlib.append(host)
+            raise OSError("stop-here")
+
+    with (
+        patch.object(basemod.imaplib, "IMAP4_SSL", _StdRecorder),
+        patch.dict(os.environ, {"UNIMAIL_PROXY": "",
+                                "HTTP_PROXY": "http://127.0.0.1:9"}),
+        contextlib.suppress(Exception),
+    ):
+        get_adapter("custom").connect(acct, "pw")
+    check("未显式配置时仍走标准库直连（即使环境里有 HTTP_PROXY）",
+          used_stdlib == ["imap.example.com"], f"实际 {used_stdlib}")
+
+    # 直连失败时的提示：要点出「系统代理不会被自动使用」并给出可直接照抄的命令
+    class _Failing:
+        def __init__(self, *a, **k):
+            raise OSError("[WinError 10060] 连接尝试失败，因为连接方在一段时间后没有正确答复")
+
+    with patch.object(basemod.imaplib, "IMAP4_SSL", _Failing), \
+            patch.dict(os.environ, {"UNIMAIL_PROXY": ""}), \
+            patch.object(basemod, "system_proxy",
+                         return_value=ProxyConfig("http", "127.0.0.1", 7890)):
+        try:
+            get_adapter("custom").connect(acct, "pw")
+            check("直连失败被翻成 ImapError", False, "竟然成功了")
+        except ImapError as exc:
+            text = str(exc)
+            check("直连失败时说明本程序不会自动使用系统代理",
+                  "直连" in text and "系统代理" in text, f"实际 {text}")
+            check("并给出可直接照抄的 UNIMAIL_PROXY 取值",
+                  "UNIMAIL_PROXY=http://127.0.0.1:7890" in text, f"实际 {text}")
+
+
+def test_session_teardown_off_caller_thread():
+    """会话回收：`close_account()` / `sweep()` 绝不能等 LOGOUT 的应答。
+
+    `Scheduler.tick` 是主线程上的 QTimer 心跳，它调用 `sweep()`；而
+    `disconnect()` 会真的发 CLOSE + LOGOUT 并等应答（死连接要等到 socket
+    超时）。只要这里退化成同步等待，界面就会「每隔几分钟无响应一次」。
+    """
+    from unimail.core.models import Account
+    from unimail.sync import session as sessmod
+
+    seen: dict = {}
+    release = threading.Event()
+
+    class _Imap:
+        pass
+
+    class _SlowAdapter:
+        """把 disconnect 做成「慢到能被观测」：模拟死连接上的 LOGOUT。"""
+
+        def connect(self, account, password):
+            return _Imap()
+
+        def disconnect(self, imap):
+            seen["tid"] = threading.current_thread().ident
+            seen["calls"] = seen.get("calls", 0) + 1
+            release.wait(6.0)
+
+    caller = threading.current_thread().ident
+    acct_a = Account(id="t1", platform="qq", email="t1@qq.com")
+    acct_b = Account(id="t2", platform="qq", email="t2@qq.com")
+
+    with patch.object(sessmod, "get_adapter", return_value=_SlowAdapter()):
+        pool = sessmod.SessionPool(max_sessions=4)
+        with pool.borrow(acct_a, "pw"):
+            pass
+
+        started = time.monotonic()
+        pool.close_account(acct_a.id)
+        elapsed = time.monotonic() - started
+        check("close_account() 不等 LOGOUT（旧实现会等满 socket 超时）",
+              elapsed < 0.5, f"实际 {elapsed:.2f}s")
+        check("会话已同步从池中摘除（记账不等网络）", len(pool) == 0,
+              f"实际 {len(pool)}")
+
+        deadline = time.monotonic() + 3.0
+        while not seen.get("tid") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        check("断开被交给后台线程执行", bool(seen.get("tid")))
+        check("断开不在调用线程上执行",
+              seen.get("tid") not in (None, caller),
+              f"caller={caller} disconnect={seen.get('tid')}")
+
+        # ---- 真实触发路径：调度器心跳在主线程上调用 sweep()
+        with pool.borrow(acct_b, "pw"):
+            pass
+        pool.idle_timeout = 0.0
+        started = time.monotonic()
+        closed = pool.sweep()
+        elapsed = time.monotonic() - started
+        check("sweep() 即刻返回（调度器主线程心跳不会卡在 LOGOUT 上）",
+              elapsed < 0.5 and closed == 1, f"实际 {elapsed:.2f}s / {closed}")
+        check("退出前能看到「正在断开」的实时计数",
+              int(pool.stats()["closing"]) >= 1, f"实际 {pool.stats()}")
+
+        release.set()
+        check("close_all(wait=True) 能在有界时间内等到断开完成",
+              pool.close_all(wait=True, timeout=5.0))
+
+    check("全部摘除后池为空", len(pool) == 0)
+
+
+def test_fetch_budget_semantics():
+    """邮件拉取上限：默认落在 300–500，是**硬**上限，且每一次运行都生效。
+
+    旧实现 `budget = MAX_FETCH_PER_RUN if first_sync else 0` 有两个缺口：
+    上限只在第一轮生效（第二轮起形同虚设），而且按整页收尾会超发
+    （上限 500、页宽 200 时实际入库 600）。
+    """
+    import subprocess
+
+    from unimail.config import MAX_FETCH_PER_RUN
+    from unimail.core.models import MailFilter
+
+    check("默认单次拉取上限落在 300–500 之间",
+          300 <= MAX_FETCH_PER_RUN <= 500, f"实际 {MAX_FETCH_PER_RUN}")
+
+    root = Path(__file__).resolve().parents[1]
+
+    def read_budget(value: str) -> tuple[str, str]:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import unimail.config as c; print(c.MAX_FETCH_PER_RUN)"],
+            cwd=str(root), env={**os.environ, "UNIMAIL_MAX_FETCH_PER_RUN": value},
+            capture_output=True, text=True, timeout=120)
+        return result.stdout.strip(), result.stderr.strip()
+
+    value, _ = read_budget("300")
+    check("环境变量可把上限调到 300（低边界）", value == "300", f"实际 {value}")
+    value, _ = read_budget("500")
+    check("环境变量可把上限调到 500（高边界）", value == "500", f"实际 {value}")
+    value, err = read_budget("5O0")      # 字母 O：最典型的手滑
+    check("非法值回落到默认上限，而不是被当成 0=不限",
+          value == str(MAX_FETCH_PER_RUN) and "不是整数" in err,
+          f"实际 {value} / {err!r}")
+
+    # ---- 语义：硬上限 + 每次运行都生效
+    _cfg, ctx, account = _make_sync_ctx("budget_")
+    mails = ctx.mails.mails
+
+    adapter = _FakeAdapter(range(1, 2001), validity=7)
+    _run_sync(ctx, account, adapter)
+    stored = mails.query(MailFilter(account_id=account.id, limit=10000))
+    check("首同步恰好只入库上限封数（不因整页收尾而超发）",
+          len(stored) == MAX_FETCH_PER_RUN, f"实际 {len(stored)}")
+    last_uid, _validity = ctx.accounts.cursors.get(account.id, "INBOX")
+    check("游标停在已抓取的最后一封，剩余留待下次",
+          last_uid == MAX_FETCH_PER_RUN, f"实际 {last_uid}")
+
+    adapter2 = _FakeAdapter(range(1, 2001), validity=7)
+    _run_sync(ctx, account, adapter2)
+    stored2 = mails.query(MailFilter(account_id=account.id, limit=10000))
+    check("第二轮仍然受上限约束（旧实现会把剩余 1500 封一次灌完）",
+          len(stored2) == MAX_FETCH_PER_RUN * 2, f"实际 {len(stored2)}")
+    last_uid2, _v = ctx.accounts.cursors.get(account.id, "INBOX")
+    check("第二轮游标继续推进（分次但最终追平）",
+          last_uid2 == MAX_FETCH_PER_RUN * 2, f"实际 {last_uid2}")
+    ctx.db.close()
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -3923,6 +4537,10 @@ SUITES = [
     ("P2 批量 UID FETCH 邮件头", test_fetch_headers_many_protocol),
     ("P3 批量标记 SQL 条数恒定", test_bulk_flags_sql_is_constant),
     ("P6 SQLite mmap_size 生效", test_sqlite_mmap_enabled),
+    ("P7 代理通道与 IMAP 隧道", test_proxy_tunnel_and_tls),
+    ("P8 connect() 走代理的接线与失败提示", test_connect_uses_proxy_when_configured),
+    ("P9 会话断开不在调用线程", test_session_teardown_off_caller_thread),
+    ("P10 拉取上限语义与覆盖方式", test_fetch_budget_semantics),
 ]
 
 

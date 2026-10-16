@@ -158,9 +158,17 @@ class SyncWorker(QThread):
         first_sync = last_uid <= 0
         page_size = max(int(INITIAL_FETCH_LIMIT), 1) if first_sync \
             else max(int(SYNC_PAGE_SIZE), 1)
-        budget = MAX_FETCH_PER_RUN if first_sync else 0     # 0 = 不限
+        # 单次运行的入库预算，**每一次**运行都适用。
+        #
+        # 此前是 `MAX_FETCH_PER_RUN if first_sync else 0`：上限只在第一轮生效。
+        # 后果是第二轮（游标已非 0、`first_sync` 变假）会以「不限」的姿态把
+        # 剩下的几万封一口气灌完 —— 用户设的那个上限从第二次同步起就形同虚设，
+        # 而「灌完」恰恰是他想避免的那件事。现在预算对所有运行一视同仁；
+        # 稳态增量同步每次只有几十封，这个上限根本不会碰到。
+        budget = max(int(MAX_FETCH_PER_RUN), 0)     # 0 = 不限
         fetched_this_run = 0
         inserted_total = 0
+        hit_budget = False
 
         # 每页一次性取回已入库 UID 集合，用于内存去重（避免逐封 exists()）
         known_uids = self.mails.existing_uids(
@@ -170,7 +178,14 @@ class SyncWorker(QThread):
         # 分页循环：始终取「最旧的一批」并推进游标，直到追平服务端。
         # 这样既不会丢中间的邮件，也不会因单页上限而永远追不上。
         while not self._cancelled:
-            uids = adapter.search_new_uids(imap, cursor_uid, limit=page_size)
+            # 最后一页按剩余额度收窄。不夹的话「上限 500、页宽 200」实际会入库
+            # 600 封 —— 上限就只是「大致上限」，而用户是把它当硬约束用的。
+            remaining = None if budget == 0 else budget - fetched_this_run
+            if remaining is not None and remaining <= 0:
+                hit_budget = True
+                break
+            limit = page_size if remaining is None else min(page_size, remaining)
+            uids = adapter.search_new_uids(imap, cursor_uid, limit=limit)
             if not uids:
                 break
             # 兜底：账号可能在同步途中被删掉（UI 的「删除账号」会先取消并等待，
@@ -252,12 +267,12 @@ class SyncWorker(QThread):
                 self.cursors.upsert(account.id, FOLDER, cursor_uid, server_validity)
                 last_uid = cursor_uid
 
-            if not page_continuous or len(uids) < page_size:
+            if not page_continuous or len(uids) < limit:
                 break
-            if budget and fetched_this_run >= budget:
-                log.info("账号 %s 首次同步达到单次上限 %d 封，其余邮件将在下次同步继续",
-                         account.email, budget)
-                break
+
+        if hit_budget:
+            log.info("账号 %s 本次同步已达到单次上限 %d 封，剩余邮件将在下次同步继续",
+                     account.email, budget)
 
         # 第二阶段：为最新若干封补齐正文（整批一次 executemany）
         # 注意 `limit <= 0` 必须显式判成「不补正文」：`new_pairs[-0:]` 等于

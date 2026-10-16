@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
@@ -68,9 +68,68 @@ ALLOW_INVALID_TLS_CERT = (
 DEFAULT_SYNC_INTERVAL = 300       # 秒，默认 5 分钟
 SYNC_PAGE_SIZE = 200              # 增量同步每页拉取的邮件数
 INITIAL_FETCH_LIMIT = 100         # 首次同步（游标为空）每页拉取的邮件数
-MAX_FETCH_PER_RUN = 5000          # 首次同步单次运行入库上限，0 = 不限
+
+
+def _int_env(name: str, default: int) -> int:
+    """从环境变量读一个整数；缺失或非法时回落到默认值。
+
+    非法值**必须**回落到默认而不是当成 0：`0` 在本项目里表示「不限」，
+    把打错的 `UNIMAIL_MAX_FETCH_PER_RUN=5O0`（字母 O）解释成「不限」，
+    正好把用户想要的那个上限变成没有上限。
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[warn] 环境变量 {name}={raw!r} 不是整数，已按默认值 {default} 处理",
+              file=sys.stderr)
+        return default
+    if value < 0:
+        print(f"[warn] 环境变量 {name}={value} 为负，已按默认值 {default} 处理",
+              file=sys.stderr)
+        return default
+    return value
+
+
+# 一次同步**最多入库多少封**（0 = 不限）。
+#
+# 为什么是 500 而不是 5000：这个数不是「能拉多少」的能力上限，而是
+# 「一次同步愿意占用多久」的时间预算。它约束的是首次同步（或长时间离线后
+# 的追平）这类突发场景 —— 在这些场景下，一次运行就把几万封灌进去会：
+#   1. 长时间占着一条 IMAP 连接（服务器侧可能判定为异常并限速）；
+#   2. 在 GUI 线程上连续触发多批增量插入与计数刷新，界面一阵阵地顿；
+#   3. 让「失败重来」的代价变得极高（重跑一次要等几分钟）。
+# 500 封配合 `SYNC_PAGE_SIZE` / `INITIAL_FETCH_LIMIT` 大约是 3–5 个往返批次，
+# 单次耗时可控，且**剩余邮件会在下一次同步继续**（游标已按连续区间推进）。
+#
+# 调整方式（三选一，后者覆盖前者）：
+#   · 改这里的默认值；
+#   · 设环境变量 UNIMAIL_MAX_FETCH_PER_RUN=300（或 500）；
+#   · 设 0 表示「不限」——只有在明确知道自己在做什么时才这么做。
+MAX_FETCH_PER_RUN = _int_env("UNIMAIL_MAX_FETCH_PER_RUN", 500)
+
 SCHEDULER_TICK = 30               # 调度器心跳（秒）
 FETCH_TIMEOUT = 30                # IMAP 超时
+
+# ---------------------------------------------------------------- 网络与代理
+# 代理由环境变量 `UNIMAIL_PROXY` 配置，取值形如：
+#     socks5://127.0.0.1:7890
+#     http://user:pass@127.0.0.1:8080
+#     auto                                  ← 读操作系统的「系统代理」设置
+#     env                                   ← 读 ALL_PROXY / HTTPS_PROXY / HTTP_PROXY
+# 留空 = 直连（默认）。
+#
+# 为什么必须显式配置、而不是「有系统代理就自动用」：imaplib 只做直连，
+# 而系统代理通常意味着一个只转发 HTTP(S) 的代理；把它自动套到 IMAP 的
+# 993 端口上，会让本来能直连的用户变成连不上。同理，`HTTP_PROXY` 这类被
+# 工具链预置的变量也不被隐式参考 —— 要用就显式写 `env`。
+#
+# **这里刻意不定义 `PROXY` 常量**：代理在**连接时**由
+# `platforms/proxy.py::resolve_proxy()` 直接读环境变量解析，不在模块导入时
+# 快照。快照会带来两个真问题——测试里 patch 环境变量将不再生效，且
+# `auto` 无法反映运行中途改过的系统设置。语义与全部取值见 proxy.py。
 
 # ---------------------------------------------------------------- 附件
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024    # 单个附件下载上限，0 = 不限
