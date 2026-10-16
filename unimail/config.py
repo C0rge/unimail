@@ -86,6 +86,9 @@ DANGEROUS_EXTENSIONS = frozenset({
 # ---------------------------------------------------------------- 数据库
 DB_BUSY_TIMEOUT_MS = 5000         # 并发写等待锁超时
 DB_CACHE_KIB = 8000               # 每连接页缓存（负值语义：KiB）
+# 内存映射 I/O 窗口（字节）。列表滚动、会话展开全是随机读，走 mmap 可以省掉
+# 一次内核到用户态的 copy。取值不宜超过可用地址空间；256 MB 对桌面端是安全的。
+DB_MMAP_BYTES = 256 * 1024 * 1024
 
 
 def sqlcipher_pip_hint() -> str:

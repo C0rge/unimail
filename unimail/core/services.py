@@ -8,6 +8,7 @@ import email.message
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -275,6 +276,15 @@ class MailService:
         self._counts_cache: tuple[dict[str, tuple[int, int]],
                                   tuple[int, int]] | None = None
         self._counts_expires = 0.0
+        # 计数缓存会被两条线程读写：`SyncWorker` 在后台线程发出 `sync_finished`
+        # → 回调里 `invalidate_counts()` 在**worker 线程**执行（它不是 QObject
+        # 的绑定方法，Qt 无从排队）；而主线程在 `_counts_snapshot()` 里读同一对
+        # 字段。没有这把锁时会读到过期值（角标数字不更新），或 `_counts_expires`
+        # 被写过导致缓存长期不失效。
+        #
+        # 这里用锁而不是 `@Slot`：`MailService` 属于 core 层，刻意**不**依赖 Qt
+        # （本文件至今没有任何 PySide6 导入），不该为了线程归属把它变成 QObject。
+        self._counts_lock = threading.Lock()
         # 同步线程直接写库（不走本服务），因此计数缓存必须在这里失效；
         # 漏掉任何一条写入路径都会让角标显示旧数字。
         bus.sync_finished.connect(lambda *_: self.invalidate_counts())
@@ -305,21 +315,30 @@ class MailService:
         return self.mails.mails_in_thread(thread_key, limit)
 
     def invalidate_counts(self) -> None:
-        self._counts_cache = None
-        self._counts_expires = 0.0
+        """作废计数缓存。可能从后台同步线程调用，因此必须持锁。"""
+        with self._counts_lock:
+            self._counts_cache = None
+            self._counts_expires = 0.0
 
     def _counts_snapshot(self) -> tuple[dict[str, tuple[int, int]], tuple[int, int]]:
         """带缓存的计数快照：一次聚合同时给出按账号与总计。
 
         `refresh_accounts()` 在每次列表刷新、每封邮件标已读时都会被调用，
         原先它要跑两次全表聚合（实测 2 万封 13.9–44 ms），随库线性增长。
+
+        聚合本身放在锁外：它是纯读、可能耗时数十毫秒，不该阻塞
+        `invalidate_counts()`（那条路径是后台同步线程在走，被拖住会推迟同步收尾）。
+        代价是极端并发下两个线程可能各算一次，只是多一次查询、不影响正确性。
         """
         now = time.monotonic()
-        if self._counts_cache is not None and now < self._counts_expires:
-            return self._counts_cache
+        with self._counts_lock:
+            cached = self._counts_cache
+            if cached is not None and now < self._counts_expires:
+                return cached
         snapshot = self.mails.counts_snapshot()
-        self._counts_cache = snapshot
-        self._counts_expires = now + COUNT_CACHE_TTL_SECONDS
+        with self._counts_lock:
+            self._counts_cache = snapshot
+            self._counts_expires = time.monotonic() + COUNT_CACHE_TTL_SECONDS
         return snapshot
 
     def counts(self) -> dict[str, tuple[int, int]]:
@@ -348,8 +367,9 @@ class MailService:
     def mark_all_read(self, account_id: str | None = None) -> None:
         affected = self.mails.ids_unread(account_id)
         self.mails.mark_all_read(account_id)
-        for mail_id in affected:
-            self._queue_server_flag(mail_id, read=True)
+        # 走批量入队：逐封 `_queue_server_flag()` 时每封要一次 `mail_context`
+        # 查询加一次队列写入，5000 封 ≈ 1.5 万条串行 SQL，全压在 GUI 线程上。
+        self._queue_server_flags_many(affected, read=True)
         self.invalidate_counts()
         self.bus.accounts_changed.emit()
 
@@ -382,6 +402,42 @@ class MailService:
         if self.pending_flags is None:
             return 0
         return self.pending_flags.count(account_id)
+
+    def _queue_server_flags_many(self, mail_ids: list[str],
+                                 read: bool | None = None,
+                                 starred: bool | None = None) -> int:
+        """批量把本地状态变化排进「待回写服务器」队列；返回入队组数。
+
+        与逐封 `_queue_server_flag()` 的语义完全一致（同一个开关、同样的失败
+        容忍），区别只是「一次批量查询 + 单事务写入」而不是 N 次。删除、批量
+        标已读这类动辄上千封的操作必须走这里，否则 GUI 线程会被串行 SQL 拖住。
+        """
+        if not (self.sync_server_flags and self.pending_flags is not None):
+            return 0
+        if not mail_ids:
+            return 0
+        add: list[str] = []
+        remove: list[str] = []
+        if read is not None:
+            (add if read else remove).append("\\Seen")
+        if starred is not None:
+            (add if starred else remove).append("\\Flagged")
+        if not add and not remove:
+            return 0
+        try:
+            contexts = self.mails.contexts_by_ids(mail_ids)
+            if not contexts:
+                return 0
+            items = [
+                (ctx["account_id"], ctx.get("folder") or "INBOX", str(ctx["uid"]),
+                 add, remove)
+                for ctx in contexts
+            ]
+            return self.pending_flags.add_many(items)
+        except Exception:
+            # 入队失败不影响本地状态（它已经生效了），留待下次同步重试
+            log.warning("批量排入待回写标记失败（本地状态已生效）", exc_info=True)
+            return 0
 
     def delete(self, mail_id: str, *, on_server: bool = False) -> str:
         """删除一封邮件。返回对服务器实际操作到的文件夹名（未走服务器时为空串）。
@@ -663,16 +719,14 @@ class MailService:
     # ------------------------------------------------------------ 批量操作
     def mark_read_many(self, mail_ids: list[str], is_read: bool = True) -> int:
         n = self.mails.set_read_many(mail_ids, is_read)
-        for mail_id in mail_ids:
-            self._queue_server_flag(mail_id, read=is_read)
+        self._queue_server_flags_many(mail_ids, read=is_read)
         self.invalidate_counts()
         self.bus.accounts_changed.emit()
         return n
 
     def star_many(self, mail_ids: list[str], starred: bool = True) -> int:
         n = self.mails.set_starred_many(mail_ids, starred)
-        for mail_id in mail_ids:
-            self._queue_server_flag(mail_id, starred=starred)
+        self._queue_server_flags_many(mail_ids, starred=starred)
         self.bus.accounts_changed.emit()
         return n
 
@@ -680,7 +734,9 @@ class MailService:
         """批量删除本地副本；`on_server=True` 时同时移入服务器垃圾箱。
 
         走服务器时**逐封**处理、单封失败不中断整批：某一封的权限或状态问题
-        不该让剩下的都删不掉。每封都遵循「先服务器、后本地」的顺序。
+        不该让剩下的都删不掉。每封都遵循「先服务器、后本地」的顺序，
+        但**本地清理合并成一次批量操作**（逐封删本地会退化成 N 次查询 + N 次
+        「计数缓存作废 + 发信号」，在选中几百封时同样是 GUI 线程上的可观开销）。
         """
         result = DeleteBatchResult()
         if not on_server:
@@ -700,12 +756,16 @@ class MailService:
             except Exception as exc:      # noqa: BLE001 —— 单封失败不该拖垮整批
                 result.failed.append((mail_id, str(exc)))
                 continue
-            self._drop_local_mail(mail_id)
             removed_ids.append(mail_id)
-            result.removed += 1
-            result.moved_to_trash += 1
         if removed_ids:
+            # 服务器侧已确认移入垃圾箱，这里才一次性清本地
+            stale = self.mails.delete_many(removed_ids)
+            for path in stale:
+                unlink_attachment_file(path)
+            self.invalidate_counts()
             self.bus.mails_removed.emit(removed_ids)
+        result.removed = len(removed_ids)
+        result.moved_to_trash = len(removed_ids)
         result.removed_ids = removed_ids
         return result
 

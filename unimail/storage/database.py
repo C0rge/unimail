@@ -27,6 +27,7 @@ from typing import Any
 from ..config import (
     DB_BUSY_TIMEOUT_MS,
     DB_CACHE_KIB,
+    DB_MMAP_BYTES,
     DB_VERSION,
     sqlcipher_pip_hint,
 )
@@ -322,34 +323,49 @@ class Database:
         # （CI 的 ubuntu runner、本机 .venv）能看到两者是不同类，会报 assignment 冲突，
         # 故此处显式标注 Any。
         conn: Any
-        if self._encrypted:
-            conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
-            conn.execute(f"PRAGMA key = \"x'{self._key_hex}'\"")
-            conn.execute("PRAGMA cipher_memory_security = ON")
-            # 必须用 SQLCipher 自己的 Row：sqlite3.Row 会拒绝 sqlcipher3 的 Cursor，
-            # 抛 "Row() argument 1 must be sqlite3.Cursor"。
-            row_factory = getattr(sqlcipher_db, "Row", sqlite3.Row)
-        else:
-            conn = sqlite3.connect(str(self.path), check_same_thread=False)
-            row_factory = sqlite3.Row
-        conn.row_factory = row_factory
-        # FTS 触发器要调用 `seg()`，而 `create_function` 是**连接级**注册，
-        # 所以每条连接建好后立刻注册。注册失败不阻断建连：全文索引会退回不可用，
-        # 检索走 LIKE，应用其余功能不受影响。
-        with contextlib.suppress(Exception):
-            conn.create_function("seg", 1, segment, deterministic=True)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_MS)}")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA temp_store = MEMORY")
-        conn.execute(f"PRAGMA cache_size = {-abs(int(DB_CACHE_KIB))}")
+        # 「检查 _closed → 建连 → 登记」必须在同一把锁内完成。否则会与 close()
+        # 竞态：close() 先把 _conns 换成空列表，本函数随后 append 进**新**列表，
+        # 这条连接就永远不会被关闭（句柄泄漏），且在已关闭的库上继续用。
+        # 与 close() 的加锁顺序一致（close 持 _write_lock 再取 _conns_lock），
+        # 不存在反向获取。
         with self._conns_lock:
+            if self._closed:
+                raise DatabaseError("数据库连接已关闭")
+            if self._encrypted:
+                conn = sqlcipher_db.connect(str(self.path), check_same_thread=False)
+                conn.execute(f"PRAGMA key = \"x'{self._key_hex}'\"")
+                conn.execute("PRAGMA cipher_memory_security = ON")
+                # 必须用 SQLCipher 自己的 Row：sqlite3.Row 会拒绝 sqlcipher3 的 Cursor，
+                # 抛 "Row() argument 1 must be sqlite3.Cursor"。
+                row_factory = getattr(sqlcipher_db, "Row", sqlite3.Row)
+            else:
+                conn = sqlite3.connect(str(self.path), check_same_thread=False)
+                row_factory = sqlite3.Row
+            conn.row_factory = row_factory
+            # FTS 触发器要调用 `seg()`，而 `create_function` 是**连接级**注册，
+            # 所以每条连接建好后立刻注册。注册失败不阻断建连：全文索引会退回不可用，
+            # 检索走 LIKE，应用其余功能不受影响。
+            with contextlib.suppress(Exception):
+                conn.create_function("seg", 1, segment, deterministic=True)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT_MS)}")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute(f"PRAGMA cache_size = {-abs(int(DB_CACHE_KIB))}")
+            # mmap：万级邮件库的随机读（列表滚动、会话展开）能少走一次 copy，
+            # 其余 PRAGMA 都已就位，唯独漏了这一条。
+            conn.execute(f"PRAGMA mmap_size = {int(DB_MMAP_BYTES)}")
             self._conns.append(conn)
         return conn
 
     def _conn(self):
+        # 快速失败路径：关闭后再用必须给一个可读的错误，而不是
+        # `ProgrammingError: Cannot operate on a closed database`（会被上层
+        # 的宽泛 except 吞掉，表现为静默丢数据）。顺带清掉本线程的陈旧引用，
+        # 否则下次会拿到已经 close 过的连接。
         if self._closed:
+            self._local.conn = None
             raise DatabaseError("数据库连接已关闭")
         conn = getattr(self._local, "conn", None)
         if conn is None:
@@ -524,19 +540,27 @@ class Database:
 
         历史实现只关掉当前线程的连接，后台同步线程的连接会一直挂着，
         长会话下句柄与内存持续累积。
+
+        全程持有 `_write_lock`：否则 `stop_all()` 报告的那些「超时未退出」
+        的同步线程仍可能在写库，与这里的关闭交错 —— 轻则抛
+        `Cannot operate on a closed database`（被宽泛 except 吞掉、静默丢数据），
+        重则让 `_new_connection()` 把连接登记进已被清空的列表而永不回收。
         """
-        with self._conns_lock:
-            conns = self._conns
-            self._conns = []
-        for conn in conns:
-            # 关闭路径尽力而为：连接可能已因底层错误失效，
-            # 任何一步失败都不应阻止其余连接被回收。
-            with contextlib.suppress(Exception):
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            with contextlib.suppress(Exception):
-                conn.close()
-        self._local.conn = None
-        self._closed = True
+        with self._write_lock:
+            with self._conns_lock:
+                # 先置 _closed 再换列表：这样 _new_connection() 拿不到锁时
+                # 也会在拿到锁后立刻看到 _closed 并拒绝建连
+                self._closed = True
+                conns = self._conns
+                self._conns = []
+            for conn in conns:
+                # 关闭路径尽力而为：连接可能已因底层错误失效，
+                # 任何一步失败都不应阻止其余连接被回收。
+                with contextlib.suppress(Exception):
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                with contextlib.suppress(Exception):
+                    conn.close()
+            self._local.conn = None
 
     def open_count(self) -> int:
         """当前登记的连接数（用于诊断与测试）。"""

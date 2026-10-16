@@ -108,7 +108,19 @@ class AppContext:
         self.device_binding = DeviceBinding()
         self.is_first_run = not DB_PATH.exists()
         self.kdf_upgrade_pending = False      # 现有库的 KDF 参数是否弱于当前默认
+        self._quiesced = False                # 「改密码 / 迁移加密」期间暂停后台 IO
         self._closed = False                  # 让 shutdown() 可重复调用
+
+    @property
+    def quiesced(self) -> bool:
+        """是否正处于「排空后台写入」的维护窗口。
+
+        改主密码 / 迁移数据库加密时，旧密钥建立的连接与半截事务都不能再产生。
+        这个标志让 UI 层的新后台 IO（附件下载、导出、服务端删除）在此窗口内
+        被直接拒绝——否则一个恰好在此时提交的 IMAP 往返可能在 rekey 之后才
+        落盘，写出用旧密钥加密的行。
+        """
+        return self._quiesced
 
     # ------------------------------------------------------------ 元数据
     @property
@@ -310,18 +322,29 @@ class AppContext:
         返回「调度器原本是否在运行」，供 `_resume()` 恢复。
         """
         resume = bool(self.scheduler and self.scheduler.enabled)
+        # 先关门再排空：反过来的话，排空过程中新提交的任务会被栅栏「漏过去」，
+        # 落在 rekey 之后才写库。
+        self._quiesced = True
         if self.scheduler:
             self.scheduler.stop()
         if self.pool:
             self.pool.stop_all(timeout_ms=4000)
         if self.body_pool:
-            self.body_pool.stop_all(timeout=4.0)
+            # 用 cancel_running 而不是 stop_all：后者会 shutdown 线程池并永久
+            # 置 _closed=True，而这条路径结束后应用还要继续运行 —— 那会让之后
+            # 点开任何「无正文」邮件静默失效。
+            self.body_pool.cancel_running(timeout=4.0)
         # 保活连接里带着**用旧主密码解出来的明文凭据**，必须一并丢弃：
         # 否则改完密码后这些连接仍能以旧凭据继续访问邮箱。
         self.sessions.close_all()
         return resume
 
     def _resume(self, resume: bool) -> None:
+        # 兜底：正常路径下 cancel_running 不会关闭线程池，restart() 是空操作；
+        # 但若某条路径确实把它关掉了，这里必须能恢复，否则正文补拉会静默失效。
+        if self.body_pool:
+            self.body_pool.restart()
+        self._quiesced = False
         if resume and self.scheduler:
             self.scheduler.start()
 
@@ -450,6 +473,9 @@ class AppContext:
     # ------------------------------------------------------------ 装配
     def _wire(self) -> None:
         assert self.db is not None
+        # 重新装配即意味着「维护窗口结束」：解锁 / 新建库都会走到这里，
+        # 哪怕上一次改密码中途失败把 _quiesced 留在了 True。
+        self._quiesced = False
         account_repo = AccountRepository(self.db)
         mail_repo = MailRepository(self.db)
         attach_repo = AttachmentRepository(self.db)
@@ -495,7 +521,7 @@ class AppContext:
         if self.pool:
             stragglers = self.pool.stop_all(timeout_ms=stop_timeout_ms)
         if self.body_pool:
-            self.body_pool.stop_all(timeout=stop_timeout_ms / 1000.0)
+            self.body_pool.shutdown(timeout=stop_timeout_ms / 1000.0)
         self.sessions.close_all()
         if self.db:
             self.db.close()

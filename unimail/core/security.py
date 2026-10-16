@@ -182,6 +182,15 @@ class UnlockGuard:
     失败 1 次等 1 s、2 次等 2 s、3 次等 4 s…上限 30 s。
     状态写入独立的小文件（只有计数与时间戳，无密钥），
     因此**重开程序不会把计数清零**——否则 3 次上限形同虚设。
+
+    时间戳一律用 `time.time()`（墙钟），**不能**用 `time.monotonic()`（v1.6.1 修正）
+    --------------------------------------------------------------------------
+    这个值要落盘、并交给**下一个进程**去比较。而 `monotonic()` 的原点在
+    Windows / macOS / Linux 上都是「开机时刻」，重启即归零。用单调钟落盘会把
+    「失败一次 → 重启电脑 → 再打开应用」变成：`remaining_wait()` 返回上一次
+    记录的那个绝对 tick 值（可能就是上万秒），`main.run_login` 里的
+    `_wait_with_ui` 于是把用户按在一个**数小时倒计时、且无法关闭**的信息框里。
+    设计意图（跨重启不清零）与单调钟的语义互相冲突，改用墙钟即可两全。
     """
 
     def __init__(self, path: Path | None = None) -> None:
@@ -194,10 +203,26 @@ class UnlockGuard:
         try:
             data = json.loads(self.path.read_text("utf-8"))
             self._failures = int(data.get("failures") or 0)
-            self._next_allowed = float(data.get("next_allowed") or 0.0)
+            self._next_allowed = self._clamp(float(data.get("next_allowed") or 0.0))
         except (OSError, ValueError, TypeError):
             self._failures = 0
             self._next_allowed = 0.0
+
+    @staticmethod
+    def _clamp(next_allowed: float) -> float:
+        """把明显异常的等待时间夹到「最多再等 UNLOCK_BACKOFF_MAX 秒」。
+
+        兜的是历史遗留与被改坏的文件：单调钟时代写下的值（相对开机时刻）与
+        墙钟不可比，可能远超当前时刻，直接用会把人锁死几小时。
+        """
+        now = time.time()
+        if next_allowed > now + UNLOCK_BACKOFF_MAX:
+            log.warning(
+                "解锁退避文件中的等待时间异常（约 %.0f 秒），已按上限 %.0f 秒处理",
+                next_allowed - now, UNLOCK_BACKOFF_MAX,
+            )
+            return now + UNLOCK_BACKOFF_MAX
+        return next_allowed
 
     def _save(self) -> None:
         payload = json.dumps({
@@ -216,7 +241,7 @@ class UnlockGuard:
         return self._failures
 
     def remaining_wait(self) -> float:
-        return max(0.0, self._next_allowed - time.monotonic())
+        return max(0.0, self._next_allowed - time.time())
 
     def check(self) -> None:
         wait = self.remaining_wait()
@@ -227,7 +252,7 @@ class UnlockGuard:
         self._failures += 1
         delay = min(UNLOCK_BACKOFF_BASE * (2 ** (self._failures - 1)),
                     UNLOCK_BACKOFF_MAX)
-        self._next_allowed = time.monotonic() + delay
+        self._next_allowed = time.time() + delay
         self._save()
         return delay
 

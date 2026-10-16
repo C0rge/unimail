@@ -12,6 +12,7 @@ import imaplib
 import logging
 import re
 import ssl
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
@@ -35,6 +36,10 @@ _LIST_LINE_RE = re.compile(
 # 列表通配符（% *）、引号类（" \）、响应特殊字符（]）。
 # 含这些字符的邮箱名必须写成带引号的字符串形式。
 _ATOM_UNSAFE = set('(){"\\]%*') | {chr(c) for c in range(0x21)} | {chr(0x7F)}
+
+# `UID FETCH` 响应前缀里的 UID，形如 `1 (UID 123 BODY[HEADER] {456}`。
+# 只在**前缀**里找，不碰字面量正文——正文里出现 "UID 999" 是邮件内容，不是应答。
+_FETCH_UID_RE = re.compile(rb"UID\s+(\d+)", re.IGNORECASE)
 
 
 def tls_context(allow_invalid: bool = False) -> ssl.SSLContext:
@@ -181,6 +186,30 @@ def parse_list_line(text: str) -> tuple[frozenset[str], str] | None:
     return flags, name
 
 
+def _iter_fetch_literals(data) -> Iterator[tuple[str, bytes]]:
+    r"""从 `UID FETCH` 的响应里逐个取出 `(uid, 字面量字节)`。
+
+    imaplib 的返回形状随服务器而异：带字面量时每项是 `(前缀, 内容)` 二元组
+    （前缀形如 `b'1 (UID 123 BODY[HEADER] {456}'`）；没有字面量时只给一段
+    bytes——那种情况下拿不到正文，直接跳过。请求是 `BODY.PEEK[HEADER]`，
+    按 `HEADER` 关键字匹配，避免把 `BODYSTRUCTURE` 之类的响应也当成头部。
+    """
+    for item in data:
+        head = b""
+        body = b""
+        if isinstance(item, tuple) and len(item) >= 2:
+            head = item[0] if isinstance(item[0], bytes) else b""
+            body = item[1] if isinstance(item[1], bytes) else b""
+        if not body:
+            continue
+        match = _FETCH_UID_RE.search(head)
+        if match is None:
+            # 服务器没在应答里回带 UID（少数实现如此）：无法定位归属，
+            # 交由调用方回退逐封取。
+            continue
+        yield match.group(1).decode("ascii"), body
+
+
 class ImapAdapter:
     """IMAP 平台适配器。
 
@@ -191,6 +220,11 @@ class ImapAdapter:
     """
 
     platform: str = "custom"
+
+    # 一次批量 `UID FETCH` 覆盖多少个 UID。每封头部通常几 KB，50 封约
+    # 100–250 KB —— 在「往返次数越少越好」与「单次响应别撞上服务器上限」
+    # 之间取平衡。
+    HEADER_FETCH_CHUNK = 50
 
     def __init__(self, config: PlatformConfig | None = None) -> None:
         self.config = config or PLATFORMS.get(self.platform, PLATFORMS["custom"])
@@ -401,6 +435,51 @@ class ImapAdapter:
                       folder: str = "INBOX") -> NormalizedMail:
         raw = self.fetch_raw(imap, uid, headers_only=True)
         return parser.parse_headers_only(raw, uid, folder)
+
+    def fetch_headers_many(self, imap: imaplib.IMAP4, uids: list[str],
+                           folder: str = "INBOX") -> dict[str, NormalizedMail]:
+        r"""批量拉取多封邮件的头部，返回 `{uid: NormalizedMail}`。
+
+        为什么要批量：`fetch_headers()` 是**单 UID** 的 `UID FETCH`，一页 200 封
+        就是 200 次串行往返（首同步 1 万封 = 1 万次往返）。IMAP 本来就允许把
+        UID 写成逗号集合一次取回 —— 本文件里的 `fetch_attachment_meta()`
+        早就这么做了，只是邮件头这条路径当初漏掉。
+
+        健壮性：批量没拿到的 UID 会**逐封回退重试**，所以返回结果的下限等于
+        「全部逐封取」，不会因为某台服务器不支持批量（或应答里不回带 UID）
+        而把邮件取丢。真正取不到的 UID 不出现在返回值里，调用方据此停止推进
+        游标（保持「单封失败不越过」的既有语义）。
+        """
+        result: dict[str, NormalizedMail] = {}
+        wanted = [str(u) for u in uids]
+        if not wanted:
+            return result
+        # 只读 select 一次供整批使用；被服务器拒绝也无妨（多数服务器登录后
+        # 已默认选中 INBOX，且 FETCH 本来就能对已选中的文件夹生效）
+        with contextlib.suppress(imaplib.IMAP4.error, OSError):
+            imap.select(folder, readonly=True)
+        for start in range(0, len(wanted), self.HEADER_FETCH_CHUNK):
+            chunk = wanted[start:start + self.HEADER_FETCH_CHUNK]
+            chunk_set = set(chunk)
+            try:
+                typ, data = imap.uid(
+                    "FETCH", ",".join(chunk), "(UID BODY.PEEK[HEADER])"
+                )
+            except (imaplib.IMAP4.error, OSError) as exc:
+                log.debug("批量拉取邮件头失败（本片改为逐封）：%s", exc)
+                continue
+            if typ != "OK" or not data:
+                continue
+            for uid_text, raw in _iter_fetch_literals(data):
+                if uid_text in chunk_set and uid_text not in result:
+                    result[uid_text] = parser.parse_headers_only(raw, uid_text, folder)
+        # 逐封回退：只补批量没拿到的（一切正常时这里是空循环）
+        for uid_text in [u for u in wanted if u not in result]:
+            try:
+                result[uid_text] = self.fetch_headers(imap, uid_text, folder)
+            except ImapError as exc:
+                log.debug("邮件头 %s 取不到：%s", uid_text, exc)
+        return result
 
     def fetch_message(self, imap: imaplib.IMAP4, uid: str,
                       folder: str = "INBOX") -> NormalizedMail:

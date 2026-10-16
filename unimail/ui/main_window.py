@@ -12,6 +12,9 @@
    用户最直观能感知到的改进——后台来新邮件不再把滚动位置顶掉。
 4. **锁屏与退出是两件事。** `Ctrl+L` / 空闲超时 → 弹遮罩（进程继续跑，
    后台同步不断）；`Ctrl+Q` / 托盘退出 → 停线程、关库、退出进程。
+5. **网络 IO 一律不在这条线程上。** 附件下载/预览、内嵌图下载、`.eml` /
+   `.mbox` 导出、「移入服务器垃圾箱」的批量删除都经 `IoTaskRunner` 提交到
+   后台线程池，结果用信号排队回主线程再更新界面（P1）。
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ from PySide6.QtWidgets import (
 from ..config import APP_NAME, AUTO_LOCK_SECONDS, IDLE_POLL_SECONDS
 from ..core.models import MailFilter
 from ..core.security import SecurityError
+from ..platforms import ImapError
 from . import icons
 from .account_panel import AccountPanel
 from .context import AppContext
@@ -43,6 +47,7 @@ from .detail_panel import DetailPanel
 from .dialogs import AboutDialog, AddAccountDialog, FirstRunWizard, SettingsDialog
 from .filter_bar import FilterBar
 from .inbox_panel import InboxPanel
+from .io_runner import IoTaskRunner
 from .lockscreen import IdleWatcher, LockOverlay
 from .settings import UiSettings
 from .task_panel import TaskPanel
@@ -68,6 +73,8 @@ class MainWindow(QMainWindow):
         self._locked = False
         self._quitting = False
         self._view_mode = self.settings.view_mode
+        # 后台 IO 提交点：复用正文补拉池的线程池，不另起第三条线程生命周期。
+        self._io = IoTaskRunner(context.body_pool, self)
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self.reload_mails)
@@ -501,12 +508,25 @@ class MainWindow(QMainWindow):
         )
         if ret != QMessageBox.Yes:
             return
+        # 顺序很重要：先停掉该账号正在跑的同步并**等它退出**，再删数据。
+        # 只关会话不够——worker 可能正好在 `insert_mails_batch` 里，把整页
+        # 数据写进一个即将消失的账号（mails 表对 accounts 没有外键，数据库
+        # 层面拦不住），留下永远不会被清理的孤儿行。
+        stopped = True
+        if self.ctx.pool:
+            stopped = self.ctx.pool.stop_account(account_id, timeout_ms=5000)
         self.ctx.sessions.close_account(account_id)
         self.ctx.accounts.remove(account_id)
         self.detail_panel.clear()
         self.refresh_accounts()
         self.reload_mails()
-        self.set_status(f"已删除账号 {account.email}")
+        if stopped:
+            self.set_status(f"已删除账号 {account.email}")
+        else:
+            self.set_status(
+                f"已删除账号 {account.email}（同步任务未能在 5 秒内退出，"
+                "可能有少量本地数据残留；下次同步前不会影响使用）"
+            )
 
     def _on_manage_account(self, account_id: str) -> None:
         account = self.ctx.accounts.get(account_id)
@@ -831,23 +851,40 @@ class MainWindow(QMainWindow):
             self.set_status(f"已删除 {len(mail_ids)} 封本地副本（服务器邮件不受影响）")
             return
 
-        result = self.ctx.mails.delete_many(mail_ids, on_server=True)
-        self._after_delete(result.removed_ids)
-        if result.failed:
-            # 失败的必须逐条说出来：只报「删了 N 封」会让用户以为整批都成功了，
-            # 而这批里恰恰有几封还留在服务器上。
-            shown = "\n".join(f"· {reason}" for _mid, reason in result.failed[:3])
-            more = "" if len(result.failed) <= 3 else \
-                f"\n（另有 {len(result.failed) - 3} 封同类失败）"
-            QMessageBox.warning(
-                self, "部分邮件未能删除",
-                f"已移入垃圾箱：{result.removed} 封\n"
-                f"失败：{len(result.failed)} 封（本机副本保持不变）\n\n{shown}{more}",
-            )
-            self.set_status(
-                f"已移入垃圾箱 {result.removed} 封，{len(result.failed)} 封失败（本机副本未动）")
-        else:
-            self.set_status(f"已把 {result.removed} 封邮件移入服务器垃圾箱并删除本机副本")
+        # 走服务器是**逐封一次 IMAP 往返**（还要先 SELECT 一次），选几百封就是
+        # 几百次串行等待，必须在后台跑。
+        self.set_status(f"正在把 {len(mail_ids)} 封邮件移入服务器垃圾箱…")
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("移入服务器垃圾箱失败")
+                QMessageBox.warning(
+                    self, "删除失败",
+                    "移入服务器垃圾箱的过程中出错，已中止。\n\n"
+                    f"{_io_error_text(error)}\n\n"
+                    "已成功移入垃圾箱的邮件会在下一次同步时从列表消失；"
+                    "本机副本不会被主动删除。",
+                )
+                return
+            self._after_delete(result.removed_ids)
+            if result.failed:
+                # 失败的必须逐条说出来：只报「删了 N 封」会让用户以为整批都成功了，
+                # 而这批里恰恰有几封还留在服务器上。
+                shown = "\n".join(f"· {reason}" for _mid, reason in result.failed[:3])
+                more = "" if len(result.failed) <= 3 else \
+                    f"\n（另有 {len(result.failed) - 3} 封同类失败）"
+                QMessageBox.warning(
+                    self, "部分邮件未能删除",
+                    f"已移入垃圾箱：{result.removed} 封\n"
+                    f"失败：{len(result.failed)} 封（本机副本保持不变）\n\n{shown}{more}",
+                )
+                self.set_status(
+                    f"已移入垃圾箱 {result.removed} 封，{len(result.failed)} 封失败（本机副本未动）")
+            else:
+                self.set_status(f"已把 {result.removed} 封邮件移入服务器垃圾箱并删除本机副本")
+
+        self._run_io(lambda: self.ctx.mails.delete_many(mail_ids, on_server=True),
+                     done, key="delete:server")
 
     def _after_delete(self, mail_ids: list[str]) -> None:
         if not mail_ids:
@@ -884,12 +921,18 @@ class MainWindow(QMainWindow):
                                               "邮件文件 (*.eml)")
         if not path:
             return
-        try:
-            dest = self.ctx.mails.export_eml(mail_id, path)
-        except Exception as exc:  # noqa: BLE001 - 如实报错
-            QMessageBox.warning(self, "导出失败", str(exc))
-            return
-        self.set_status(f"已导出：{dest}")
+        self.set_status("正在导出…")
+
+        def done(dest, error) -> None:
+            if error is not None:
+                self.set_status("导出失败")
+                QMessageBox.warning(self, "导出失败", _io_error_text(error))
+                return
+            self.set_status(f"已导出：{dest}")
+
+        # 导出要先去服务器取原始报文，是一次完整往返 —— 不能在 GUI 线程做
+        self._run_io(lambda: self.ctx.mails.export_eml(mail_id, path),
+                     done, key=f"export:{path}")
 
     def _export_mbox(self, mail_ids: list[str]) -> None:
         default = "unimail-导出.mbox"
@@ -897,25 +940,40 @@ class MainWindow(QMainWindow):
                                               "mbox 归档 (*.mbox)")
         if not path:
             return
-        self.set_status(f"正在导出 {len(mail_ids)} 封邮件…")
-        QApplication.processEvents()
+        total = len(mail_ids)
+        self.set_status(f"正在导出 {total} 封邮件…")
 
-        def progress(done: int, total: int) -> None:
-            self.set_status(f"正在导出 {done}/{total}…")
-            QApplication.processEvents()
+        def report(done: int, all_: int) -> None:
+            self.set_status(f"正在导出 {done}/{all_}…")
 
-        try:
-            dest, written = self.ctx.mails.export_mbox(mail_ids, path,
-                                                       progress=progress)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "导出失败", str(exc))
-            return
-        self.set_status(f"已导出 {written} 封到 {dest}")
-        QMessageBox.information(
-            self, "导出完成",
-            f"已导出 {written} 封邮件到：\n{dest}\n\n"
-            "该格式可被 Thunderbird、mutt 等客户端直接导入。",
-        )
+        # 进度的节流放在**工作线程**：几百封邮件逐封回投会把主线程事件队列
+        # 刷满，反而让界面更卡。只在百分比变化或最后一封时回投一次。
+        last = [-1]
+
+        def progress(done: int, all_: int) -> None:
+            pct = (done * 100) // max(1, all_)
+            if pct == last[0] and done != all_:
+                return
+            last[0] = pct
+            self._io.post(report, done, all_)
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("导出失败")
+                QMessageBox.warning(self, "导出失败", _io_error_text(error))
+                return
+            dest, written = result
+            self.set_status(f"已导出 {written} 封到 {dest}")
+            QMessageBox.information(
+                self, "导出完成",
+                f"已导出 {written} 封邮件到：\n{dest}\n\n"
+                "该格式可被 Thunderbird、mutt 等客户端直接导入。",
+            )
+
+        def work():
+            return self.ctx.mails.export_mbox(mail_ids, path, progress=progress)
+
+        self._run_io(work, done, key=f"export:{path}")
 
     def _export_csv(self) -> None:
         flt = self._current_filter()
@@ -934,42 +992,58 @@ class MainWindow(QMainWindow):
                                 f"已导出 {rows} 行到：\n{dest}\n\n"
                                 "文件带 UTF-8 BOM，Excel 打开不会乱码。")
 
+    # ================================================================ 后台 IO
+    def _run_io(self, fn, handler, key: str | None = None) -> bool:
+        """把一次阻塞式服务调用丢到后台线程，完成后回主线程执行 `handler`。
+
+        这里是所有网络 IO 的唯一入口（P1），因此维护窗口的检查也收在这里：
+        「改主密码 / 迁移数据库加密」期间 `ctx.quiesced` 为真，此时提交的
+        IMAP 往返可能在 rekey 之后才落盘，写出用旧密钥加密的行——直接拒绝。
+        """
+        if self.ctx.quiesced:
+            self.set_status("正在维护数据库，请稍后再试")
+            return False
+        return self._io.submit(fn, handler, key=key)
+
     # ================================================================ 附件
     def _on_download_attachment(self, attachment_id: str) -> None:
-        try:
-            result = self.ctx.mails.download_attachment(attachment_id)
-        except (FileNotFoundError, OSError, ValueError, SecurityError) as exc:
-            QMessageBox.warning(self, "下载失败", str(exc))
-            return
+        self.set_status("正在下载附件…")
 
-        self.set_status(f"附件已保存到：{result.path}")
-        lines = [f"附件已保存到：\n{result.path}"]
-        if result.size:
-            lines.append(f"\n大小：{result.size / 1024:.1f} KB")
-        if result.danger and result.name_hint:
-            lines.append(f"\n⚠️ {result.name_hint}")
-        QMessageBox.information(
-            self, "附件已下载" + ("（已做安全处理）" if result.danger else ""),
-            "\n".join(lines),
-        )
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("附件下载失败")
+                QMessageBox.warning(self, "下载失败", _io_error_text(error))
+                return
+            self.set_status(f"附件已保存到：{result.path}")
+            lines = [f"附件已保存到：\n{result.path}"]
+            if result.size:
+                lines.append(f"\n大小：{result.size / 1024:.1f} KB")
+            if result.danger and result.name_hint:
+                lines.append(f"\n⚠️ {result.name_hint}")
+            QMessageBox.information(
+                self, "附件已下载" + ("（已做安全处理）" if result.danger else ""),
+                "\n".join(lines),
+            )
+
+        self._run_io(lambda: self.ctx.mails.download_attachment(attachment_id),
+                     done, key=f"attach:{attachment_id}")
 
     def _on_preview_attachment(self, attachment_id: str) -> None:
         att = self.ctx.mails.attachments.get(attachment_id)
         title = att.filename if att else "预览"
         self.set_status("正在准备预览…")
-        QApplication.processEvents()
-        try:
-            kind, payload = self.ctx.mails.preview_attachment(attachment_id)
-        except (FileNotFoundError, OSError, ValueError, SecurityError) as exc:
-            self.set_status("预览失败")
-            QMessageBox.warning(self, "预览失败", str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001 - 网络层的意外也要如实说明
-            self.set_status("预览失败")
-            QMessageBox.warning(self, "预览失败", f"取回附件时出错：{exc}")
-            return
-        self.set_status("预览就绪")
-        self.detail_panel.show_preview(kind, payload, title)
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("预览失败")
+                QMessageBox.warning(self, "预览失败", _io_error_text(error))
+                return
+            kind, payload = result
+            self.set_status("预览就绪")
+            self.detail_panel.show_preview(kind, payload, title)
+
+        self._run_io(lambda: self.ctx.mails.preview_attachment(attachment_id),
+                     done, key=f"preview:{attachment_id}")
 
     def _resolve_inline(self, mail_id: str, content_id: str) -> bytes | None:
         if self.ctx.mails is None:
@@ -985,19 +1059,23 @@ class MainWindow(QMainWindow):
         if self.ctx.mails is None:
             return
         self.set_status("正在下载内嵌图片…")
-        QApplication.processEvents()
-        try:
-            ok, failed = self.ctx.mails.download_inline_images(mail_id)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "下载失败", str(exc))
-            return
-        mail = self.ctx.mails.get(mail_id)
-        if mail is not None:
-            self.detail_panel.show_mail(mail)
-        msg = f"已加载 {ok} 张内嵌图片"
-        if failed:
-            msg += f"，{failed} 张失败"
-        self.set_status(msg)
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("内嵌图片下载失败")
+                QMessageBox.warning(self, "下载失败", _io_error_text(error))
+                return
+            ok, failed = result
+            mail = self.ctx.mails.get(mail_id) if self.ctx.mails else None
+            if mail is not None:
+                self.detail_panel.show_mail(mail)
+            msg = f"已加载 {ok} 张内嵌图片"
+            if failed:
+                msg += f"，{failed} 张失败"
+            self.set_status(msg)
+
+        self._run_io(lambda: self.ctx.mails.download_inline_images(mail_id),
+                     done, key=f"inline:{mail_id}")
 
     # ================================================================ 锁定
     def _on_activity(self) -> None:
@@ -1071,6 +1149,9 @@ class MainWindow(QMainWindow):
         if self._quitting:
             return
         self._quitting = True
+        # 先掐掉后台 IO 的回投：接下来要停线程、关库，任何「下载失败」之类的
+        # 结果弹窗都会卡在退出路径上。
+        self._io.stop()
         self._save_geometry()
         try:
             self.settings.save()
@@ -1302,6 +1383,26 @@ def _safe_name(text: str, limit: int = 80) -> str:
     import re
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text or "").strip().rstrip(". ")
     return (cleaned[:limit] or "mail")
+
+
+# 后台任务里「本该发生」的异常：直接说它的文案就够清楚。
+# 其余异常属于意外，把类型名一并带上，否则用户只看到一句莫名其妙的话。
+_IO_EXPECTED_ERRORS = (
+    FileNotFoundError, PermissionError, OSError,
+    ValueError, SecurityError, ImapError,
+)
+
+
+def _io_error_text(error: BaseException) -> str:
+    """把后台任务抛出的异常转成给用户看的一段话。
+
+    后台执行意味着异常不再由 Qt 打到 stderr；如果这里不落成文案，用户看到的
+    就只是「点了没反应」。因此宁可啰嗦也要把它说出来。
+    """
+    text = str(error).strip() or error.__class__.__name__
+    if isinstance(error, _IO_EXPECTED_ERRORS):
+        return text
+    return f"意外错误（{error.__class__.__name__}）：{text}"
 
 
 def QLineEdit_EchoMode_Password():

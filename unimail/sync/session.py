@@ -14,7 +14,27 @@
 * `borrow()` 是唯一的取用入口，返回上下文管理器：进入时探活（`NOOP`），
   退出时若本次调用抛异常则把连接标记为脏、关闭，下次自动重连。
 * 空闲超过 `idle_timeout` 的会话由 `sweep()` 回收（调度器心跳顺带调用）。
-* 总连接数受 `max_sessions` 约束：账号很多时不会一次性把所有连接都握在手里。
+* 总连接数以 `max_sessions` 为目标：需要新建会话且已达上限时，优先回收一个
+  「不在使用」的最久未用会话。
+
+为什么不用信号量做槽位控制（v1.6.1 修正）
+-----------------------------------------
+v1.5.0–v1.6.0 用 `BoundedSemaphore` 限制连接数，写法是：
+
+    if not self._slots.acquire(blocking=False):
+        self._evict_lru_locked()      # 若全部 in_use → 一个槽位都释放不出来
+        self._slots.acquire()         # ← 阻塞，而此时**仍持有 self._lock**
+
+槽位只在 `_evict_lru_locked` / `close_account` / `close_all` 三处释放，而这三处
+都必须先拿到 `self._lock`。于是「8 个账号的会话同时在使用、第 9 个账号到来」会让
+该线程永久阻塞在 `acquire()` 上，并连带把 `sweep()` / `close_account()` /
+`close_all()` / `stats()` 全部堵死 —— 而 `Scheduler.tick` 是在**主线程**调用
+`sweep()` 的，最终表现是界面永久冻结、进程关不掉。
+
+现在改为**不做无界等待**：容量已满且存在空闲会话就回收它；若全都在用（这是
+`Scheduler.tick` 一次派发所有到期账号时的正常情形），允许临时超额并记一条
+WARNING，等这一批结束后在 `_release()` 里回落到上限。池锁**绝不跨越任何阻塞
+调用**：所有 `close()`（内含 `LOGOUT` 网络往返）都挪到锁外执行。
 
 为什么用 `NOOP` 探活：TCP 连接可能在服务器侧已经被单方面关闭（NAT 超时、
 服务端 `IDLE` 超时），此时本地 socket 看起来仍是「已连接」，直到下一次读写
@@ -150,56 +170,82 @@ class SessionPool:
         self.idle_timeout = float(idle_timeout)
         self._sessions: dict[str, ImapSession] = {}
         self._lock = threading.Lock()
-        self._slots = threading.BoundedSemaphore(self.max_sessions)
         self._borrows: dict[str, int] = {}
+        # 临时超额的次数，仅供诊断（正常应为 0，或只在「一次派发很多账号」时短暂 > 0）
+        self._over_capacity = 0
 
     # ------------------------------------------------------------ 内部
     def _get_or_create(self, account: Account, password: str) -> ImapSession:
+        """取出（或新建）该账号的会话，并把「已借出」登记在锁内完成。
+
+        登记借用的时机很关键：`ImapSession.borrow()` 要等到进入下一步才会把
+        `in_use` 置真。若中间这段窗口被 `_detach_lru_locked()` 判定为「空闲」
+        并回收，调用方手里就留下一条**不在 `_sessions` 里**的孤儿连接——
+        永远不会被回收，连接数还会突破上限。所以这里在释放池锁之前就计入
+        `_borrows`，让驱逐逻辑看得到它。
+        """
+        victim: ImapSession | None = None
         with self._lock:
             session = self._sessions.get(account.id)
-            if session is not None:
-                return session
-            if not self._slots.acquire(blocking=False):
-                # 槽位用尽：回收一个最久未用的空闲会话再建新的
-                self._evict_lru_locked()
-                self._slots.acquire()
-            session = ImapSession(account, password)
-            self._sessions[account.id] = session
-            return session
+            if session is None:
+                if len(self._sessions) >= self.max_sessions:
+                    victim = self._detach_lru_locked()
+                    if victim is None:
+                        # 全都在用：这是 Scheduler.tick 一次派发多个账号时的正常
+                        # 情形。宁可临时超额，也绝不阻塞（阻塞会连带锁死主线程）。
+                        self._over_capacity += 1
+                        log.warning(
+                            "IMAP 会话数已达上限 %d 且全部在用，临时超额建立账号 %s 的连接；"
+                            "这一批结束后会自动回落",
+                            self.max_sessions, account.id,
+                        )
+                session = ImapSession(account, password)
+                self._sessions[account.id] = session
+            self._borrows[account.id] = self._borrows.get(account.id, 0) + 1
+        # close() 内含 LOGOUT 网络往返，必须在池锁之外执行
+        if victim is not None:
+            victim.close()
+        return session
 
-    def _evict_lru_locked(self) -> None:
-        """回收「不是在用」的最久未用会话，腾出一个连接槽位。"""
+    def _detach_lru_locked(self, exclude: str | None = None) -> ImapSession | None:
+        """摘除「不在使用」的最久未用会话并返回它（**不做 IO**，调用方在锁外关闭）。
+
+        `exclude` 用于避免刚归还的会话被立刻回收——保留它才能实现保活复用。
+        没有任何可回收对象时返回 None。
+        """
         candidates = [
             (s.last_used, aid) for aid, s in self._sessions.items()
-            if not s.in_use
+            if not s.in_use and aid not in self._borrows and aid != exclude
         ]
         if not candidates:
-            return
+            return None
         _ts, account_id = min(candidates)
-        session = self._sessions.pop(account_id, None)
-        if session is not None:
-            try:
-                session.close()
-            finally:
-                with contextlib.suppress(ValueError):
-                    self._slots.release()
+        return self._sessions.pop(account_id, None)
+
+    def _release(self, account_id: str) -> None:
+        """归还一次借用；若此前曾临时超额，顺手回落到上限。"""
+        victim: ImapSession | None = None
+        with self._lock:
+            left = self._borrows.get(account_id, 1) - 1
+            if left <= 0:
+                self._borrows.pop(account_id, None)
+            else:
+                self._borrows[account_id] = left
+            if len(self._sessions) > self.max_sessions:
+                # 优先保留刚用过的会话（它最可能被立刻复用）
+                victim = self._detach_lru_locked(exclude=account_id)
+        if victim is not None:
+            victim.close()
 
     # ------------------------------------------------------------ 对外
     @contextlib.contextmanager
     def borrow(self, account: Account, password: str) -> Iterator:
         session = self._get_or_create(account, password)
-        with self._lock:
-            self._borrows[account.id] = self._borrows.get(account.id, 0) + 1
         try:
             with session.borrow() as imap:
                 yield imap
         finally:
-            with self._lock:
-                left = self._borrows.get(account.id, 1) - 1
-                if left <= 0:
-                    self._borrows.pop(account.id, None)
-                else:
-                    self._borrows[account.id] = left
+            self._release(account.id)
 
     def close_account(self, account_id: str) -> None:
         with self._lock:
@@ -207,25 +253,26 @@ class SessionPool:
             self._borrows.pop(account_id, None)
         if session is None:
             return
-        try:
-            session.close()
-        finally:
-            with contextlib.suppress(ValueError):
-                self._slots.release()
+        session.close()
 
     def interrupt_account(self, account_id: str) -> None:
-        """打断该账号正在阻塞的调用（取消/退出用，不会释放槽位）。"""
+        """打断该账号正在阻塞的调用（取消/退出用，不影响会话的存续）。"""
         with self._lock:
             session = self._sessions.get(account_id)
         if session is not None:
             session.interrupt()
 
     def sweep(self) -> int:
-        """回收空闲超时的会话。返回回收数量。"""
+        """回收空闲超时的会话。返回回收数量。
+
+        `aid not in self._borrows` 是必要的：`in_use` 要等到 `ImapSession.borrow()`
+        内部才置真，两者之间存在一个「已借出但尚未标记在用」的窗口。
+        """
         with self._lock:
             stale = [
                 aid for aid, s in self._sessions.items()
-                if not s.in_use and s.idle_seconds > self.idle_timeout
+                if not s.in_use and aid not in self._borrows
+                and s.idle_seconds > self.idle_timeout
             ]
         for aid in stale:
             self.close_account(aid)
@@ -243,6 +290,7 @@ class SessionPool:
                 "sessions": len(self._sessions),
                 "max_sessions": self.max_sessions,
                 "in_use": len(self._borrows),
+                "over_capacity": self._over_capacity,
             }
 
     def __len__(self) -> int:

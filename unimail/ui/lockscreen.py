@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.security import UnlockGuard
 from . import icons
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,14 @@ class LockOverlay(QWidget):
         self.setAutoFillBackground(True)
         self._theme: dict = {}
         self._attempts = 0
+        # 与登录页**共用同一份持久化的退避状态**（同一个 guard 文件）。
+        # 此前锁屏完全没接 UnlockGuard：登录页精心实现的递增等待在这里形同虚设，
+        # 挂机时可以对主密码做无限次在线尝试（每次都是 GUI 线程上跑一遍
+        # Argon2id ≈ 0.4 s）。v1.6.1 修正。
+        self._guard = UnlockGuard()
+        self._cooldown_timer = QTimer(self)
+        self._cooldown_timer.setInterval(500)
+        self._cooldown_timer.timeout.connect(self._tick_cooldown)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -152,6 +161,7 @@ class LockOverlay(QWidget):
         self.password.clear()
         self.hint.setText(reason or "输入主密码继续使用")
         self._refresh_device_button()
+        self._sync_cooldown()
         parent = self.parentWidget()
         if parent is not None:
             self.setGeometry(parent.rect())
@@ -175,7 +185,35 @@ class LockOverlay(QWidget):
         return self.isVisible()
 
     # ------------------------------------------------------------ 认证
+    def _sync_cooldown(self) -> None:
+        """按退避状态启用/禁用输入并显示剩余秒数。"""
+        wait = self._guard.remaining_wait()
+        if wait <= 0:
+            self._cooldown_timer.stop()
+            self.password.setEnabled(True)
+            self.unlock_btn.setEnabled(True)
+            self.device_btn.setEnabled(True)
+            return
+        self.password.setEnabled(False)
+        self.unlock_btn.setEnabled(False)
+        self.error.setText(f"尝试过于频繁，请等待 {wait:.0f} 秒后重试")
+        self.error.show()
+        if not self._cooldown_timer.isActive():
+            self._cooldown_timer.start()
+
+    def _tick_cooldown(self) -> None:
+        if self._guard.remaining_wait() > 0:
+            self._sync_cooldown()
+            return
+        self.error.hide()
+        self._sync_cooldown()
+        self._refresh_device_button()
+        self.password.setFocus()
+
     def _try_unlock(self) -> None:
+        if self._guard.remaining_wait() > 0:
+            self._sync_cooldown()
+            return
         password = self.password.text()
         if not password:
             return
@@ -184,13 +222,33 @@ class LockOverlay(QWidget):
         except Exception as exc:  # noqa: BLE001 - 元数据坏了要如实说明
             self._fail(f"无法读取安全元数据：{exc}")
             return
-        if self.ctx.security.verify_password(password, params, verifier):
+
+        # 校验要在 GUI 线程里跑一遍 Argon2id（约 0.4 s）。给一个忙碌提示，并且
+        # 只 repaint 不 processEvents —— 后者会让「解锁」按钮在等待期内被再次
+        # 点中，触发并发的第二次密钥派生。
+        self.error.setText("正在校验…")
+        self.error.show()
+        self.password.setEnabled(False)
+        self.unlock_btn.setEnabled(False)
+        self.error.repaint()
+        try:
+            ok = self.ctx.security.verify_password(password, params, verifier)
+        finally:
+            self.password.setEnabled(True)
+            self.unlock_btn.setEnabled(True)
+
+        if ok:
+            self._guard.reset()
+            self._cooldown_timer.stop()
+            self.error.hide()
             self.password.clear()
             self.hide()
             self.unlocked.emit()
             return
+        delay = self._guard.record_failure()
         self._attempts += 1
-        self._fail("主密码不正确")
+        self._fail(f"主密码不正确（第 {self._attempts} 次，需等待 {delay:.0f} 秒）")
+        self._sync_cooldown()
 
     def _try_device_unlock(self) -> None:
         binding = getattr(self.ctx, "device_binding", None)

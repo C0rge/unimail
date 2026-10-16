@@ -23,6 +23,10 @@ from ..core.models import (
 )
 from ..core.textsearch import fts_eligible, match_query
 
+# `IN (?,?,…)` 的分批大小。SQLite 的变量上限默认 999（老版本更低），
+# 一次传几千个 id 会直接报错，因此所有批量 `IN` 查询都按这个粒度分批。
+_SQL_VAR_CHUNK = 500
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -526,6 +530,25 @@ class MailRepository:
         )
         return [str(r["stored_path"]) for r in rows]
 
+    def stored_paths_of_mails(self, mail_ids: list[str]) -> list[str]:
+        """批量取多封邮件已落盘的附件路径（`stored_paths_of_mail` 的批量版）。
+
+        `delete_many()` 此前对每封各查一次：全选 300 封 = 300 次查询，
+        而且是在删除事务**之前**串行跑完。
+        """
+        if not mail_ids:
+            return []
+        out: list[str] = []
+        for start in range(0, len(mail_ids), _SQL_VAR_CHUNK):
+            chunk = mail_ids[start:start + _SQL_VAR_CHUNK]
+            marks = ", ".join("?" * len(chunk))
+            rows = self.db.query_all(
+                f"SELECT stored_path FROM attachments WHERE mail_id IN ({marks}) "  # noqa: S608
+                "AND stored_path IS NOT NULL AND stored_path <> ''", chunk
+            )
+            out.extend(str(r["stored_path"]) for r in rows)
+        return out
+
     def stored_paths_of_account(self, account_id: str) -> list[str]:
         rows = self.db.query_all(
             "SELECT a.stored_path FROM attachments a JOIN mails m ON m.id = a.mail_id "
@@ -600,6 +623,26 @@ class MailRepository:
             (mail_id,),
         )
 
+    def contexts_by_ids(self, mail_ids: list[str]) -> list[dict]:
+        """批量取邮件的同步元信息（`mail_context` 的批量版）。
+
+        返回顺序与 `mail_ids` 一致，且**跳过不存在的 id**（邮件可能已被删）。
+        批量标已读时逐封查一次会变成 N 次往返，全部压在 GUI 线程上。
+        """
+        if not mail_ids:
+            return []
+        found: dict[str, dict] = {}
+        for start in range(0, len(mail_ids), _SQL_VAR_CHUNK):
+            chunk = mail_ids[start:start + _SQL_VAR_CHUNK]
+            marks = ", ".join("?" * len(chunk))
+            rows = self.db.query_all(
+                f"SELECT id, account_id, platform, folder, uid FROM mails "  # noqa: S608
+                f"WHERE id IN ({marks})", chunk
+            )
+            for row in rows:
+                found[row["id"]] = dict(row)
+        return [found[mid] for mid in mail_ids if mid in found]
+
     def body_fetch_info(self, mail_id: str) -> dict | None:
         """正文补拉需要的全部信息 + 是否已有正文（一次查询给出）。
 
@@ -657,9 +700,7 @@ class MailRepository:
         """批量删除本地副本，返回需要一并清理的附件文件路径。"""
         if not mail_ids:
             return []
-        stale: list[str] = []
-        for mid in mail_ids:
-            stale.extend(self.stored_paths_of_mail(mid))
+        stale = self.stored_paths_of_mails(mail_ids)
         with self.db.transaction() as conn:
             conn.executemany("DELETE FROM mails WHERE id = ?",
                              [(mid,) for mid in mail_ids])
@@ -979,6 +1020,89 @@ class PendingFlagRepository:
             (new_id(), account_id, folder or "INBOX", str(uid),
              json.dumps(sorted(add_set)), json.dumps(sorted(remove_set)), utcnow_iso()),
         )
+
+    def add_many(self, items: list[tuple[str, str, str, list[str], list[str]]]) -> int:
+        """批量入队，返回实际发生变化的 `(account, folder, uid)` 组数。
+
+        `items` 每项为 `(account_id, folder, uid, add, remove)`，合并语义与
+        逐条 `add()` **完全一致**（同键叠加、相反方向抵消、空则删除已有行）。
+        省略这里是为什么：`mark_all_read()` 会对最多 5000 封逐封调 `add()`，
+        每封 = 1 次 SELECT + 1 次写入 ≈ 1.5 万条串行 SQLite 操作，而它跑在
+        GUI 线程上 —— 点一次「全部标为已读」就卡住数秒到数十秒。
+
+        实现是「一次预读 + 单事务 executemany」：预读用一次 `IN` 查询取回
+        所有涉及的已存在行，随后的插入/更新/删除各自一次 `executemany`。
+        """
+        merged: dict[tuple[str, str, str], tuple[set[str], set[str]]] = {}
+        for account_id, folder, uid, add, remove in items:
+            add_set = {f for f in add if f}
+            remove_set = {f for f in remove if f}
+            # 同一次调用里对同一标志既加又删 = 没点这个标志（与 add() 一致）
+            both = add_set & remove_set
+            if both:
+                add_set -= both
+                remove_set -= both
+            if not add_set and not remove_set:
+                continue
+            key = (account_id, folder or "INBOX", str(uid))
+            cur_add, cur_remove = merged.get(key, (set(), set()))
+            new_add = (cur_add | add_set) - remove_set
+            new_remove = (cur_remove | remove_set) - add_set
+            new_add -= new_remove
+            new_remove -= new_add
+            merged[key] = (new_add, new_remove)
+        if not merged:
+            return 0
+
+        keys = list(merged)
+        existing: dict[tuple[str, str, str], dict] = {}
+        # 每组占 3 个绑定变量，因此按 1/3 粒度分批，避免撞上 SQLite 的变量上限
+        step = max(1, _SQL_VAR_CHUNK // 3)
+        for start in range(0, len(keys), step):
+            chunk = keys[start:start + step]
+            # 三列联合定位，SQLite 的 `IN` 只吃单值，因此写成 OR 组合
+            where = " OR ".join(
+                "(account_id = ? AND folder = ? AND uid = ?)" for _ in chunk)
+            params = [v for key in chunk for v in key]
+            for row in self.db.query_all(
+                    f"SELECT * FROM pending_flags WHERE {where}", params):  # noqa: S608
+                existing[(row["account_id"], row["folder"], str(row["uid"]))] = dict(row)
+
+        now = utcnow_iso()
+        inserts: list[tuple] = []
+        updates: list[tuple] = []
+        deletes: list[tuple] = []
+        for key, (add_set, remove_set) in merged.items():
+            row = existing.get(key)
+            if row is None:
+                inserts.append((new_id(), key[0], key[1], key[2],
+                                json.dumps(sorted(add_set)),
+                                json.dumps(sorted(remove_set)), now))
+                continue
+            merged_add = set(load_str_list(row.get("add_flags")))
+            merged_remove = set(load_str_list(row.get("remove_flags")))
+            merged_add = (merged_add | add_set) - remove_set
+            merged_remove = (merged_remove | remove_set) - add_set
+            merged_add -= merged_remove
+            merged_remove -= merged_add
+            if not merged_add and not merged_remove:
+                deletes.append((row["id"],))
+            else:
+                updates.append((json.dumps(sorted(merged_add)),
+                                json.dumps(sorted(merged_remove)), row["id"]))
+        with self.db.transaction() as conn:
+            if inserts:
+                conn.executemany(
+                    "INSERT INTO pending_flags"
+                    "(id, account_id, folder, uid, add_flags, remove_flags, created_at) "
+                    "VALUES(?,?,?,?,?,?,?)", inserts)
+            if updates:
+                conn.executemany(
+                    "UPDATE pending_flags SET add_flags = ?, remove_flags = ? "
+                    "WHERE id = ?", updates)
+            if deletes:
+                conn.executemany("DELETE FROM pending_flags WHERE id = ?", deletes)
+        return len(merged)
 
     def list_for_account(self, account_id: str, limit: int = 200) -> list[dict]:
         rows = self.db.query_all(

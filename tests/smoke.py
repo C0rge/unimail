@@ -32,6 +32,10 @@
    29. 界面偏好持久化：白名单、越界回落、损坏文件容错（v1.4.0）
    30. 设备绑定免密解锁：DPAPI/Keychain 往返 + 密文损坏检测（v1.6.0）
    31. UI 层：设计令牌、图标、模型增量、多选 J/K、任务面板、锁屏遮罩（v1.4.0–v1.6.0）
+   32. 删除语义与服务端删除；代码签名参数拼装（v1.6.0）
+   33. 【回归】并发与性能（v1.6.1）：会话池不持锁阻塞、worker 回调线程归属、
+       补拉池可恢复、连接关闭竞态、删账号取消同步、退避时钟、锁屏限速、
+       网络 IO 移出主线程、邮件头批量 FETCH、批量标记 SQL 恒定、mmap
 
 运行：python tests/smoke.py
 """
@@ -88,11 +92,13 @@ def _fake_server(adapter, svcmod=None):
     from unittest.mock import patch as _patch
 
     import unimail.core.services as _svc
+    import unimail.sync.body_fetcher as bodymod
     import unimail.sync.session as sessmod
     import unimail.sync.worker as workermod
     with _patch.object(svcmod or _svc, "get_adapter", return_value=adapter), \
             _patch.object(sessmod, "get_adapter", return_value=adapter), \
-            _patch.object(workermod, "get_adapter", return_value=adapter):
+            _patch.object(workermod, "get_adapter", return_value=adapter), \
+            _patch.object(bodymod, "get_adapter", return_value=adapter):
         yield adapter
 
 
@@ -572,6 +578,10 @@ class _FakeAdapter:
         self.searches: list[tuple[int, int]] = []
         self.body_fetches: list[int] = []
         self.meta_fetches: list[list[str]] = []
+        self.header_batches: list[list[str]] = []
+        # 每次「向服务器要新 UID」时的人为延迟。默认 0（既有用例零开销）；
+        # 需要让同步「跑得够久」以便在其执行中间做别的动作时（例如删账号）调大。
+        self.delay = 0.0
 
     def connect(self, account, password):
         return _FakeImap()
@@ -583,6 +593,8 @@ class _FakeAdapter:
         return self.validity
 
     def search_new_uids(self, imap, since_uid, limit=200):
+        if self.delay:
+            time.sleep(self.delay)
         self.searches.append((int(since_uid), int(limit)))
         avail = [u for u in self.uids if u > since_uid]
         return [str(u) for u in avail[:limit]]
@@ -595,6 +607,24 @@ class _FakeAdapter:
         return NormalizedMail(uid=str(uid), subject=f"mail {uid}",
                               from_addr="sender@example.com",
                               date=datetime.now(timezone.utc))
+
+    def fetch_headers_many(self, imap, uids, folder="INBOX"):
+        """批量路径的替身：记录调用参数，逐个委托给 `fetch_headers`。
+
+        刻意做成「按 uid 委托」而不是一次性返回全部：这样 `fail_uids` 编排出的
+        「某一封取不到 → 游标不越过它」语义，在批量路径下仍是同一套断言。
+        取不到就不放进字典 —— 与真实实现的契约一致（缺失即代表失败）。
+        """
+        from unimail.platforms.base import ImapError
+        batch = [str(u) for u in uids]
+        self.header_batches.append(batch)
+        out = {}
+        for u in batch:
+            try:
+                out[u] = self.fetch_headers(imap, u, folder)
+            except ImapError:
+                continue
+        return out
 
     def fetch_message(self, imap, uid, folder="INBOX"):
         from unimail.core.models import AttachmentMeta, NormalizedMail
@@ -2582,6 +2612,24 @@ def test_ui_layer():
           win.lock_overlay.isVisible() and win._locked)
     check("错误密码有提示", win.lock_overlay.error.isVisible())
 
+    # 锁屏必须与登录页共用同一份持久化退避：此前这里完全不限速，
+    # 挂机时可以对主密码做无限次在线尝试（每次都在 GUI 线程跑一遍 Argon2id）。
+    check("错误密码触发退避（锁屏不再可无限尝试）",
+          win.lock_overlay._guard.remaining_wait() > 0)
+    check("退避期间输入被禁用", not win.lock_overlay.password.isEnabled())
+    win.lock_overlay.password.setText("wrong-password")
+    win.lock_overlay._try_unlock()          # 冷却期内的尝试必须被直接挡回
+    app.processEvents()
+    check("冷却期内不再消耗一次校验（失败次数不变）",
+          win.lock_overlay._guard.failures == 1,
+          f"实际 {win.lock_overlay._guard.failures}")
+
+    # 模拟用户等待结束
+    win.lock_overlay._guard.reset()
+    win.lock_overlay._sync_cooldown()
+    app.processEvents()
+    check("冷却结束后恢复可输入", win.lock_overlay.password.isEnabled())
+
     # 正确密码：走真实解锁路径（信号 → 主窗口），遮罩必须自己收起来
     status: list[str] = []
     original_status = win.set_status
@@ -2945,6 +2993,875 @@ def test_build_signing_args():
           > B.sdk_version_key(r"C:\Kits\10\bin\10.0.10011.0\x64\signtool.exe"))
 
 
+# ============================================================ 35–48. 并发与性能回归
+# 对应 v1.6.1 代码审查的梯队 1（C1–C8、S2、S3）与梯队 2（P1、P2、P3、P6）。
+#
+# 每一项都刻意构造成「修复前必然失败」的场景，而不是把实现复述一遍：
+# C1 用 9 个账号同时借用把旧的持锁阻塞逼出来；C2 用子类记录三个回调所在的
+# 线程；C6 让 4 条线程与 close() 抢写锁；P3 统计真实下发的 SQL 条数并与邮件数
+# 做对比。凡是「只断言函数被调用过」的写法在这里一律不用 —— 那种断言对回归
+# 毫无价值。
+
+
+def _qt_app():
+    """测试套件里获取 QApplication 的唯一入口（已存在就复用）。
+
+    一个进程只能有一个 QApplication，因此不能无条件新建；本组用例排在
+    第 31 组（UI 层）之后，正常情况下直接复用它的实例。
+    """
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication(sys.argv[:1])
+
+
+class _SilentMessageBox:
+    """把 `main_window` 里的 QMessageBox 换成一个「永远点确定」的替身。
+
+    驱动 `MainWindow._on_remove_account` 这类真实路径时，模态框会把测试挂住。
+    只替换 `main_window` 模块引用的那一个名字，别处不受影响。
+    """
+
+    Yes = 1
+    No = 0
+    Ok = 1
+
+    @staticmethod
+    def question(*_a, **_kw):
+        return _SilentMessageBox.Yes
+
+    @staticmethod
+    def information(*_a, **_kw):
+        return _SilentMessageBox.Ok
+
+    @staticmethod
+    def warning(*_a, **_kw):
+        return _SilentMessageBox.Ok
+
+    @staticmethod
+    def critical(*_a, **_kw):
+        return _SilentMessageBox.Ok
+
+
+def _make_window(ctx, app):
+    """构造一个不做启动定时任务的主窗口（与第 31 组同一套路）。"""
+    import unimail.ui.main_window as mwmod
+    import unimail.ui.settings as setmod
+    from unimail.ui.main_window import MainWindow
+    from unimail.ui.theme import ThemeManager
+
+    setmod.SETTINGS_PATH = Path(tempfile.mkdtemp(prefix="mwcfg_")) / "ui.json"
+    with patch.object(mwmod.MainWindow, "_initial_sync", lambda self: None), \
+            patch.object(mwmod.MainWindow, "_maybe_first_run",
+                         lambda self, auto=False: None):
+        win = MainWindow(ctx, setmod.UiSettings(theme_mode="dark"), ThemeManager("dark"))
+    win.resize(900, 620)
+    win.show()
+    app.processEvents()
+    win.reload_mails()
+    app.processEvents()
+    return win
+
+
+def _new_mail(ctx, account, uid: str, subject: str = "无正文", body: bool = False):
+    """写一封邮件（默认「有头部、没有正文」，用于驱动正文补拉）。"""
+    from unimail.core.models import NormalizedMail
+    return ctx.mails.mails.insert_mail(
+        account.id, account.platform,
+        NormalizedMail(uid=str(uid), subject=subject, from_addr="a@b.c",
+                       body_text=f"body {uid}" if body else None,
+                       date=datetime.now(timezone.utc)),
+    )
+
+
+# ------------------------------------------------------------ C1
+def test_session_pool_no_deadlock():
+    """C1：容量已满且全部在用，第 9 个账号必须**立刻**拿到连接，绝不能阻塞。
+
+    修复前 `_get_or_create` 在持有池锁的状态下 `semaphore.acquire()` 无条件等待，
+    而释放槽位的三条路径都要先拿同一把锁 —— 该线程永久阻塞，并连带把
+    `sweep()` / `close_account()` / `close_all()` 堵死（`Scheduler.tick` 在
+    主线程调 `sweep()`，表现为界面永久冻结、进程关不掉）。
+    """
+    from unimail.core.models import Account
+    from unimail.sync import session as sessmod
+
+    class _Imap:
+        pass
+
+    class _Adapter:
+        def connect(self, account, password):
+            return _Imap()
+
+        def disconnect(self, imap):
+            pass
+
+    pool = sessmod.SessionPool(max_sessions=8)
+    accounts = [Account(id=f"a{i}", platform="qq", email=f"a{i}@qq.com") for i in range(9)]
+
+    with patch.object(sessmod, "get_adapter", return_value=_Adapter()):
+        held = [pool.borrow(a, "pw") for a in accounts[:8]]
+        try:
+            for cm in held:
+                cm.__enter__()
+            check("8 个账号同时借用全部返回", pool.stats()["in_use"] == 8)
+
+            got: list[object] = []
+
+            def ninth() -> None:
+                with pool.borrow(accounts[8], "pw") as imap:
+                    got.append(imap)
+
+            t = threading.Thread(target=ninth, daemon=True)
+            t.start()
+            t.join(5.0)
+            check("全部在用时的第 9 个借用不被阻塞（旧实现会永久卡住）",
+                  not t.is_alive())
+            check("临时超额仍返回可用连接", len(got) == 1, f"实际 {len(got)}")
+            check("统计里记录了这次超额", int(pool.stats()["over_capacity"]) >= 1)
+            # 池锁必须已经释放：旧实现下这三个调用都会卡死
+            check("sweep() 仍能获取池锁", pool.sweep() == 0)
+            pool.close_account("a-does-not-exist")
+            check("close_account() 仍能获取池锁", True)
+        finally:
+            for cm in held:
+                cm.__exit__(None, None, None)
+
+    check("全部归还后会话数回落到上限", len(pool) <= 8, f"实际 {len(pool)}")
+    pool.close_all()
+    check("close_all() 后无残留会话", len(pool) == 0)
+
+
+# ------------------------------------------------------------ C2
+def test_worker_pool_callback_thread_affinity():
+    """C2：worker 的三个回调必须落在**主线程**，且迟到的旧回调不得误删新 worker。
+
+    修复前用 `worker.finished_ok.connect(lambda …)`：lambda 不是 QObject 的绑定
+    方法，Qt 无从判断接收者在哪个线程，于是在**发出信号的线程**（worker 线程）
+    里执行 —— 与主线程并发读写 `_workers`；并且 `_on_thread_done` 按 account_id
+    反查会拿到**新**的 worker 并把它 `deleteLater()`。
+    """
+    app = _qt_app()
+    main_tid = threading.current_thread().ident
+    _cfg, ctx, account = _make_sync_ctx("c2_")
+
+    from unimail.sync.worker import WorkerPool
+
+    class _SpyPool(WorkerPool):
+        """把三个回调换成「先记线程、再转交父类」的子类。
+
+        必须是**子类的绑定方法**才能被 Qt 当作真正的接收者；换成普通函数或
+        lambda 会连 `sender()` 都拿不到 —— 那正是原缺陷的形态。
+        """
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.records: list[tuple[str, int]] = []
+
+        def _on_success(self, account_id, _new_count=0):
+            self.records.append(("success", threading.current_thread().ident))
+            super()._on_success(account_id, _new_count)
+
+        def _on_failure(self, account_id, _message=""):
+            self.records.append(("failure", threading.current_thread().ident))
+            super()._on_failure(account_id, _message)
+
+        def _on_thread_done(self):
+            self.records.append(("done", threading.current_thread().ident))
+            super()._on_thread_done()
+
+    class _BrokenAdapter(_FakeAdapter):
+        def uid_validity(self, imap):
+            from unimail.platforms.base import ImapError
+            raise ImapError("模拟服务端拒答")
+
+    ok_adapter = _FakeAdapter(range(1, 5), validity=7)
+    bad_adapter = _BrokenAdapter([1])
+
+    pool = _SpyPool(ctx.accounts, ctx.mails.mails, ctx.accounts.cursors,
+                    ctx.security, ctx.bus, sessions=ctx.sessions)
+    try:
+        with _fake_server(ok_adapter):
+            check("派发同步成功", pool.dispatch(account) is True)
+            _drain(app, lambda: pool.running_count() == 0, timeout=10)
+            _drain(app, lambda: False, timeout=0.2)      # 让排队的回调全部落地
+            check("同步线程已退出", pool.running_count() == 0)
+            check("worker 已被摘除（回调确实执行了）", pool._workers == {})
+            kinds = {k for k, _ in pool.records}
+            check("成功与收尾回调都被触发", kinds == {"success", "done"}, f"实际 {kinds}")
+            check("成功回调在主线程执行",
+                  all(t == main_tid for k, t in pool.records if k == "success"))
+            check("线程收尾回调在主线程执行",
+                  all(t == main_tid for k, t in pool.records if k == "done"))
+
+            # ---- 身份校验：旧 worker 的迟到回调不得动到「已被取代」的新对象
+            old = _finished_worker(ctx, pool, account)
+            sentinel = object()
+            pool._workers[account.id] = sentinel        # 模拟新一轮任务已占位
+            old.finished_ok.emit(account.id, 0)         # 旧回调迟到
+            old.failed.emit(account.id, "旧任务失败")     # 旧失败回调迟到
+            _drain(app, lambda: pool._failures.get(account.id) is not None, timeout=0.3)
+            check("迟到的旧回调不会摘除被取代的 worker",
+                  pool._workers.get(account.id) is sentinel, f"实际 {pool._workers}")
+            check("迟到的旧失败回调不污染新一轮的退避状态",
+                  account.id not in pool._failures)
+            pool._workers.pop(account.id, None)
+            old.deleteLater()
+            app.processEvents()
+
+            # ---- 失败路径同样必须回主线程
+            with _fake_server(bad_adapter):
+                from unimail.core.models import AccountDraft
+                bad = ctx.accounts.add(AccountDraft(platform="qq",
+                                                    email="c2bad@qq.com", password="c"))
+                pool.dispatch(bad)
+                _drain(app, lambda: pool.running_count() == 0, timeout=10)
+                _drain(app, lambda: False, timeout=0.2)
+                failed_tids = [t for k, t in pool.records if k == "failure"]
+                check("失败回调在主线程执行",
+                      bool(failed_tids) and all(t == main_tid for t in failed_tids),
+                      f"实际 {failed_tids}")
+                check("失败被记入退避状态", bad.id in pool._failures)
+    finally:
+        pool.stop_all(timeout_ms=3000)
+        app.processEvents()
+    ctx.shutdown()
+
+
+def _drain(app, done, timeout: float = 5.0) -> None:
+    """跑事件循环直到 `done()` 为真（或超时），让排队中的信号回调落地。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if done():
+            return
+        time.sleep(0.005)
+
+
+def _finished_worker(ctx, pool, account):
+    """造一个「已结束但信号还能再发一次」的 worker，用于模拟迟到回调。
+
+    它复用调用处 `_fake_server` 已经生效的适配器替身，因此不再单独 patch。
+    """
+    from PySide6.QtCore import Qt
+
+    from unimail.sync.worker import SyncWorker
+    worker = SyncWorker(account, ctx.accounts, ctx.mails.mails,
+                        ctx.accounts.cursors, ctx.security, ctx.bus,
+                        sessions=ctx.sessions)
+    worker.finished_ok.connect(pool._on_success, Qt.QueuedConnection)
+    worker.failed.connect(pool._on_failure, Qt.QueuedConnection)
+    worker.run()          # 直接在测试线程里跑完，不 start()（不产生 finished）
+    return worker
+
+
+# ------------------------------------------------------------ C3
+def test_body_pool_recovers_after_quiesce():
+    """C3：`_quiesce()` → `_resume()` 之后，正文补拉必须仍然可用。
+
+    修复前 `_quiesce()` 调 `body_pool.stop_all()`，它会 `shutdown()` 线程池并
+    永久置 `_closed=True`，而 `_resume()` 只重启调度器 —— 于是改完主密码后
+    点开任何「无正文」邮件都静默失效（`_submit` 直接 return False），用户看到
+    的是列表有邮件、点开永远空白。
+    """
+    _cfg, ctx, account = _make_sync_ctx("c3_")
+    adapter = _FakeAdapter([1])
+    mid = _new_mail(ctx, account, "1")
+
+    with _fake_server(adapter):
+        check("构造了一封没有正文的邮件",
+              mid is not None and int(ctx.mails.mails.body_fetch_info(mid)["has_body"]) == 0)
+        check("正常路径可提交补拉", ctx.body_pool.request(mid) is True)
+        ctx.body_pool.cancel_running(timeout=3.0)
+
+        resume = ctx._quiesce()
+        check("维护窗口内 ctx.quiesced 为真", ctx.quiesced is True)
+        ctx._resume(resume)
+        check("维护窗口结束后恢复", ctx.quiesced is False)
+        check("维护窗口结束后线程池仍然可用", ctx.body_pool._closed is False)
+
+        # 清掉上一轮可能写入的正文，确保下面走的是真实提交路径
+        ctx.db.execute("UPDATE mails SET body_text = NULL, body_html = NULL WHERE id = ?",
+                       (mid,))
+        check("排空-恢复之后仍能提交补拉（旧实现会永久静默失败）",
+              ctx.body_pool.request(mid) is True)
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and ctx.body_pool.pending_count():
+            time.sleep(0.02)
+        row = ctx.mails.mails.body_fetch_info(mid)
+        check("补拉结果真的落库（线程池不是空转）", int(row["has_body"]) == 1)
+    ctx.shutdown()
+
+
+# ------------------------------------------------------------ C4
+def test_body_pool_container_locking():
+    """C4：`_futures` / `_requested` 的并发读写不能抛异常、不能计数错乱。
+
+    修复前这两个容器由主线程（`request/prefetch/stop_all`）与 executor 线程
+    （`add_done_callback` → `_finalize`）同时改，会抛
+    `RuntimeError: set/dict changed size during iteration`，或让同一封被重复
+    提交 / 永远停在「拉取中」。
+    """
+    _cfg, ctx, account = _make_sync_ctx("c4_")
+    mids = [m for m in (_new_mail(ctx, account, str(i), f"m{i}") for i in range(1, 81)) if m]
+    adapter = _FakeAdapter(range(1, 81))
+
+    errors: list[str] = []
+    with _fake_server(adapter):
+        def hammer(n: int) -> None:
+            try:
+                for i in range(40):
+                    ctx.body_pool.prefetch(mids, limit=4)
+                    ctx.body_pool.pending_count()
+                    ctx.body_pool.is_pending(mids[(n * 7 + i) % len(mids)])
+                    ctx.body_pool.request(mids[(n * 13 + i) % len(mids)])
+            except Exception as exc:  # noqa: BLE001 - 任何异常都要如实报出来
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=hammer, args=(i,), daemon=True) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        check("6 条线程并发提交/查询不抛异常", not errors, "; ".join(errors[:3]))
+
+        ctx.body_pool.cancel_running(timeout=10.0)
+        check("排空后 pending 登记为空", ctx.body_pool.pending_count() == 0)
+        check("排空后 futures 表为空", ctx.body_pool._futures == {})
+
+        # 计数不错乱：反复预取之后所有邮件最终都要拿到正文
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            ctx.body_pool.prefetch(mids, limit=8)
+            if not ctx.body_pool.pending_count():
+                break
+            time.sleep(0.05)
+        ctx.body_pool.cancel_running(timeout=10.0)
+        got = [r["id"] for r in ctx.db.query_all(
+            "SELECT id FROM mails WHERE body_text IS NOT NULL AND body_text <> ''")]
+        check("并发提交没有把任何一封漏掉（计数没错乱）",
+              len(set(got)) == len(mids), f"{len(set(got))}/{len(mids)}")
+    ctx.shutdown()
+
+
+# ------------------------------------------------------------ C5
+def test_counts_cache_thread_affinity():
+    """C5：计数缓存被后台线程作废 / 主线程读取，必须一致且不抛异常。
+
+    修复前 `invalidate_counts()` 由 `bus.sync_finished`（worker 线程发信号）
+    触发，而 lambda 没有 QObject 上下文 → 它在 worker 线程里改 `_counts_cache`
+    / `_counts_expires`，与主线程的 `_counts_snapshot()` 并发。
+    """
+    _cfg, ctx, account = _make_sync_ctx("c5_")
+    mids = [m for m in (_new_mail(ctx, account, str(i), f"m{i}") for i in range(1, 41)) if m]
+
+    errors: list[str] = []
+
+    def churn(n: int) -> None:
+        try:
+            for i in range(120):
+                if (i + n) % 3 == 0:
+                    ctx.mails.invalidate_counts()
+                else:
+                    ctx.mails.counts()
+                    ctx.mails.total_counts()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=churn, args=(i,), daemon=True) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    check("并发 invalidate/counts 不抛异常", not errors, "; ".join(errors[:3]))
+
+    # 作废之后必须重新算：否则「标为已读后未读数不变」会一直显示旧值
+    ctx.mails.invalidate_counts()
+    before = ctx.mails.counts()[account.id][1]
+    check("作废前未读数正确", before == len(mids), f"实际 {before}")
+    ctx.mails.mark_read_many(mids, True)
+    after = ctx.mails.counts()[account.id][1]
+    check("状态变更后计数缓存被正确作废（未读归零）", after == 0, f"实际 {after}")
+    check("总数仍然正确", ctx.mails.total_counts()[0] == len(mids))
+    ctx.shutdown()
+
+
+# ------------------------------------------------------------ C6
+def test_database_close_race():
+    """C6：`close()` 与并发写入交错时，不能出现驱动层的 «closed database»。
+
+    修复前 `close()` 不持写锁、`_new_connection()` 也不复查 `_closed`：
+    straggler 线程可以（1）在已关闭的库上继续写，抛
+    `ProgrammingError: Cannot operate on a closed database`（会被上层的宽泛
+    except 吞掉 → 静默丢数据）；（2）把新连接登记进已被换成空列表的 `_conns`，
+    这条连接永远不会被关闭（句柄泄漏）。
+    """
+    from unimail.core.security import SecurityService
+    from unimail.storage import Database, DatabaseError
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("c6_")
+    sec = SecurityService()
+    params = SecurityService.new_kdf_params()
+    db = Database(tmp / "c6.db", sec.setup("pw123456", params), encrypted=False)
+    db.execute("CREATE TABLE IF NOT EXISTS t (v INTEGER)")
+
+    errors: list[str] = []
+    stop = threading.Event()
+
+    def writer(n: int) -> None:
+        wrote = 0
+        while not stop.is_set() and wrote < 400:
+            wrote += 1
+            try:
+                db.execute("INSERT INTO t (v) VALUES (?)", (n * 1000 + wrote,))
+            except DatabaseError:
+                pass        # 关闭之后的**预期**错误：必须是这一种
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{type(exc).__name__}: {exc}")
+                return
+
+    threads = [threading.Thread(target=writer, args=(i,), daemon=True) for i in range(4)]
+    for t in threads:
+        t.start()
+    time.sleep(0.08)
+    db.close()
+    stop.set()
+    for t in threads:
+        t.join(10)
+    check("close() 与并发写入不会产生驱动层异常", not errors, "; ".join(errors[:2]))
+
+    try:
+        db.execute("INSERT INTO t (v) VALUES (1)")
+        check("关闭后写入被拒绝", False, "竟然写成功了")
+    except DatabaseError as exc:
+        check("关闭后写入给出可读错误（而不是 ProgrammingError）",
+              "关闭" in str(exc), f"实际 {exc}")
+    except Exception as exc:  # noqa: BLE001
+        check("关闭后写入给出可读错误（而不是 ProgrammingError）", False, repr(exc))
+    check("关闭后连接列表为空（无句柄泄漏）", db._conns == [])
+
+
+# ------------------------------------------------------------ C7
+def test_remove_account_waits_for_sync():
+    """C7：删除账号必须先取消并**等待**同步线程退出，不能留下孤儿邮件行。
+
+    `mails` 表对 `accounts` 没有外键，数据库层面拦不住「同步线程往一个刚被删掉
+    的账号里写整页数据」——那会留下永远不会被清理的行。
+    """
+    app = _qt_app()
+    import unimail.ui.main_window as mwmod
+    _cfg, ctx, account = _make_sync_ctx("c7_")
+
+    # 让同步「跑得够久」，删除动作才能落在它执行中间
+    adapter = _FakeAdapter(range(1, 801), validity=11)
+    adapter.delay = 0.25
+
+    win = _make_window(ctx, app)
+    with patch.object(mwmod, "QMessageBox", _SilentMessageBox):
+        try:
+            with _fake_server(adapter):
+                check("派发同步成功", ctx.pool.dispatch(account) is True)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and ctx.pool.running_count() == 0:
+                    app.processEvents()
+                    time.sleep(0.01)
+                check("删除时同步仍在跑", ctx.pool.running_count() >= 1)
+                win._on_remove_account(account.id)
+                app.processEvents()
+                check("同步线程已被取消并等到退出",
+                      ctx.pool.running_count() == 0, f"实际 {ctx.pool.running_count()}")
+                check("账号已从列表移除", ctx.accounts.get(account.id) is None)
+                orphans = int(ctx.db.scalar(
+                    "SELECT COUNT(*) FROM mails WHERE account_id = ?", (account.id,)) or 0)
+                check("删除账号后没有孤儿邮件行", orphans == 0, f"实际 {orphans} 行")
+                cursors = ctx.db.scalar(
+                    "SELECT COUNT(*) FROM sync_cursors WHERE account_id = ?", (account.id,))
+                check("删除账号后没有孤儿游标行", int(cursors or 0) == 0)
+        finally:
+            win.quit_app()
+            app.processEvents()
+
+
+# ------------------------------------------------------------ C8
+def test_body_fetch_limit_zero():
+    """C8：`fetch_body_limit=0` 必须是「不补正文」，不能变成「补全量」。
+
+    `new_pairs[-0:]` 等于 `new_pairs[0:]`，与配置语义正好相反 ——
+    设置里关掉自动补正文，反而触发全量逐封拉取。
+    """
+    from unimail.sync.worker import SyncWorker
+
+    _cfg, ctx, account = _make_sync_ctx("c8_")
+    adapter = _FakeAdapter(range(1, 31), validity=5)
+    worker = SyncWorker(account, ctx.accounts, ctx.mails.mails,
+                        ctx.accounts.cursors, ctx.security, ctx.bus,
+                        fetch_body_limit=0)
+    with patch("unimail.sync.worker.get_adapter", return_value=adapter):
+        worker.run()
+    check("limit=0 时一封正文都不补", adapter.body_fetches == [],
+          f"实际拉了 {len(adapter.body_fetches)} 封")
+    ctx.db.close()
+
+    # 对照组：limit=3 只补最后 3 封（证明上面的 0 不是「恰好没有数据」）
+    _cfg2, ctx2, account2 = _make_sync_ctx("c8b_")
+    adapter2 = _FakeAdapter(range(1, 31), validity=5)
+    worker2 = SyncWorker(account2, ctx2.accounts, ctx2.mails.mails,
+                         ctx2.accounts.cursors, ctx2.security, ctx2.bus,
+                         fetch_body_limit=3)
+    with patch("unimail.sync.worker.get_adapter", return_value=adapter2):
+        worker2.run()
+    check("limit=3 时只补最后 3 封", adapter2.body_fetches == [28, 29, 30],
+          f"实际 {adapter2.body_fetches}")
+    ctx2.db.close()
+
+
+# ------------------------------------------------------------ S2
+def test_unlock_guard_wallclock_and_clamp():
+    """S2：退避时间戳必须是墙钟，且异常值要被夹到上限。
+
+    单调钟的原点是开机时刻，落盘后交给下一个进程比较会得到「上一个开机周期的
+    tick 值」——重启电脑再打开应用，`remaining_wait()` 可能返回上万秒，
+    `_wait_with_ui` 会把用户按在一个数小时、无法关闭的倒计时里。
+    """
+    from unimail.config import UNLOCK_BACKOFF_MAX
+    from unimail.core.security import UnlockGuard
+
+    path = Path(tempfile.mkdtemp(prefix="guard_")) / "guard.json"
+
+    guard = UnlockGuard(path)
+    check("新文件初始无冷却", guard.remaining_wait() == 0)
+    delay = guard.record_failure()
+    check("失败一次进入冷却", guard.remaining_wait() > 0 and delay > 0)
+    check("退避状态已落盘", path.exists())
+    payload = json.loads(path.read_text("utf-8"))
+    # 落盘值必须能与**当前墙钟**直接比较（单调钟写出来的值会小几个数量级）
+    check("落盘时间戳是墙钟口径（与 time.time() 同量级）",
+          abs(float(payload["next_allowed"]) - time.time()) < 3600,
+          f"next_allowed={payload['next_allowed']}")
+    check("同一文件被新实例读到（跨进程不清零）", UnlockGuard(path).failures == 1)
+
+    # 人为写入一个「相对开机时刻」的历史遗留值：必须被夹到上限
+    path.write_text(json.dumps({"failures": 3, "next_allowed": time.time() + 10 ** 7}),
+                    "utf-8")
+    clamped = UnlockGuard(path)
+    wait = clamped.remaining_wait()
+    check("异常等待时间被夹到上限", 0 < wait <= UNLOCK_BACKOFF_MAX + 1,
+          f"实际 {wait:.0f} 秒（上限 {UNLOCK_BACKOFF_MAX}）")
+
+    clamped.reset()
+    check("reset 之后计数与冷却都清零",
+          clamped.failures == 0 and clamped.remaining_wait() == 0)
+    check("reset 已落盘（重开仍是 0）", UnlockGuard(path).failures == 0)
+
+
+# ------------------------------------------------------------ S3
+def test_lockscreen_backoff_shared_with_login():
+    """S3：锁屏必须与登录页共用同一份持久化退避，且成功解锁会清零。
+
+    此前锁屏完全没接 `UnlockGuard`：挂机时可以对主密码做无限次在线尝试，
+    每次都在 GUI 线程跑一遍 Argon2id（约 0.4 s）。
+    """
+    app = _qt_app()
+    from unimail.core.security import UnlockGuard
+    from unimail.ui import lockscreen as lockmod
+    from unimail.ui.lockscreen import LockOverlay
+
+    _cfg, ctx, _account = _make_sync_ctx("s3_")
+    guard_path = Path(tempfile.mkdtemp(prefix="s3guard_")) / "guard.json"
+
+    with patch.object(lockmod, "UnlockGuard", lambda: UnlockGuard(guard_path)):
+        overlay = LockOverlay(ctx)
+        try:
+            overlay.lock("测试")
+            app.processEvents()
+            check("锁屏初始可输入", overlay.password.isEnabled())
+
+            overlay.password.setText("wrong-password")
+            overlay._try_unlock()
+            app.processEvents()
+            check("失败后进入冷却（锁屏不再可无限尝试）",
+                  overlay._guard.remaining_wait() > 0)
+            check("冷却期间输入被禁用", not overlay.password.isEnabled())
+            check("退避状态写到登录页用的同一个文件", guard_path.exists())
+
+            failures = overlay._guard.failures
+            overlay.password.setText("wrong-password")
+            overlay._try_unlock()          # 冷却期内的尝试必须被直接挡回
+            app.processEvents()
+            check("冷却期内不再消耗一次校验", overlay._guard.failures == failures,
+                  f"实际 {overlay._guard.failures}")
+
+            # 模拟用户已经等完了冷却（只放行时间，不动失败计数）
+            overlay._guard._next_allowed = time.time() - 1
+            overlay._sync_cooldown()
+            app.processEvents()
+            check("冷却结束后恢复可输入", overlay.password.isEnabled())
+
+            overlay.password.setText("pw-1234567890")
+            overlay._try_unlock()
+            app.processEvents()
+            check("正确密码解锁成功", not overlay.isVisible())
+            check("解锁成功后失败计数清零", overlay._guard.failures == 0)
+            check("清零结果已落盘", UnlockGuard(guard_path).failures == 0)
+        finally:
+            overlay.deleteLater()
+            app.processEvents()
+    ctx.shutdown()
+
+
+# ------------------------------------------------------------ P1
+def test_io_off_main_thread():
+    """P1：网络 IO 必须在后台线程跑，期间主线程事件循环仍然可响应。
+
+    修复前附件下载 / 预览 / 内嵌图下载 / eml-mbox 导出 / 服务端批量删除全部在
+    GUI 线程同步执行，每条至少一次 IMAP 往返（`FETCH_TIMEOUT` 默认 30 秒）；
+    服务端一慢整窗冻住。原先靠 `processEvents()` 缓解，但它只是把一次长阻塞切成
+    很多次短阻塞，并且允许事件重入。
+    """
+    app = _qt_app()
+    main_tid = threading.current_thread().ident
+
+    from PySide6.QtCore import QTimer
+
+    from unimail.sync.body_fetcher import BodyFetchPool
+    from unimail.ui.io_runner import IoTaskRunner
+
+    pool = BodyFetchPool(MagicMock(), MagicMock(), MagicMock(), sessions=None)
+    runner = IoTaskRunner(pool)
+    try:
+        ticks: list[int] = []
+        timer = QTimer()
+        timer.setInterval(10)
+        timer.timeout.connect(lambda: ticks.append(1))
+        timer.start()
+
+        ready = threading.Event()
+        log: list[tuple] = []
+
+        def slow_work():
+            ready.set()
+            time.sleep(0.6)          # 模拟一次慢往返
+            return "payload"
+
+        def on_done(result, error):
+            log.append((result, error, threading.current_thread().ident))
+
+        check("后台任务已提交", runner.submit(slow_work, on_done) is True)
+        ready.wait(2.0)
+        start = time.monotonic()
+        while time.monotonic() - start < 2.0 and not log:
+            app.processEvents()
+            time.sleep(0.005)
+        timer.stop()
+
+        check("后台任务完成后回投了结果", len(log) == 1, f"实际 {len(log)}")
+        check("结果与异常都正确回投", log[0][0] == "payload" and log[0][1] is None)
+        check("回调在主线程执行", log[0][2] == main_tid)
+        # 事件循环能持续打点 → 主线程在这 0.6 秒里没有被阻塞
+        check("IO 期间主线程事件循环仍在打点（界面不会冻住）",
+              len(ticks) >= 20, f"实际 {len(ticks)} 次")
+
+        # ---- 同 key 去重：连点两次不该真的下载两遍
+        gate = threading.Event()
+        seen: list[object] = []
+        check("首次提交返回 True",
+              runner.submit(lambda: (gate.wait(3.0), "a")[1],
+                            lambda r, e: seen.append(r), key="attach:x") is True)
+        check("同一 key 在飞行中重复提交被忽略",
+              runner.submit(lambda: "b", lambda r, e: seen.append(r),
+                            key="attach:x") is False)
+        gate.set()
+        for _ in range(200):
+            app.processEvents()
+            time.sleep(0.005)
+            if seen:
+                break
+        check("去重不影响第一次的结果回投", seen == ["a"], f"实际 {seen}")
+
+        # ---- 异常路径：后台抛出的异常必须原样交回主线程
+        errs: list[object] = []
+        runner.submit(lambda: (_ for _ in ()).throw(ValueError("后台出错")),
+                      lambda r, e: errs.append(e))
+        for _ in range(200):
+            app.processEvents()
+            time.sleep(0.005)
+            if errs:
+                break
+        check("后台异常被交回主线程（不会被 Qt 静默吞掉）",
+              len(errs) == 1 and isinstance(errs[0], ValueError), f"实际 {errs}")
+
+        # ---- 退出流程：stop() 之后不再受理新任务，也不再回投已提交的结果
+        gate2 = threading.Event()
+        runner.submit(lambda: (gate2.wait(3.0), "late")[1],
+                      lambda r, e: seen.append("late"), key="late")
+        runner.stop()
+        gate2.set()
+        for _ in range(100):
+            app.processEvents()
+            time.sleep(0.005)
+        check("stop() 之后不再回投结果（退出时不会弹窗卡住）",
+              "late" not in seen, f"实际 {seen}")
+        check("stop() 之后不再受理新任务",
+              runner.submit(lambda: "c", lambda r, e: seen.append(r)) is False)
+    finally:
+        pool.shutdown(timeout=2.0)
+
+
+# ------------------------------------------------------------ P2
+def test_fetch_headers_many_protocol():
+    """P2：一页 200 封必须用逗号集合批量 FETCH，而不是 200 次逐封往返。
+
+    同时钉住三条契约：分片不超过 `HEADER_FETCH_CHUNK`、imaplib 的
+    `(前缀, 字面量)` 二元组形状要能解析、批量没拿到的 UID 要逐封回退且最终缺失
+    即代表失败（调用方据此不推进游标）。
+    """
+    from unimail.platforms.base import ImapAdapter
+
+    class _HeaderImap:
+        """只记录 `UID FETCH` 并回吐头部的假连接（刻意不用 MagicMock）。"""
+
+        def __init__(self, headers: dict[str, bytes], blind_batch: bool = False):
+            self.headers = headers
+            self.blind_batch = blind_batch
+            self.commands: list[tuple] = []
+
+        def select(self, folder, readonly=False):
+            return ("OK", [b""])
+
+        def uid(self, command, *args):
+            self.commands.append((command, args))
+            if command != "FETCH":
+                return ("OK", [b""])
+            spec = args[0]
+            if "," in spec and self.blind_batch:
+                # 少数服务器不支持多 UID 集合：应答里不回带任何字面量
+                return ("OK", [b""])
+            out = []
+            for u in spec.split(","):
+                body = self.headers.get(u)
+                if body is None:
+                    continue
+                out.append((f"{u} (UID {u} BODY[HEADER] {{{len(body)}}}".encode(), body))
+            return ("OK", out)
+
+    def header(u: str) -> bytes:
+        return (f"Subject: mail {u}\r\nFrom: a@b.c\r\n"
+                "Date: Thu, 01 Jan 2026 00:00:00 +0000\r\n\r\n").encode()
+
+    adapter = ImapAdapter()
+    uids = [str(i) for i in range(1, 201)]
+    headers = {u: header(u) for u in uids}
+
+    imap = _HeaderImap(headers)
+    got = adapter.fetch_headers_many(imap, uids, "INBOX")
+    fetches = [c for c in imap.commands if c[0] == "FETCH"]
+    check("一页 200 封只发 4 次 UID FETCH（而不是 200 次）",
+          len(fetches) == 4, f"实际 {len(fetches)} 次")
+    check("每片 UID 数不超过分片上限",
+          all(len(c[1][0].split(",")) <= adapter.HEADER_FETCH_CHUNK for c in fetches))
+    check("逗号集合按顺序覆盖全部 UID",
+          [u for c in fetches for u in c[1][0].split(",")] == uids)
+    check("批量应答全部解析回填",
+          len(got) == 200 and got["7"].subject == "mail 7", f"实际 {len(got)} 封")
+
+    # 服务器完全不支持批量 → 逐封回退，结果不能少
+    imap2 = _HeaderImap(headers, blind_batch=True)
+    got2 = adapter.fetch_headers_many(imap2, uids[:10], "INBOX")
+    check("服务器不回带 UID 时逐封回退补齐", len(got2) == 10, f"实际 {len(got2)}")
+
+    # 应答里缺失的 UID：回退也失败 → 不出现在结果里（调用方据此停住游标）
+    imap3 = _HeaderImap({u: header(u) for u in uids[:10]})
+    imap3.headers.pop("3")
+    imap3.headers.pop("4")
+    got3 = adapter.fetch_headers_many(imap3, uids[:10], "INBOX")
+    check("取不到的 UID 不出现在结果里（缺失即失败）",
+          len(got3) == 8 and "3" not in got3 and "4" not in got3,
+          f"实际 {sorted(got3)}")
+
+
+# ------------------------------------------------------------ P3
+class _CountingConn:
+    """包一层 sqlite 连接，只统计真正下发的 SQL 条数。"""
+
+    def __init__(self, conn, counter: list):
+        self._conn = conn
+        self._counter = counter
+
+    def execute(self, *a, **kw):
+        self._counter[0] += 1
+        return self._conn.execute(*a, **kw)
+
+    def executemany(self, *a, **kw):
+        self._counter[0] += 1
+        return self._conn.executemany(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_bulk_flags_sql_is_constant():
+    """P3：批量标已读 / 批量删除的 SQL 条数必须与邮件数无关。
+
+    修复前 `mark_all_read()` 对每封各一次 `mail_context` 查询加一次队列写入，
+    5000 封 ≈ 1.5 万条串行 SQLite 操作，全压在同一条线程上。
+    """
+    from unimail.core.models import MailFilter
+
+    _cfg, ctx, account = _make_sync_ctx("p3_")
+    ctx.mails.sync_server_flags = True
+
+    def count_sql(fn) -> int:
+        counter = [0]
+        real = ctx.db._conn
+        with patch.object(ctx.db, "_conn", lambda: _CountingConn(real(), counter)):
+            fn()
+        return counter[0]
+
+    small_ids = [m for m in (_new_mail(ctx, account, str(i), f"m{i}")
+                             for i in range(1, 6)) if m]
+    small = count_sql(lambda: ctx.mails.mark_all_read(account.id))
+    check("小批量确实入了队列（否则下面的条数对比没有意义）",
+          ctx.mails.pending_flag_count(account.id) == len(small_ids),
+          f"实际 {ctx.mails.pending_flag_count(account.id)}")
+
+    big_ids = [m for m in (_new_mail(ctx, account, str(i), f"m{i}")
+                           for i in range(100, 220)) if m]
+    big = count_sql(lambda: ctx.mails.mark_all_read(account.id))
+    check("120 封也全部入队",
+          ctx.mails.pending_flag_count(account.id) == len(small_ids) + len(big_ids))
+    check("标已读的 SQL 条数不随邮件数增长",
+          abs(big - small) <= 4, f"5 封 {small} 条 vs 120 封 {big} 条")
+    check("标已读的 SQL 条数是常数级", big <= 16, f"实际 {big} 条")
+
+    # 批量删除的本地清理同样是批量：条数不应随封数线性增长
+    all_ids = [m.id for m in ctx.mails.mails.query_summaries(
+        MailFilter(account_id=account.id, limit=1000))]
+    many_del = count_sql(lambda: ctx.mails.delete_many(all_ids))
+    check("批量删除本地的 SQL 条数同样是常数级",
+          many_del <= 12, f"实际 {many_del} 条（{len(all_ids)} 封）")
+    ctx.shutdown()
+
+
+# ------------------------------------------------------------ P6
+def test_sqlite_mmap_enabled():
+    """P6：连接建好之后必须带上 `PRAGMA mmap_size`。
+
+    万级邮件库的随机读（列表滚动、会话展开）靠它少走一次 copy；其余 PRAGMA
+    都已就位，唯独漏了这一条。
+    """
+    from unimail.config import DB_MMAP_BYTES
+    from unimail.core.security import SecurityService
+    from unimail.storage import Database
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("p6_")
+    sec = SecurityService()
+    params = SecurityService.new_kdf_params()
+    db = Database(tmp / "p6.db", sec.setup("pw123456", params), encrypted=False)
+    value = int(db.scalar("PRAGMA mmap_size") or 0)
+    check("mmap_size 非 0", value != 0, f"实际 {value}")
+    check("mmap_size 与配置一致", value == DB_MMAP_BYTES,
+          f"实际 {value}，期望 {DB_MMAP_BYTES}")
+    db.close()
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -2984,6 +3901,21 @@ SUITES = [
     # ---- 第五批（删除语义与服务端删除）
     ("删除语义与服务端删除", test_server_side_delete),
     ("代码签名参数拼装", test_build_signing_args),
+    # ---- 第六批（v1.6.1 并发与性能回归：梯队 1 + 梯队 2）
+    ("C1 会话池不再持锁阻塞", test_session_pool_no_deadlock),
+    ("C2 worker 回调线程归属与身份校验", test_worker_pool_callback_thread_affinity),
+    ("C3 补拉池排空后可恢复", test_body_pool_recovers_after_quiesce),
+    ("C4 补拉池容器加锁", test_body_pool_container_locking),
+    ("C5 计数缓存线程归属", test_counts_cache_thread_affinity),
+    ("C6 数据库关闭竞态", test_database_close_race),
+    ("C7 删账号先取消并等待同步", test_remove_account_waits_for_sync),
+    ("C8 fetch_body_limit=0 不补正文", test_body_fetch_limit_zero),
+    ("S2 退避改墙钟并钳制异常值", test_unlock_guard_wallclock_and_clamp),
+    ("S3 锁屏共用持久化退避", test_lockscreen_backoff_shared_with_login),
+    ("P1 网络 IO 移出 GUI 线程", test_io_off_main_thread),
+    ("P2 批量 UID FETCH 邮件头", test_fetch_headers_many_protocol),
+    ("P3 批量标记 SQL 条数恒定", test_bulk_flags_sql_is_constant),
+    ("P6 SQLite mmap_size 生效", test_sqlite_mmap_enabled),
 ]
 
 
