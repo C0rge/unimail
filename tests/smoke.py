@@ -3961,13 +3961,33 @@ def main() -> int:
     # 同一台机器 git-bash 报 0、PowerShell 报 0xC0000005、CI 报 1）。
     # 所有断言已经跑完、输出已经落盘，清理毫无意义——Windows 上直接
     # TerminateProcess 自身：不执行 DLL 卸载通知，退出码原样送达父进程。
+    #
+    # argtypes / restype 必须显式声明，这段代码此前就是栽在这上面：
+    # ctypes 对未声明原型的函数一律按 c_int 处理，而 x64 上
+    # GetCurrentProcess() 返回的伪句柄是 0xFFFFFFFFFFFFFFFF（全 1），
+    # 按 c_int 读出来是 -1，再按 c_int 传回去时 libffi 只写寄存器的
+    # 低 32 位、高 32 位未定义，TerminateProcess 于是静默失败
+    # （返回 0，连 GetLastError 都是 0），进程照样走 os._exit() 那条会
+    # 触发 DLL 卸载崩溃的路。实测两种写法：
+    #   默认原型 → TerminateProcess 返回 0、进程存活（退出码由 os._exit 决定）
+    #   显式原型 → 进程立刻以指定退出码结束
+    # 本机之所以多年看起来正常，只是因为本机 Qt 的 DLL 卸载恰好不崩，
+    # 把这个问题掩盖了；CI 的 Windows runner 上就崩成 exit code 1。
     sys.stdout.flush()
     sys.stderr.flush()
     if sys.platform == "win32":
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.TerminateProcess.restype = ctypes.c_int
+        if not kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code):
+            # 走到这里说明进程没被终止。如实说出来，不要静默退回 ——
+            # 静默退回正是这个问题长期存在的原因。
+            print(f"[warn] TerminateProcess 失败 err={ctypes.get_last_error()}；"
+                  "退回 os._exit，退出码可能被 DLL 卸载崩溃覆盖", file=sys.stderr)
+            sys.stderr.flush()
     os._exit(code)
 
 
