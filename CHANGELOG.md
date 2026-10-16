@@ -114,6 +114,13 @@ SOCKS5 与 HTTP CONNECT 均手写握手）。
 - 移除 `config.py` 里从未被读取的 `PROXY` 常量。代理在**连接时**由
   `resolve_proxy()` 直接读环境变量；模块导入时的快照会让测试 patch 环境变量失效，
   也让 `auto` 无法反映运行中途改过的系统设置——两份事实源迟早会漂移。
+- 修正 `proxy.py` 中 `winreg` 的**平台相关类型问题**：typeshed 只在 Windows 上
+  声明 `winreg` 的属性，在 Linux 上它是个空模块，于是 `winreg.OpenKey` /
+  `HKEY_CURRENT_USER` / `QueryValueEx` 会被判成 `attr-defined`——而这段代码在
+  Linux 上根本不会执行（调用方先判了 `sys.platform`）。症状是**本地（Windows）
+  mypy 全绿、CI（ubuntu）报 4 条错**。修法是在唯一的入口 `_windows_registry()`
+  处把模块收敛成 `Any`，而不是逐行挂 `# type: ignore`：让 Windows 与 Linux 上的
+  类型检查结论一致。发布检查清单同步补上「mypy 必须按 CI 的平台跑」这条要求。
 
 ### 🧪 测试
 

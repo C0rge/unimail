@@ -46,6 +46,7 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import unquote
 
 log = logging.getLogger(__name__)
@@ -280,6 +281,24 @@ def _read_system_proxy() -> ProxyConfig | None:
         return None
 
 
+def _windows_registry() -> Any:
+    """取 `winreg` 模块。返回 `Any` 而不是模块类型，理由如下。
+
+    typeshed **只在 Windows 上**声明 winreg 的属性：在 Linux / macOS 上它是一个
+    **空模块**，于是 `winreg.OpenKey(...)`、`winreg.HKEY_CURRENT_USER` 这类访问
+    在 ubuntu 上（也就是本仓库 CI 的类型检查环境）会被判成 `attr-defined`，而这段
+    代码在那两个平台上根本不会被执行——调用方 `system_proxy()` 先判了 `sys.platform`。
+
+    与其在每一行挂 `# type: ignore`，不如在这唯一的入口处收敛成 `Any`：
+    类型检查在这个薄封装上让一步，换掉四条平台相关的噪音，并且让
+    **Windows 与 Linux 上的 mypy 结论一致**（否则本地过、CI 红，只有推到远端
+    才会发现）。
+    """
+    import winreg
+
+    return winreg
+
+
 def _read_windows_proxy() -> ProxyConfig | None:
     """Windows：`HKCU\\...\\Internet Settings`。
 
@@ -288,13 +307,13 @@ def _read_windows_proxy() -> ProxyConfig | None:
     任意端口，不会在 993 上被拒），其次 `https=`/`http=` —— 后者要求代理允许
     CONNECT 到非 443 端口，Clash / V2Ray 这类客户端默认允许。
     """
-    import winreg
+    reg = _windows_registry()
     path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
-        enabled = _reg_int(key, "ProxyEnable")
+    with reg.OpenKey(reg.HKEY_CURRENT_USER, path) as key:
+        enabled = _reg_int(reg, key, "ProxyEnable")
         if not enabled:
             return None
-        server = _reg_str(key, "ProxyServer")
+        server = _reg_str(reg, key, "ProxyServer")
     if not server:
         return None
     segmented: dict[str, str] = {}
@@ -313,18 +332,16 @@ def _read_windows_proxy() -> ProxyConfig | None:
     return parse_proxy(f"{scheme}://{raw}")
 
 
-def _reg_int(key, name: str) -> int:
-    import winreg
+def _reg_int(reg: Any, key: Any, name: str) -> int:
     try:
-        return int(winreg.QueryValueEx(key, name)[0])
+        return int(reg.QueryValueEx(key, name)[0])
     except (FileNotFoundError, ValueError, OSError):
         return 0
 
 
-def _reg_str(key, name: str) -> str:
-    import winreg
+def _reg_str(reg: Any, key: Any, name: str) -> str:
     try:
-        return str(winreg.QueryValueEx(key, name)[0] or "").strip()
+        return str(reg.QueryValueEx(key, name)[0] or "").strip()
     except (FileNotFoundError, ValueError, OSError):
         return ""
 
