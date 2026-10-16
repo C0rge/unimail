@@ -1,9 +1,63 @@
-# 工程基线配置（lint / 类型 / 测试）。
+# 工程基线配置（打包元数据 / lint / 类型 / 测试）。
 #
-# 这里**只放工具配置**，不声明 [project]：UniMail 是一个应用（由 main.py 启动、
-# 用 PyInstaller 打包），不是一个需要 pip install 的分发包。运行依赖仍以
-# requirements.txt 为唯一事实源，开发依赖见 requirements-dev.txt。
-# 这样避免出现「两份依赖声明互相漂移」的经典问题。
+# 依赖与版本号的**唯一事实源**仍然是 requirements*.txt 与 unimail/config.py：
+# 下面的 [project] 一律用 dynamic 从这两处取值，不在 pyproject 里重复声明，
+# 因此不会出现「两份声明互相漂移」的经典问题。
+#
+# 为什么注册 [project]：UniMail 本体是一个应用（由 main.py 启动、用 PyInstaller
+# 打包），但注册元数据后 `pip install -e .` 可以一键装齐运行依赖、外部工具也能
+# 读到包元数据。这里**刻意不暴露 console script**：根目录的 main.py 若注册为
+# py-module，会往 site-packages 里塞一个通用名 `main`，命名污染的风险大于收益。
+# 启动方式仍然是 `python main.py`。
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unimail"
+dynamic = ["version", "dependencies"]
+description = "多平台邮箱统一管理程序：统一收件箱 + 本地加密存储"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "C0rge" }]
+keywords = ["email", "imap", "desktop", "pyside6", "mail-client", "unified-inbox"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email :: Email Clients (MUA)",
+]
+
+[project.urls]
+Homepage = "https://github.com/C0rge/unimail"
+Repository = "https://github.com/C0rge/unimail"
+Changelog = "https://github.com/C0rge/unimail/blob/main/CHANGELOG.md"
+Releases = "https://github.com/C0rge/unimail/releases"
+
+[tool.setuptools.dynamic]
+# 版本号取自代码里的单一常量（unimail/config.py），不是另写一遍。
+version = { attr = "unimail.config.APP_VERSION" }
+# 运行依赖直接读 requirements.txt —— 它仍是唯一事实源。
+dependencies = { file = ["requirements.txt"] }
+#
+# 开发依赖**刻意不在这里声明**：requirements-dev.txt 用了 `-r requirements.txt`
+# 这种标准包含写法，而 setuptools 的 `{ file = [...] }` 不支持 `-r` 展开
+# （会报 "Expected package name at the start of dependency specifier"）。
+# 想声明 dev extras 就只能把依赖再抄一遍，正好是文件头批评的那种漂移。
+# 因此开发环境仍然按 README 走 `pip install -r requirements-dev.txt`。
+
+[tool.setuptools.packages.find]
+# 显式指定，避免 flat-layout 自动发现把 tests/ 等目录也算成顶层包而报错。
+include = ["unimail*"]
 
 # ---------------------------------------------------------------- 代码风格
 [tool.ruff]

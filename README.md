@@ -68,7 +68,8 @@ python main.py --theme light
 ## 测试
 
 ```bash
-# 核心层 + UI 层回归套件：31 组、427 项断言
+# 核心层 + UI 层回归套件：32 组、424~427 项断言
+# （断言数随环境浮动 3 项：装了 sqlcipher3 为 427 项，未装为 424 项）
 python tests/smoke.py
 ```
 
@@ -88,6 +89,10 @@ mypy                    # 类型检查
 pip-audit -r requirements.txt   # 依赖漏洞扫描
 ```
 
+`pyproject.toml` 已注册打包元数据，也可以直接 `pip install -e .` 一键装齐运行依赖
+（版本号取自 `unimail/config.py`、依赖直读 `requirements.txt`，不在第二处重复声明）。
+应用入口仍然是 `python main.py`。
+
 ## 目录结构
 
 ```text
@@ -96,9 +101,10 @@ unimail/
 ├── requirements.txt         # 运行依赖（含 SQLCipher 驱动）
 ├── requirements-dev.txt     # 开发/CI 依赖
 ├── requirements.lock        # 已验证的版本组合
-├── pyproject.toml           # ruff / mypy / pytest 配置
+├── pyproject.toml           # 打包元数据（版本/依赖走 dynamic）+ ruff/mypy/pytest
 ├── .github/workflows/ci.yml # CI：lint + 类型检查 + 双环境测试 + 漏洞扫描
 ├── docs/架构设计.md          # 完整架构设计文档
+├── docs/发布规范.md          # 版本号来源 / tag 约定 / 发版检查清单
 ├── tests/smoke.py           # 核心层回归套件
 └── unimail/
     ├── config.py            # 平台配置 / 路径 / 安全参数
