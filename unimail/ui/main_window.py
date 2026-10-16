@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
         bar.addPermanentWidget(self.encryption_label)
         self.setStatusBar(bar)
         self._refresh_security_labels()
+        self._refresh_delete_label()
 
         self.detail_panel.inline_resolver = self._resolve_inline
         self.detail_panel.inline_missing = self._inline_missing
@@ -282,6 +283,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
 
         self.ctx.mails.sync_server_flags = self.settings.sync_server_flags
+        self._refresh_delete_label()
         self.detail_panel.auto_inline = self.settings.inline_images_auto
         if self.settings.view_mode != self._view_mode:
             self._view_mode = self.settings.view_mode
@@ -434,6 +436,17 @@ class MainWindow(QMainWindow):
             self.tray.set_unread(total[1],
                                  [(a.label, counts.get(a.id, (0, 0))[1]) for a in accounts])
         self._refresh_security_labels()
+
+    def _refresh_delete_label(self) -> None:
+        """让删除菜单的文案与真实行为一致。
+
+        默认行为是「只删本机副本」，菜单就必须这么写——否则用户会以为
+        服务器上的邮件也没了。开启服务器删除后，文案要相应改成「移入
+        服务器垃圾箱」，同样是因为两者后果完全不同。
+        """
+        label = ("删除（移入服务器垃圾箱）" if self._delete_uses_server()
+                 else "删除本地副本")
+        self.inbox_panel.set_delete_label(label)
 
     def _refresh_security_labels(self) -> None:
         level = self.ctx.db.encryption_level if self.ctx.db else ""
@@ -784,24 +797,66 @@ class MainWindow(QMainWindow):
     def _on_delete_mail(self, mail_id: str) -> None:
         self._on_delete_many(self._selected_or(mail_id))
 
+    def _delete_uses_server(self) -> bool:
+        return bool(getattr(self.settings, "delete_on_server", False))
+
     def _on_delete_many(self, mail_ids: list[str]) -> None:
         if not mail_ids:
             return
-        if len(mail_ids) > 1:
+        on_server = self._delete_uses_server()
+        # 单封「删除本地副本」沿用旧行为、不再二次确认（与常见邮件客户端一致）；
+        # 一旦涉及服务器则**无论封数**都要确认——那是本程序撤销不了的动作。
+        if on_server or len(mail_ids) > 1:
+            if on_server:
+                title = "移入服务器垃圾箱"
+                body = (f"确定把选中的 {len(mail_ids)} 封邮件移入服务器垃圾箱吗？\n\n"
+                        "邮件会先被移进垃圾箱（可在垃圾箱里恢复），随后移除本机副本。\n"
+                        "若服务器拒绝或网络失败，本机副本会**保持不变**。")
+            else:
+                title = "删除本地副本"
+                body = (f"确定删除选中的 {len(mail_ids)} 封邮件吗？\n\n"
+                        "只删除本机副本，服务器上的邮件不受影响。\n"
+                        "注意：重置同步或换设备后，这些邮件会重新出现。\n"
+                        "（可在设置 → 行为中开启「同时移入服务器垃圾箱」）")
             ret = QMessageBox.question(
-                self, "删除本地副本",
-                f"确定删除选中的 {len(mail_ids)} 封邮件吗？\n\n"
-                "只删除本机副本，服务器上的邮件不受影响。",
+                self, title, body,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if ret != QMessageBox.Yes:
                 return
-        self.ctx.mails.delete_many(mail_ids)
+
+        if not on_server:
+            self.ctx.mails.delete_many(mail_ids)
+            self._after_delete(mail_ids)
+            self.set_status(f"已删除 {len(mail_ids)} 封本地副本（服务器邮件不受影响）")
+            return
+
+        result = self.ctx.mails.delete_many(mail_ids, on_server=True)
+        self._after_delete(result.removed_ids)
+        if result.failed:
+            # 失败的必须逐条说出来：只报「删了 N 封」会让用户以为整批都成功了，
+            # 而这批里恰恰有几封还留在服务器上。
+            shown = "\n".join(f"· {reason}" for _mid, reason in result.failed[:3])
+            more = "" if len(result.failed) <= 3 else \
+                f"\n（另有 {len(result.failed) - 3} 封同类失败）"
+            QMessageBox.warning(
+                self, "部分邮件未能删除",
+                f"已移入垃圾箱：{result.removed} 封\n"
+                f"失败：{len(result.failed)} 封（本机副本保持不变）\n\n{shown}{more}",
+            )
+            self.set_status(
+                f"已移入垃圾箱 {result.removed} 封，{len(result.failed)} 封失败（本机副本未动）")
+        else:
+            self.set_status(f"已把 {result.removed} 封邮件移入服务器垃圾箱并删除本机副本")
+
+    def _after_delete(self, mail_ids: list[str]) -> None:
+        if not mail_ids:
+            return
         self.inbox_panel.remove_mails(mail_ids)
-        if self.detail_panel._mail is not None and self.detail_panel._mail.id in mail_ids:  # noqa: SLF001
+        current = self.detail_panel._mail  # noqa: SLF001
+        if current is not None and current.id in mail_ids:
             self.detail_panel.clear()
         self.refresh_accounts()
-        self.set_status(f"已删除 {len(mail_ids)} 封本地副本（服务器邮件不受影响）")
 
     def _refresh_rows(self, mail_ids: list[str]) -> None:
         summaries = self.ctx.mails.summaries_by_ids(mail_ids)

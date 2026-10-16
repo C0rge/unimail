@@ -5,11 +5,14 @@
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import imaplib
 import logging
+import re
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
 from ..core.models import Account, NormalizedMail
@@ -20,6 +23,18 @@ log = logging.getLogger(__name__)
 # 大邮件头：imaplib 默认单行上限仅 10 KB，长 References / 长主题会被静默截断。
 # `_MAXLINE` 是 CPython 有意暴露的模块级开关，只能直接改模块属性。
 imaplib._MAXLINE = 10_000_000  # type: ignore[attr-defined]  # noqa: SLF001
+
+# LIST 响应形如 `(\HasNoChildren \Trash) "/" "Deleted Messages"`。
+# 分隔符可能是 `NIL` 或 `.`，文件夹名可能带引号，也可能是 163 那种中文名，
+# 因此不能沿用 `split(' "/" ')`（该写法在 `[Gmail]/Trash` 与中文名上都不稳）。
+_LIST_LINE_RE = re.compile(
+    r'^\((?P<flags>[^)]*)\)\s+(?P<delim>"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.+)$'
+)
+
+# RFC 3501 ATOM-CHAR 排除的字符：括号、花括号、空格、CTL、
+# 列表通配符（% *）、引号类（" \）、响应特殊字符（]）。
+# 含这些字符的邮箱名必须写成带引号的字符串形式。
+_ATOM_UNSAFE = set('(){"\\]%*') | {chr(c) for c in range(0x21)} | {chr(0x7F)}
 
 
 def tls_context(allow_invalid: bool = False) -> ssl.SSLContext:
@@ -42,6 +57,95 @@ def tls_context(allow_invalid: bool = False) -> ssl.SSLContext:
     return ctx
 
 
+def utf7_encode(name: str) -> str:
+    r"""把文件夹名编成 **IMAP 修改版 UTF-7**（RFC 3501 §5.1.3）。
+
+    为什么不能直接用 `str.encode("utf-7")`：Python 内置的 `utf-7` 编解码器
+    用 `+/` 表示 Base64 位移，而 IMAP 的修改版规定用 `+,` 且省略补位的 `=`。
+    两者**不兼容**——把内置编解码器的结果发给服务器，163 / QQ 的中文文件夹名
+    会直接报 `NO Invalid mailbox name`。
+
+    两个易错点：位移字符是 `+`（不是 `&`）；字面量 `&` 与 `+` 分别要写成
+    `&-` 与 `+-`，否则解码方会把它们当位移序列的起始。
+    """
+    out: list[str] = []
+    buf: list[bytes] = []
+
+    def flush() -> None:
+        if buf:
+            b64 = base64.b64encode(b"".join(buf)).rstrip(b"=").decode("ascii")
+            out.append("+" + b64.replace("/", ",") + "-")
+            buf.clear()
+
+    for ch in name:
+        if ch == "&":
+            flush()
+            out.append("&-")
+        elif ch == "+":
+            flush()
+            out.append("+-")
+        elif 0x20 <= ord(ch) <= 0x7E:
+            flush()
+            out.append(ch)
+        else:
+            buf.append(ch.encode("utf-16-be"))
+    flush()
+    return "".join(out)
+
+
+def utf7_decode(name: str) -> str:
+    """解码 IMAP 修改版 UTF-7（`utf7_encode` 的逆运算）。
+
+    同样不能用内置的 `utf-7` 解码器：内置版认 `+/`，而协议用 `+,`，
+    直接喂给内置解码器会把 QQ / 163 的中文文件夹名解成乱码。
+    遇到解不开的片段**原样保留**——猜错编码比留一段怪字符更难排查。
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(name):
+        char = name[index]
+        if char == "&":
+            # `&-` 表示字面量 `&`；孤立的 `&`（畸形输入）也按字面量处理。
+            out.append("&")
+            index += 2 if name.startswith("&-", index) else 1
+            continue
+        if char != "+":
+            out.append(char)
+            index += 1
+            continue
+        end = name.find("-", index + 1)
+        if end == -1:
+            # 位移序列没有收尾的 `-`：原样保留，不猜。
+            out.append(name[index:])
+            break
+        chunk = name[index + 1:end]
+        if not chunk:
+            out.append("+")          # `+-` 是字面量 `+`
+        else:
+            padded = chunk.replace(",", "/")
+            padded += "=" * (-len(padded) % 4)
+            try:
+                out.append(base64.b64decode(padded, validate=True).decode("utf-16-be"))
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                out.append(name[index:end + 1])
+        index = end + 1
+    return "".join(out)
+
+
+def encode_mailbox(name: str) -> str:
+    """把文件夹名编成可**直接拼进 IMAP 命令**的形式。
+
+    含非 ASCII（163 / QQ 的中文文件夹名）或含 `]`（`[Gmail]/Trash`）时，
+    必须先转修改版 UTF-7 或退化为带引号的字符串，否则命令要么编码出错、
+    要么被服务器理解成列表通配符。
+    """
+    encoded = utf7_encode(name)
+    if encoded and all(ord(c) > 0x20 and ord(c) != 0x7F and c not in _ATOM_UNSAFE
+                       for c in encoded):
+        return encoded
+    return '"' + encoded.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class ImapError(Exception):
     """IMAP 连接或操作失败（面向用户的可读错误）。"""
 
@@ -50,6 +154,31 @@ class ImapError(Exception):
 class Folder:
     name: str
     display: str
+    # LIST 响应里的属性，如 `\Trash` / `\Sent` / `\Noselect`（大写，含反斜杠）。
+    # 只有带 `\Trash` 的文件夹才能被安全地当作删除目标：靠名字猜是不可靠的
+    # （同一家邮箱的中文版 / 英文版界面给出的名字不同）。
+    flags: frozenset[str] = field(default_factory=frozenset)
+
+    def has_flag(self, flag: str) -> bool:
+        return flag.upper() in self.flags
+
+
+def parse_list_line(text: str) -> tuple[frozenset[str], str] | None:
+    """解析一行 LIST / LSUB 响应，返回 `(属性集合, 文件夹名)`。
+
+    返回 `None` 表示这行不符合标准形式，调用方应回退到宽松解析，
+    以免某个服务器的畸形响应让整个文件夹列表变成空的。
+    """
+    match = _LIST_LINE_RE.match(text)
+    if match is None:
+        return None
+    flags = frozenset(
+        token.upper() for token in match.group("flags").split() if token.startswith("\\")
+    )
+    name = match.group("name").strip()
+    if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+        name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return flags, name
 
 
 class ImapAdapter:
@@ -174,12 +303,60 @@ class ImapAdapter:
             if not line:
                 continue
             text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+            parsed = parse_list_line(text)
+            if parsed is not None:
+                flags, name = parsed
+                if name:
+                    folders.append(Folder(name=name, display=name, flags=flags))
+                continue
+            # 回退：老式宽松解析，兼容不含属性组的畸形响应
             # 形如: (\HasNoChildren) "/" "INBOX"
             parts = text.split(' "/" ')
             if len(parts) >= 2:
                 name = parts[-1].strip().strip('"')
                 folders.append(Folder(name=name, display=name))
         return folders or [Folder("INBOX", "收件箱")]
+
+    def capabilities(self, imap: imaplib.IMAP4) -> set[str]:
+        """查询服务器能力（`CAPABILITY`），返回大写集合。
+
+        每次现查而不是缓存：登录前后能力集可能变化（例如登录后才宣告
+        `UIDPLUS`），而删除是低频操作，多一次往返无所谓。
+        查询失败返回空集——调用方应按「不具备该能力」处理，宁可拒绝执行。
+        """
+        try:
+            typ, data = imap.capability()
+        except (imaplib.IMAP4.error, AttributeError, OSError):
+            return set()
+        if typ != "OK":
+            return set()
+        caps: set[str] = set()
+        for item in data or []:
+            text = item.decode("ascii", errors="replace") if isinstance(item, bytes) else str(item)
+            caps |= {token.upper() for token in text.split()}
+        return caps
+
+    def find_trash_folder(self, imap: imaplib.IMAP4) -> str | None:
+        """定位垃圾箱文件夹，找不到返回 None。
+
+        优先用 `\\Trash` 特殊用途属性（RFC 6154）——这是唯一可靠的方式，
+        网易 / Gmail 的中文版与英文版给出的文件夹名并不一致。只有在服务器
+        不宣告该属性时，才退回按平台常见名匹配。
+        """
+        try:
+            folders = self.list_folders(imap)
+        except (ImapError, imaplib.IMAP4.error, OSError):
+            folders = []
+        usable = [f for f in folders if not f.has_flag("\\Noselect")]
+        for folder in usable:
+            if folder.has_flag("\\Trash"):
+                return folder.name
+        candidates = {name.casefold() for name in (self.config.trash_candidates or ())}
+        if candidates:
+            for folder in usable:
+                if folder.name.casefold() in candidates:
+                    return folder.name
+        return None
 
     # ------------------------------------------------------------ 邮件
     def search_new_uids(self, imap: imaplib.IMAP4, since_uid: int,
@@ -318,7 +495,9 @@ class ImapAdapter:
         回传只会多一次解析。不需要增删任何标志时直接返回，不产生任何往返。
 
         只改 `\Seen` / `\Flagged` 这两个「用户可见状态」标志，**不动**
-        `\Deleted`：那等于直接删服务器上的邮件，是本地客户端绝不该有的行为。
+        `\Deleted`：把「标为已读」和「删除邮件」混在同一条通路里，
+        一次标志位转义错误就可能变成删邮件。真正的删除走 `move_to_trash()`，
+        且必须由用户显式触发。
         """
         allowed = {self.FLAG_SEEN, self.FLAG_FLAGGED}
         add_set = sorted(set(add) & allowed)
@@ -336,6 +515,58 @@ class ImapAdapter:
                          "(" + " ".join(remove_set) + ")")
         except imaplib.IMAP4.error as exc:
             raise ImapError(f"同步标记到服务器失败（uid={uid}）：{exc}") from exc
+
+    # ------------------------------------------------------------ 服务端删除
+    def move_to_trash(self, imap: imaplib.IMAP4, uid: str, folder: str = "INBOX",
+                      *, trash: str | None = None) -> str:
+        r"""把一封邮件移入垃圾箱（**可在垃圾箱里恢复**），返回垃圾箱名。
+
+        刻意只做「移动到垃圾箱」而**不提供永久删除**，理由有两层：
+
+        1. 可逆。误删的邮件还躺在垃圾箱里，这与「永久删除」是两种不同后果的
+           操作，前者不该被一次误点触发。
+        2. 不变通 `EXPUNGE`。`UID EXPUNGE`（RFC 4315）精确到单个 UID，而普通的
+           `EXPUNGE` 会清掉该文件夹里**所有**被标记 `\Deleted` 的邮件——包括
+           手机端 / 网页版标记的、用户根本没打算删的那些。因此这里要求服务器
+           宣告 `UIDPLUS`，否则宁可拒绝执行并说明原因。
+
+        调用方需保证 `uid` 确实属于 `folder`；本方法会自行 `select`（非只读）。
+        """
+        caps = self.capabilities(imap)
+        if "UIDPLUS" not in caps:
+            raise ImapError(
+                "该服务器未宣告 UIDPLUS（RFC 4315），无法安全地删除单封邮件。\n"
+                "没有 UIDPLUS 就只能用整文件夹 EXPUNGE，而那会把其它客户端"
+                "（手机、网页版）标记为删除的邮件一并清掉，因此本程序拒绝执行。"
+            )
+
+        target = trash or self.find_trash_folder(imap)
+        if not target:
+            raise ImapError(
+                "未能在这个账号里找到垃圾箱文件夹，已中止操作（不做不可恢复的删除）。\n"
+                "若该邮箱确实没有垃圾箱，请改用「删除本地副本」。"
+            )
+
+        try:
+            typ, _data = imap.select(folder or "INBOX", readonly=False)
+            if typ != "OK":
+                raise ImapError(f"无法以可写方式打开文件夹「{folder}」")
+            typ, _data = imap.uid("COPY", str(uid), encode_mailbox(target))
+            if typ != "OK":
+                raise ImapError(f"复制邮件到「{target}」失败")
+            typ, _data = imap.uid("STORE", str(uid), "+FLAGS.SILENT", "(\\Deleted)")
+            if typ != "OK":
+                raise ImapError("标记邮件为已删除失败（邮件可能已复制到垃圾箱）")
+            typ, _data = imap.uid("EXPUNGE", str(uid))
+            if typ != "OK":
+                raise ImapError(
+                    f"从「{folder}」移除邮件失败；邮件可能同时存在于原文件夹与垃圾箱"
+                )
+        except ImapError:
+            raise
+        except imaplib.IMAP4.error as exc:
+            raise ImapError(f"移动到垃圾箱失败：{exc}") from exc
+        return target
 
 
 

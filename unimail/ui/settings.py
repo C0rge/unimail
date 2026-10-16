@@ -26,6 +26,28 @@ THEME_MODES = ("system", "dark", "light")
 VIEW_MODES = ("list", "thread")
 FONT_SCALES = (0.9, 1.0, 1.1, 1.25)
 
+_TRUE_LITERALS = {"1", "true", "yes", "on"}
+
+
+def _as_bool(value: object, default: bool) -> bool:
+    """把配置里的值收敛成 bool。
+
+    为什么不能直接 `bool(value)`：JSON 里写成 `"false"`（字符串）时
+    `bool("false")` 是 **True**。对 `delete_on_server` 这种会动用服务器的开关，
+    这种误读的方向恰恰是最危险的那一侧，因此显式解析未知值并回落到默认值。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_LITERALS:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
 
 @dataclass
 class UiSettings:
@@ -34,6 +56,11 @@ class UiSettings:
     font_scale: float = 1.0
     view_mode: str = "list"              # list | thread（会话视图）
     sync_server_flags: bool = True       # 已读/星标回写服务器
+    # 删除邮件时是否同时移入服务器垃圾箱。默认**关**：
+    # 「删除」在多数人心里默认等于「从我的邮箱里拿掉」，而这里默认实现的
+    # 只是「本机不再显示」（服务器不动，重置同步后会重新出现）。让用户
+    # 显式选择要不要动用服务器，比替他决定更安全。
+    delete_on_server: bool = False
     minimize_to_tray: bool = True
     show_notifications: bool = True
     prefetch_bodies: bool = True         # 后台预取正文
@@ -76,6 +103,10 @@ class UiSettings:
         if scale not in FONT_SCALES:
             scale = 1.0
         self.font_scale = scale
+        # 这两个开关会改变外部可见后果（服务器上的状态、服务器上的邮件），
+        # 因此不走 `bool()` 而是显式解析，未知值一律回落到安全默认。
+        self.sync_server_flags = _as_bool(self.sync_server_flags, True)
+        self.delete_on_server = _as_bool(self.delete_on_server, False)
 
     def save(self, path: Path | None = None) -> None:
         target = Path(path) if path else SETTINGS_PATH

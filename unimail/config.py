@@ -113,6 +113,12 @@ class PlatformConfig:
     auth_hint: str
     help_url: str = ""
     requires_oauth: bool = False
+    # 垃圾箱文件夹的**候选名**，仅在前者缺失时使用的兜底。
+    # 首选判据始终是 LIST 响应里的 `\Trash` 特殊用途属性（RFC 6154）：
+    # 同一家邮箱的中文版 / 英文版界面给出的文件夹名并不一致
+    # （Gmail 中文版是「废件箱」而不是 `[Gmail]/Trash`），靠名字匹配必然有漏网。
+    # 这里只是「服务器不宣告 \Trash」时的第二道防线，因此允许写多个候选。
+    trash_candidates: tuple[str, ...] = ()
 
 
 PLATFORMS: dict[str, PlatformConfig] = {
@@ -125,6 +131,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         auth_hint="需在「设置 → 账户 → POP3/IMAP/SMTP」开启 IMAP 服务，"
                   "并使用生成的 16 位「授权码」，不是 QQ 登录密码。",
         help_url="https://service.mail.qq.com/detail/0/75",
+        trash_candidates=("Deleted Messages", "已删除"),
     ),
     "163": PlatformConfig(
         key="163",
@@ -135,6 +142,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         auth_hint="需在「设置 → POP3/SMTP/IMAP」开启 IMAP 服务，"
                   "使用生成的「授权码」作为密码。",
         help_url="https://help.mail.163.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b",
+        trash_candidates=("已删除", "Deleted Messages", "Trash"),
     ),
     "gmail": PlatformConfig(
         key="gmail",
@@ -144,6 +152,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         use_ssl=True,
         auth_hint="需先开启两步验证，然后在「应用专用密码」中生成 16 位密码。",
         help_url="https://support.google.com/accounts/answer/185833",
+        trash_candidates=("[Gmail]/Trash", "[Gmail]/Bin", "[Gmail]/废件箱"),
     ),
     "outlook": PlatformConfig(
         key="outlook",
@@ -154,6 +163,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         auth_hint="微软已停用基础认证，建议开启两步验证后在「安全 → 应用密码」生成密码；"
                   "企业租户需管理员开启 IMAP。",
         help_url="https://support.microsoft.com/account-billing/app-passwords",
+        trash_candidates=("Deleted Items", "已删除邮件", "Deleted"),
     ),
     "custom": PlatformConfig(
         key="custom",
@@ -162,6 +172,7 @@ PLATFORMS: dict[str, PlatformConfig] = {
         imap_port=993,
         use_ssl=True,
         auth_hint="手动填写 IMAP 服务器地址、端口与加密方式。",
+        trash_candidates=("Trash", "Deleted Items", "Deleted Messages", "已删除"),
     ),
 }
 

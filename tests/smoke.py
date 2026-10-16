@@ -2609,6 +2609,342 @@ def test_ui_layer():
     mwmod.MainWindow._maybe_first_run = real_first
 
 
+# ============================================================ 33. 服务端删除语义
+class _ScriptedImap:
+    """按脚本应答的假 IMAP 连接，用于验证**协议交互本身**。
+
+    这里刻意不用 MagicMock：删除是不可逆操作，真正要验证的是「发了哪几条
+    命令、顺序如何、有没有出现整文件夹 EXPUNGE」。MagicMock 会把任何调用
+    都记下来并返回另一个 Mock，连返回值格式写错都发现不了。
+    """
+
+    def __init__(self, caps=("IMAP4REV1", "UIDPLUS"), list_data=()):
+        self._caps = tuple(caps)
+        self._list = list(list_data)
+        self.commands: list[tuple] = []
+        self.selected = None
+        self.fail_on: set[str] = set()
+
+    def capability(self):
+        return ("OK", [" ".join(self._caps).encode()])
+
+    def list(self, *args):
+        return ("OK", list(self._list))
+
+    def select(self, mailbox, readonly=False):
+        self.selected = mailbox
+        self.commands.append(("SELECT", mailbox, readonly))
+        return ("OK", [b"1"])
+
+    def uid(self, command, *args):
+        self.commands.append(("UID", command, *args))
+        if command in self.fail_on:
+            return ("NO", [b"boom"])
+        if command == "COPY":
+            return ("OK", [b"[COPYUID 1 200 900]"])
+        return ("OK", [b""])
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+    def uid_calls(self):
+        """只取 UID 命令，形如 [("COPY", ('200', '"Trash"')), ...]。"""
+        return [(c[1], c[2:]) for c in self.commands if c[0] == "UID"]
+
+
+def test_server_side_delete():
+    """删除语义：默认只删本机副本；显式开启时才动用服务器，且必须可恢复。"""
+    _tmp, _cfg, _ctxmod, svcmod = setup_env("srvdel_")
+    from unimail.config import PLATFORMS
+    from unimail.core.models import AccountDraft
+    from unimail.platforms.base import (
+        ImapAdapter,
+        ImapError,
+        encode_mailbox,
+        parse_list_line,
+        utf7_decode,
+        utf7_encode,
+    )
+    from unimail.ui.context import AppContext
+
+    # ---- 1. 文件夹名编解码（163 / QQ 的中文名是这条链路的必经环节）
+    check("文件夹名编码后必为 ASCII",
+          all(encode_mailbox(n).isascii()
+              for n in ("已删除", "废件箱", "Sent Messages", "A&B", "INBOX")),
+          f"实际 {encode_mailbox('已删除')!r}")
+    check("中文名用修改版 UTF-7（+ 位移、, 代替 /）",
+          encode_mailbox("已删除") == "+XfJSIJZk-", f"实际 {encode_mailbox('已删除')!r}")
+    check("字面量 & 转义为 &-", encode_mailbox("A&B") == "A&-B",
+          f"实际 {encode_mailbox('A&B')!r}")
+    check("含 ] 的名字加引号（Gmail 的 [Gmail]/Trash）",
+          encode_mailbox("[Gmail]/Trash") == '"[Gmail]/Trash"',
+          f"实际 {encode_mailbox('[Gmail]/Trash')!r}")
+    check("含空格的名字加引号（QQ 的 Deleted Messages）",
+          encode_mailbox("Deleted Messages") == '"Deleted Messages"',
+          f"实际 {encode_mailbox('Deleted Messages')!r}")
+    check("UTF-7 往返一致（含 & 与 + 这类位移冲突字符）",
+          all(utf7_decode(utf7_encode(s)) == s
+              for s in ("已删除", "A&B", "a+b-c", "INBOX", "废件箱", "已发送")),
+          f"实际 {utf7_decode(utf7_encode('a+b-c'))!r}")
+    check("解不开的位移序列原样保留，不猜",
+          utf7_decode("+不是合法base64-") == "+不是合法base64-",
+          f"实际 {utf7_decode('+不是合法base64-')!r}")
+
+    # ---- 2. LIST 响应解析
+    flags, name = parse_list_line(r'(\HasNoChildren \Trash) "/" "Deleted Messages"')
+    check("LIST 属性被解析出来",
+          flags == frozenset({r"\HASNOCHILDREN", r"\TRASH"}), f"实际 {flags}")
+    check("带引号的文件夹名被还原", name == "Deleted Messages", f"实际 {name!r}")
+    check("NIL 分隔符兼容", parse_list_line(r"(\HasNoChildren) NIL INBOX")[1] == "INBOX")
+    check("畸形行返回 None（交给宽松回退解析）", parse_list_line("garbage") is None)
+
+    # ---- 3. 垃圾箱定位：优先 \Trash 属性，其次平台候选名
+    adapter = ImapAdapter(PLATFORMS["qq"])
+    trash_first = _ScriptedImap(list_data=[
+        b'(\\HasNoChildren) "/" "INBOX"',
+        b'(\\HasNoChildren \\Trash) "/" "Trash"',
+    ])
+    check("优先按 \\Trash 属性定位", adapter.find_trash_folder(trash_first) == "Trash")
+
+    by_name = _ScriptedImap(list_data=[
+        b'(\\HasNoChildren) "/" "INBOX"',
+        b'(\\HasNoChildren) "/" "Deleted Messages"',
+    ])
+    check("服务器不宣告 \\Trash 时按平台候选名兜底",
+          adapter.find_trash_folder(by_name) == "Deleted Messages",
+          f"实际 {adapter.find_trash_folder(by_name)!r}")
+
+    none_found = _ScriptedImap(list_data=[b'(\\HasNoChildren) "/" "INBOX"'])
+    check("确实没有垃圾箱时返回 None", adapter.find_trash_folder(none_found) is None)
+
+    noselect = _ScriptedImap(list_data=[b'(\\Noselect \\Trash) "/" "[Gmail]"'])
+    check("跳过 \\Noselect 的占位文件夹", adapter.find_trash_folder(noselect) is None)
+
+    # ---- 4. 协议序列必须是 COPY → STORE \Deleted → UID EXPUNGE
+    scripted = _ScriptedImap(list_data=[
+        b'(\\HasNoChildren \\Trash) "/" "Deleted Messages"'
+    ])
+    moved = adapter.move_to_trash(scripted, "200")
+    check("返回实际使用的垃圾箱名", moved == "Deleted Messages", f"实际 {moved!r}")
+    calls = scripted.uid_calls()
+    check("协议顺序：COPY → STORE → EXPUNGE",
+          [c[0] for c in calls] == ["COPY", "STORE", "EXPUNGE"], f"实际 {calls}")
+    check("第一步先复制进垃圾箱（保证可恢复）",
+          calls[0][1] == ("200", '"Deleted Messages"'), f"实际 {calls[0]}")
+    check("只加 \\Deleted，不碰其它标志",
+          calls[1][1][:2] == ("200", "+FLAGS.SILENT") and "\\Deleted" in calls[1][1][2],
+          f"实际 {calls[1]}")
+    check("用 UID EXPUNGE 精确删除单个 UID",
+          calls[2][1] == ("200",), f"实际 {calls[2]}")
+    check("全程未出现整文件夹 EXPUNGE",
+          not any(c[0] == "EXPUNGE" for c in scripted.commands),
+          f"实际 {scripted.commands}")
+    check("以可写方式打开源文件夹（readonly=False）",
+          ("SELECT", "INBOX", False) in scripted.commands, f"实际 {scripted.commands}")
+
+    # ---- 5. 没有 UIDPLUS 必须拒绝，且一条删除命令都不能发
+    no_uidplus = _ScriptedImap(caps=("IMAP4REV1",),
+                               list_data=[b'(\\HasNoChildren \\Trash) "/" "Trash"'])
+    try:
+        adapter.move_to_trash(no_uidplus, "200")
+        check("无 UIDPLUS 时拒绝执行", False, "竟然没有抛错")
+    except ImapError as exc:
+        check("无 UIDPLUS 时拒绝执行（并说明原因）",
+              "UIDPLUS" in str(exc), f"实际 {exc}")
+    check("拒绝时未发出任何命令", no_uidplus.commands == [], f"实际 {no_uidplus.commands}")
+
+    # ---- 6. 找不到垃圾箱也必须拒绝：宁可报错，也不做不可恢复的删除
+    no_trash = _ScriptedImap(list_data=[b'(\\HasNoChildren) "/" "INBOX"'])
+    try:
+        adapter.move_to_trash(no_trash, "200")
+        check("找不到垃圾箱时拒绝执行", False, "竟然没有抛错")
+    except ImapError as exc:
+        check("找不到垃圾箱时拒绝执行", "垃圾箱" in str(exc), f"实际 {exc}")
+    check("拒绝时未发出任何 UID 命令",
+          not [c for c in no_trash.commands if c[0] == "UID"],
+          f"实际 {no_trash.commands}")
+
+    # ---- 7. 服务层：先服务器、后本地；服务器失败则本地原样保留
+    from unimail.platforms.parser import parse_message
+
+    RAW = (b"From: a@b.com\r\nSubject: x\r\n"
+           b"Date: Mon, 15 Oct 2026 10:00:00 +0800\r\n\r\nbody\r\n")
+    ctx = AppContext()
+    ctx.bootstrap_new("pw1234567890")
+    acc = ctx.accounts.add(AccountDraft(platform="qq", email="me@qq.com", password="code"))
+    # 绕开保活会话池：这里要验证的是服务层的调用顺序，不是连接复用
+    ctx.mails.sessions = None
+
+    class _TrashAdapter:
+        def __init__(self, ok=True):
+            self.ok = ok
+            self.calls: list[tuple] = []
+
+        def connect(self, account, password):
+            return _ScriptedImap()
+
+        def disconnect(self, imap):
+            pass
+
+        def move_to_trash(self, imap, uid, folder="INBOX"):
+            self.calls.append((str(uid), folder))
+            if not self.ok:
+                raise ImapError("模拟服务器拒绝删除")
+            return "Deleted Messages"
+
+    ok_mid = ctx.mails.mails.insert_mail(acc.id, "qq", parse_message(RAW, "200"))
+    ok_adapter = _TrashAdapter(ok=True)
+    with _fake_server(ok_adapter, svcmod):
+        target = ctx.mails.delete(ok_mid, on_server=True)
+    check("delete(on_server=True) 返回目标垃圾箱", target == "Deleted Messages",
+          f"实际 {target!r}")
+    check("服务器动作带上正确的 UID 与文件夹",
+          ok_adapter.calls == [("200", "INBOX")], f"实际 {ok_adapter.calls}")
+    check("服务器成功后才删本地副本", ctx.mails.get(ok_mid) is None)
+
+    bad_mid = ctx.mails.mails.insert_mail(acc.id, "qq", parse_message(RAW, "201"))
+    bad_adapter = _TrashAdapter(ok=False)
+    try:
+        with _fake_server(bad_adapter, svcmod):
+            ctx.mails.delete(bad_mid, on_server=True)
+        check("服务器失败时对外抛错", False, "竟然没有抛错")
+    except ImapError:
+        check("服务器失败时对外抛错", True)
+    check("服务器失败时本地副本保持不变（杜绝「假删除」）",
+          ctx.mails.get(bad_mid) is not None)
+
+    # ---- 8. 批量：单封失败不拖垮整批，且失败项必须被逐条报出
+    good_mid = ctx.mails.mails.insert_mail(acc.id, "qq", parse_message(RAW, "202"))
+    bad_mid2 = ctx.mails.mails.insert_mail(acc.id, "qq", parse_message(RAW, "203"))
+
+    class _PartialAdapter(_TrashAdapter):
+        def move_to_trash(self, imap, uid, folder="INBOX"):
+            self.calls.append((str(uid), folder))
+            if str(uid) == "203":
+                raise ImapError("模拟这一封删不掉")
+            return "Trash"
+
+    partial = _PartialAdapter()
+    with _fake_server(partial, svcmod):
+        result = ctx.mails.delete_many([good_mid, bad_mid2], on_server=True)
+    check("批量：成功的那封被删除",
+          result.removed == 1 and ctx.mails.get(good_mid) is None, f"实际 {result}")
+    check("批量：失败的那封仍留在本地", ctx.mails.get(bad_mid2) is not None)
+    check("批量：失败项被逐条记录（而不是只报一个数字）",
+          len(result.failed) == 1 and result.failed[0][0] == bad_mid2,
+          f"实际 {result.failed}")
+    check("批量：removed_ids 只含成功项", result.removed_ids == [good_mid],
+          f"实际 {result.removed_ids}")
+    check("批量：尝试过两封", len(partial.calls) == 2, f"实际 {partial.calls}")
+
+    # ---- 9. 默认路径：on_server=False 时绝不碰网络
+    local_mid = ctx.mails.mails.insert_mail(acc.id, "qq", parse_message(RAW, "204"))
+    never = _TrashAdapter()
+    with _fake_server(never, svcmod):
+        ret = ctx.mails.delete(local_mid)
+    check("默认删除不触发任何服务器调用", never.calls == [], f"实际 {never.calls}")
+    check("默认删除返回空串（表示未走服务器）", ret == "")
+    check("默认删除确实移除了本地副本", ctx.mails.get(local_mid) is None)
+
+    # ---- 10. 设置项的类型收敛（"false" 字符串不能被当成 True）
+    from unimail.ui import settings as setmod
+    s_false = setmod.UiSettings(delete_on_server="false")
+    s_false.sanitize()
+    check("字符串 \"false\" 不会被当成 True",
+          s_false.delete_on_server is False, f"实际 {s_false.delete_on_server!r}")
+    s_true = setmod.UiSettings(delete_on_server="yes")
+    s_true.sanitize()
+    check("字符串 \"yes\" 被识别为 True", s_true.delete_on_server is True)
+    s_bad = setmod.UiSettings(delete_on_server="maybe")
+    s_bad.sanitize()
+    check("无法识别的值回落到安全默认（关）", s_bad.delete_on_server is False)
+    check("服务器删除默认关闭", setmod.UiSettings().delete_on_server is False)
+
+
+# ============================================================ 34. 代码签名参数
+def test_build_signing_args():
+    """打包脚本的签名参数拼装。
+
+    为什么值得测：签名一旦漏掉或参数写错，产物是个**能跑但没签名**的 exe——
+    本地双击完全正常，问题只在别人下载时才暴露成 SmartScreen 拦截。
+    这类「本地看不出问题」的失败必须由测试兜住。
+    """
+    from unittest.mock import patch
+
+    import build_exe as B
+
+    calls: list[list[str]] = []
+
+    class _Ok:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _Ok()
+
+    tmp = Path(tempfile.mkdtemp(prefix="umsignargs_"))
+    exe = tmp / "UniMail.exe"
+    exe.write_bytes(b"MZ" + b"\0" * 64)
+
+    with patch.object(B, "find_signtool", return_value=r"C:\fake\signtool.exe"), \
+            patch.object(B.subprocess, "run", side_effect=fake_run), \
+            patch.object(B, "signature_status", return_value="Valid"):
+        # ---- 证书存储指纹（推荐路径：命令行里不出现密码）
+        ok = B.sign_exe(exe, B.SignConfig(thumbprint="AB CD EF"))
+        argv = calls[-1]
+        check("指纹方式签名成功", ok is True)
+        check("用 /sha1 指定证书（且去掉空格）",
+              "/sha1" in argv and argv[argv.index("/sha1") + 1] == "ABCDEF", f"实际 {argv}")
+        check("默认带时间戳（/tr + /td sha256）",
+              "/tr" in argv and argv[argv.index("/td") + 1] == "sha256", f"实际 {argv}")
+        check("文件摘要固定 sha256",
+              "/fd" in argv and argv[argv.index("/fd") + 1] == "sha256", f"实际 {argv}")
+        check("最后一项是被签的文件", argv[-1] == str(exe), f"实际 {argv[-1]!r}")
+
+        # ---- PFX 路径 + 关闭时间戳
+        calls.clear()
+        ok2 = B.sign_exe(exe, B.SignConfig(pfx=tmp / "c.pfx", pfx_password="pw",
+                                           timestamp=False))
+        argv2 = calls[-1]
+        check("PFX 方式签名成功", ok2 is True)
+        check("用 /f 与 /p 传证书与密码",
+              "/f" in argv2 and "/p" in argv2, f"实际 {argv2}")
+        check("关闭时间戳时不出现 /tr", "/tr" not in argv2, f"实际 {argv2}")
+
+        # ---- 没给证书时必须拒绝，而不是"签个空转"
+        calls.clear()
+        ok3 = B.sign_exe(exe, B.SignConfig())
+        check("未提供证书时拒绝签名", ok3 is False)
+        check("拒绝时根本不调用 signtool", calls == [], f"实际 {calls}")
+
+    # ---- 校验结论异常时必须判失败，不能把未签名产物放过去
+    class _Noop:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    with patch.object(B, "find_signtool", return_value="signtool"), \
+            patch.object(B.subprocess, "run", return_value=_Noop()), \
+            patch.object(B, "signature_status", return_value="NotSigned"):
+        check("校验为 NotSigned 时判定失败",
+              B.sign_exe(exe, B.SignConfig(thumbprint="X")) is False)
+
+    # ---- 环境里没有 signtool 时给出可操作提示，而不是抛异常
+    with patch.object(B, "find_signtool", return_value=None):
+        check("缺少 signtool 时返回失败而非抛异常",
+              B.sign_exe(exe, B.SignConfig(thumbprint="X")) is False)
+
+    # ---- signtool 定位：按 SDK 版本号排序，取最新的一套
+    check("SDK 版本号可比较（10.0.26100.0 > 10.0.10011.0）",
+          B.sdk_version_key(r"C:\Kits\10\bin\10.0.26100.0\x64\signtool.exe")
+          > B.sdk_version_key(r"C:\Kits\10\bin\10.0.10011.0\x64\signtool.exe"))
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -2645,6 +2981,9 @@ SUITES = [
     ("界面偏好持久化", test_ui_settings_roundtrip),
     ("设备绑定免密解锁", test_device_binding),
     ("UI：令牌 / 模型 / 面板 / 锁屏", test_ui_layer),
+    # ---- 第五批（删除语义与服务端删除）
+    ("删除语义与服务端删除", test_server_side_delete),
+    ("代码签名参数拼装", test_build_signing_args),
 ]
 
 

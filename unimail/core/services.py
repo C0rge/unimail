@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,6 +134,20 @@ class AttachmentSaveResult:
     @property
     def danger(self) -> bool:
         return bool(self.name_hint)
+
+
+@dataclass
+class DeleteBatchResult:
+    """批量删除的结果。
+
+    刻意不用「删除成功 N 封」这种单一数字：走服务器删除时，一封失败不该让
+    整批回滚，但用户必须知道**哪几封没删成**——否则他会以为全删干净了，
+    而这正是「删除仅本地」这一类设计最容易给人的错觉。
+    """
+    removed: int = 0              # 本地副本已删除的封数
+    moved_to_trash: int = 0       # 其中已同步移入服务器垃圾箱的封数
+    failed: list[tuple[str, str]] = field(default_factory=list)   # (mail_id, 原因)
+    removed_ids: list[str] = field(default_factory=list)          # 供界面精确摘除行
 
 
 class AccountService:
@@ -369,7 +383,41 @@ class MailService:
             return 0
         return self.pending_flags.count(account_id)
 
-    def delete(self, mail_id: str) -> None:
+    def delete(self, mail_id: str, *, on_server: bool = False) -> str:
+        """删除一封邮件。返回对服务器实际操作到的文件夹名（未走服务器时为空串）。
+
+        `on_server=False`（默认）：**只**删本机副本，服务器完全不受影响。
+        后果是重置同步 / 换设备后会重新出现——这也是界面上必须讲清楚的事。
+
+        `on_server=True`：先把邮件移入服务器垃圾箱（可恢复），成功后才删本地。
+        顺序刻意如此：服务器操作失败时**不动**本地数据，用户拿到的是一个明确的
+        错误，而不是「本地没了、服务器还在」的假删除。
+        """
+        if not on_server:
+            self._drop_local_mail(mail_id)
+            return ""
+        moved_to = self.move_to_trash(mail_id)
+        self._drop_local_mail(mail_id)
+        return moved_to
+
+    def move_to_trash(self, mail_id: str) -> str:
+        """只做服务端动作：把邮件移入垃圾箱，本地副本保持不变。
+
+        拆出来是为了让「先服务器、后本地」这个顺序可测：调用方先执行本方法，
+        确认没有抛错之后才删本地。
+        """
+        ctx = self.mails.mail_context(mail_id)
+        if ctx is None:
+            raise FileNotFoundError("邮件不存在或已被删除")
+        account, password = self._account_and_password(ctx["account_id"])
+        folder = ctx.get("folder") or "INBOX"
+        uid = str(ctx["uid"])
+        return self._with_connection(
+            account, password,
+            lambda adapter, imap: adapter.move_to_trash(imap, uid, folder=folder),
+        )
+
+    def _drop_local_mail(self, mail_id: str) -> None:
         stale = self.mails.delete(mail_id)
         for path in stale:
             unlink_attachment_file(path)
@@ -628,13 +676,38 @@ class MailService:
         self.bus.accounts_changed.emit()
         return n
 
-    def delete_many(self, mail_ids: list[str]) -> int:
-        stale = self.mails.delete_many(mail_ids)
-        for path in stale:
-            unlink_attachment_file(path)
-        self.invalidate_counts()
-        self.bus.mails_removed.emit(list(mail_ids))
-        return len(mail_ids)
+    def delete_many(self, mail_ids: list[str], *, on_server: bool = False) -> DeleteBatchResult:
+        """批量删除本地副本；`on_server=True` 时同时移入服务器垃圾箱。
+
+        走服务器时**逐封**处理、单封失败不中断整批：某一封的权限或状态问题
+        不该让剩下的都删不掉。每封都遵循「先服务器、后本地」的顺序。
+        """
+        result = DeleteBatchResult()
+        if not on_server:
+            stale = self.mails.delete_many(mail_ids)
+            for path in stale:
+                unlink_attachment_file(path)
+            self.invalidate_counts()
+            self.bus.mails_removed.emit(list(mail_ids))
+            result.removed = len(mail_ids)
+            result.removed_ids = list(mail_ids)
+            return result
+
+        removed_ids: list[str] = []
+        for mail_id in mail_ids:
+            try:
+                self.move_to_trash(mail_id)
+            except Exception as exc:      # noqa: BLE001 —— 单封失败不该拖垮整批
+                result.failed.append((mail_id, str(exc)))
+                continue
+            self._drop_local_mail(mail_id)
+            removed_ids.append(mail_id)
+            result.removed += 1
+            result.moved_to_trash += 1
+        if removed_ids:
+            self.bus.mails_removed.emit(removed_ids)
+        result.removed_ids = removed_ids
+        return result
 
     # ------------------------------------------------------------ 导出
     def build_rfc822(self, mail_id: str, *, allow_network: bool = True) -> bytes:

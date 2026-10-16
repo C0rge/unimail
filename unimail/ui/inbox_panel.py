@@ -157,7 +157,7 @@ class InboxToolbar(QFrame):
         act_all = menu.addAction("全选当前列表")
         act_none = menu.addAction("取消选择")
         menu.addSeparator()
-        act_delete = menu.addAction("删除本地副本")
+        act_delete = menu.addAction(self.delete_label)
 
         chosen = menu.exec(self.btn_batch.mapToGlobal(self.btn_batch.rect().bottomLeft()))
         mapping = {
@@ -226,6 +226,9 @@ class InboxPanel(QFrame):
         self.setObjectName("Panel")
         self.model = MailTableModel(self)
         self.delegate = MailRowDelegate(self)
+        # 菜单里给用户看的删除文案。默认按「只删本机副本」措辞——这是默认
+        # 行为，也是用户最需要被告知的一件事；主窗口会在设置变化时改写它。
+        self.delete_label = "删除本地副本"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -541,6 +544,14 @@ class InboxPanel(QFrame):
         target = not bool(getattr(mail, "is_starred", False))
         self._emit_star(ids, target)
 
+    def set_delete_label(self, text: str) -> None:
+        """由主窗口按「删除是否同步服务器」的设置改写菜单文案。
+
+        文案必须跟着真实行为走：设置开启后若仍写「删除本地副本」，
+        用户会以为服务器上的邮件还在，而实际上它已经被移进垃圾箱了。
+        """
+        self.delete_label = text
+
     def _delete_selected(self) -> None:
         ids = self.selected_ids()
         if ids:
@@ -638,7 +649,7 @@ class InboxPanel(QFrame):
         act_csv = sub_export.addAction("CSV 清单（当前筛选）")
 
         menu.addSeparator()
-        act_delete = menu.addAction(f"删除本地副本{scope}")
+        act_delete = menu.addAction(f"{self.delete_label}{scope}")
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is None:

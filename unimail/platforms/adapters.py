@@ -8,7 +8,7 @@ import imaplib
 import logging
 
 from ..config import APP_VERSION
-from .base import ImapAdapter
+from .base import ImapAdapter, parse_list_line, utf7_decode
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +31,19 @@ class QQMailAdapter(ImapAdapter):
                 if not line:
                     continue
                 raw = line if isinstance(line, bytes) else str(line).encode()
-                # QQ 部分文件夹名以 modified UTF-7 编码
-                text = raw.decode("utf-7", errors="replace") if b"&" in raw \
-                    else raw.decode("gb18030", errors="replace")
+                # QQ 部分文件夹名以 modified UTF-7 编码。注意这里用的是
+                # base.utf7_decode（协议用的 `+,` 位移），而不是内置 `utf-7`
+                # 解码器——后者认的是 `+/`，会把中文名解成乱码。
+                if b"&" in raw:
+                    text = utf7_decode(raw.decode("ascii", errors="replace"))
+                else:
+                    text = raw.decode("gb18030", errors="replace")
+                parsed = parse_list_line(text)
+                if parsed is not None:
+                    flags, name = parsed
+                    if name:
+                        folders.append(self._folder(name, flags))
+                    continue
                 parts = text.split(' "/" ')
                 if len(parts) >= 2:
                     name = parts[-1].strip().strip('"')
@@ -43,13 +53,13 @@ class QQMailAdapter(ImapAdapter):
             return super().list_folders(imap)
 
     @staticmethod
-    def _folder(name: str):
+    def _folder(name: str, flags: frozenset[str] = frozenset()):
         from .base import Folder
         mapping = {
             "INBOX": "收件箱", "Sent Messages": "已发送", "Drafts": "草稿箱",
             "Deleted Messages": "已删除", "Junk": "垃圾邮件",
         }
-        return Folder(name=name, display=mapping.get(name, name))
+        return Folder(name=name, display=mapping.get(name, name), flags=flags)
 
 
 class Net163Adapter(ImapAdapter):
@@ -98,7 +108,9 @@ class GmailAdapter(ImapAdapter):
         from .base import Folder
         out = []
         for f in folders:
-            out.append(Folder(f.name, mapping.get(f.name, f.display)))
+            # 保留 LIST 属性（`\Trash` 等）——垃圾箱定位依赖它，
+            # 只做显示名替换不该把它丢掉。
+            out.append(Folder(f.name, mapping.get(f.name, f.display), f.flags))
         return out
 
 

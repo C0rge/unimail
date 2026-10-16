@@ -509,6 +509,20 @@ class SettingsDialog(QDialog):
             "变更会排队，下次同步时推送。"
         ))
 
+        self.chk_delete_server = QCheckBox("删除邮件时，同时移入服务器垃圾箱")
+        self.chk_delete_server.setChecked(self.settings.delete_on_server)
+        outer.addWidget(self.chk_delete_server)
+        warn_delete = _hint(
+            "⚠️ 默认关闭时，「删除」只移除本机副本——服务器上的邮件不受影响，"
+            "重置同步或换设备后会重新出现。\n"
+            "开启后，删除会先把邮件移入服务器垃圾箱（可在垃圾箱恢复），再移除"
+            "本机副本；服务器操作失败时不动本机数据。\n"
+            "需要服务器支持 UIDPLUS；不支持时会明确报错并保持本机副本不变。"
+        )
+        warn_delete.setObjectName("Warning")
+        warn_delete.setWordWrap(True)
+        outer.addWidget(warn_delete)
+
         self.chk_prefetch = QCheckBox("后台预取正文（点开即显）")
         self.chk_prefetch.setChecked(self.settings.prefetch_bodies)
         outer.addWidget(self.chk_prefetch)
@@ -706,6 +720,7 @@ class SettingsDialog(QDialog):
         s.font_scale = _combo_value(self.scale_box, FONT_SCALES, 1.0)
         s.view_mode = _combo_value(self.view_box, ("list", "thread"), "list")
         s.sync_server_flags = self.chk_flags.isChecked()
+        s.delete_on_server = self.chk_delete_server.isChecked()
         s.prefetch_bodies = self.chk_prefetch.isChecked()
         s.inline_images_auto = self.chk_inline.isChecked()
         s.minimize_to_tray = self.chk_tray.isChecked()
