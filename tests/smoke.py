@@ -2988,9 +2988,16 @@ def test_build_signing_args():
               B.sign_exe(exe, B.SignConfig(thumbprint="X")) is False)
 
     # ---- signtool 定位：按 SDK 版本号排序，取最新的一套
+    #
+    # 这两条在 Linux CI 上有真实回归价值：`sdk_version_key` 若改用平台相关的
+    # `Path` 去切分 Windows 路径，POSIX 上会把整串当成一个不含分隔符的文件名，
+    # 两个路径都退化成 `(0,)`，于是「比大小」和「等于真实版本」会同时失败。
     check("SDK 版本号可比较（10.0.26100.0 > 10.0.10011.0）",
           B.sdk_version_key(r"C:\Kits\10\bin\10.0.26100.0\x64\signtool.exe")
           > B.sdk_version_key(r"C:\Kits\10\bin\10.0.10011.0\x64\signtool.exe"))
+    check("SDK 版本号解析出真实版本（没有因平台差异退化成 0）",
+          B.sdk_version_key(r"C:\Kits\10\bin\10.0.26100.0\x64\signtool.exe")
+          == (10, 0, 26100, 0))
 
 
 # ============================================================ 35–48. 并发与性能回归

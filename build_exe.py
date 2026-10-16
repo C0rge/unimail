@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
@@ -112,8 +112,15 @@ class SignConfig:
 
 
 def sdk_version_key(path: str) -> tuple[int, ...]:
-    """把 SDK 路径里的版本号拆成可比较的元组，用于挑最新的一套工具。"""
-    name = Path(path).parent.parent.name        # 形如 10.0.26100.0
+    """把 SDK 路径里的版本号拆成可比较的元组，用于挑最新的一套工具。
+
+    这里必须用 `PureWindowsPath` 而不是 `Path`。`Path` 按**运行平台**的规则
+    切分路径：在 Linux / macOS 上，`C:\\Kits\\10\\bin\\10.0.26100.0\\x64\\signtool.exe`
+    整体被视为一个不含分隔符的文件名，`.parent.parent.name` 拿到空串，
+    于是任何两个路径都退化成 `(0,)`，"取最新的一套"就静默失效了。
+    `PureWindowsPath` 的切分规则与平台无关，三个平台上结果一致。
+    """
+    name = PureWindowsPath(path).parent.parent.name        # 形如 10.0.26100.0
     parts: list[int] = []
     for chunk in name.split("."):
         parts.append(int(chunk) if chunk.isdigit() else 0)
