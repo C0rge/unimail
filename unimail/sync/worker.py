@@ -416,10 +416,13 @@ class WorkerPool(QObject):
             worker = SyncWorker(account, self.account_service, self.mails,
                                 self.cursors, self.security, self.bus,
                                 sessions=self.sessions)
-            # 绑定方法 + 显式排队：回调一定在主线程执行，且 sender() 可辨身份
-            worker.finished_ok.connect(self._on_success, Qt.QueuedConnection)
-            worker.failed.connect(self._on_failure, Qt.QueuedConnection)
-            worker.finished.connect(self._on_thread_done, Qt.QueuedConnection)
+            # 绑定方法 + 显式排队：回调一定在主线程执行，且 sender() 可辨身份。
+            # 注意用 `Qt.ConnectionType.QueuedConnection` 而非 `Qt.QueuedConnection`：
+            # 二者运行时是同一个枚举对象，但 PySide6 的 .pyi 存根只在嵌套枚举里
+            # 声明了该成员，简写形式会让 mypy 报 [attr-defined]。
+            worker.finished_ok.connect(self._on_success, Qt.ConnectionType.QueuedConnection)
+            worker.failed.connect(self._on_failure, Qt.ConnectionType.QueuedConnection)
+            worker.finished.connect(self._on_thread_done, Qt.ConnectionType.QueuedConnection)
             self._workers[account.id] = worker
         worker.start()
         return True

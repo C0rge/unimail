@@ -5,6 +5,11 @@
 -r requirements.txt
 
 ruff>=0.6            # lint + format（配置见 pyproject.toml）
+# mypy 必须能「看见」PySide6 的 .pyi 存根：PySide6 没装时，pyproject 里的
+# ignore_missing_imports=true 会让 `Qt` 整体退化成一个 Any，UI / 线程层的
+# 类型错误被静默放过，于是出现「本地全绿、CI 红」。所以本地校验请务必用
+#   pip install -r requirements.txt -r requirements-dev.txt
+# 一次装全，不要只装 ruff/mypy。
 mypy>=1.11           # 静态类型检查（实测 2.4.0 通过）
 pytest>=8.2          # 测试运行器（直接跑 tests/smoke.py 里已有的 test_* 函数）
 pip-audit>=2.7       # 依赖漏洞扫描（CI 中阻断高危项）

@@ -3247,8 +3247,8 @@ def _finished_worker(ctx, pool, account):
     worker = SyncWorker(account, ctx.accounts, ctx.mails.mails,
                         ctx.accounts.cursors, ctx.security, ctx.bus,
                         sessions=ctx.sessions)
-    worker.finished_ok.connect(pool._on_success, Qt.QueuedConnection)
-    worker.failed.connect(pool._on_failure, Qt.QueuedConnection)
+    worker.finished_ok.connect(pool._on_success, Qt.ConnectionType.QueuedConnection)
+    worker.failed.connect(pool._on_failure, Qt.ConnectionType.QueuedConnection)
     worker.run()          # 直接在测试线程里跑完，不 start()（不产生 finished）
     return worker
 
