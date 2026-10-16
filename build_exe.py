@@ -7,6 +7,10 @@
     python build_exe.py --sign --cert-thumbprint <SHA1>     # 用证书存储里的证书签
     python build_exe.py --sign --pfx cert.pfx --pfx-password-env UNIMAIL_PFX_PW
 
+打包前会检查 `REQUIRED_RUNTIME` 里的依赖是否齐全（目前是 SQLCipher）——原因见该常量的注释：
+缺了它 exe 照样能跑，只是永远降级为字段级加密，属于「静默少一块能力」，必须在构建期拦住。
+确实要打降级包时显式加 `--allow-degraded`。
+
 为什么提供签名：未签名的 exe 会触发 SmartScreen 的「已阻止不安全的下载」，
 用户必须点「仍要运行」才能装上——对一个要接管邮箱凭据的程序来说，这个提示
 是不该出现的（它训练用户忽略安全警告）。签名解决的是可信度，不是功能。
@@ -82,8 +86,22 @@ HIDDEN = [
     "_cffi_backend",
     "cryptography.hazmat.bindings._rust",
     "cryptography.hazmat.bindings._rust.openssl",
+    "sqlcipher3",
+    "sqlcipher3.dbapi2",
     "unimail.demo",
 ]
+
+# 必须真正打进发行包的依赖：导入名 → 安装提示。
+#
+# `sqlcipher3` 是唯一一处「打包环境装了才有、没装也**不报任何错**」的依赖：缺失时
+# exe 照样启动、功能看起来都正常，只是永远降级为字段级加密（整库明文），
+# 而界面上的「数据库加密设置」迁移入口对绿色版用户会永久不可用。
+# v1.0.0–v1.6.0 的发布包**全部**如此，构建日志里也没有任何提示——
+# 这类「静默少一块能力」正是最该在构建期拦住的东西，所以改成硬性检查，
+# 真要打降级包时必须显式加 --allow-degraded。
+REQUIRED_RUNTIME = {
+    "sqlcipher3": "sqlcipher3-wheels==0.5.6（已在 requirements.txt 中）",
+}
 
 DEFAULT_TSP = "http://timestamp.digicert.com"
 
@@ -211,6 +229,19 @@ def sign_exe(exe: Path, cfg: SignConfig) -> bool:
     return True
 
 
+def check_required_runtime() -> list[str]:
+    """检查发行包必须具备的依赖，返回缺失项的人类可读描述。"""
+    import importlib
+
+    missing: list[str] = []
+    for module, hint in REQUIRED_RUNTIME.items():
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            missing.append(f"{module} —— {hint}")
+    return missing
+
+
 def build(onedir: bool, clean: bool) -> Path:
     if clean:
         for d in (DIST, BUILD):
@@ -276,7 +307,19 @@ def main() -> int:
     ap.add_argument("--no-timestamp", action="store_true",
                     help="不打时间戳（离线或自签名测试时使用）")
     ap.add_argument("--skip-verify", action="store_true", help="跳过签名后校验")
+    ap.add_argument("--allow-degraded", action="store_true",
+                    help="允许打出缺少 SQLCipher 的降级包（默认不允许，见 REQUIRED_RUNTIME）")
     args = ap.parse_args()
+
+    if not args.allow_degraded:
+        missing = check_required_runtime()
+        if missing:
+            print("[x] 打包环境缺少发行包必须具备的依赖，继续下去会打出一个"
+                  "「能跑、但少了一块能力」的包：")
+            for item in missing:
+                print(f"    · {item}")
+            print("    安装后重试；确实需要降级包请显式加 --allow-degraded。")
+            return 1
 
     exe = build(args.onedir, clean=not args.no_clean)
 

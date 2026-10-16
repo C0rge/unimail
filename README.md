@@ -18,13 +18,13 @@
 - 🔄 自动同步：IMAP UID 增量拉取 + 按账号周期定时刷新 + 失败指数退避；已读 / 星标**回写服务器**（离线先排队，下次同步 `STORE ±FLAGS`）
 - 🖥️ 系统托盘常驻 + 新邮件通知（节流；锁屏 / 托盘态不弹，避免绕过锁定）
 - 🎨 深浅双主题（跟随系统 / 手动覆盖）+ 4 档字号 + 内联 SVG 图标集，全部由设计令牌生成
-- 🔐 本地加密：主密码经 **Argon2id**（内存硬性 64 MiB）派生主密钥，再经 HKDF 分出数据库密钥与凭据密钥；凭据 Fernet 加密；SQLCipher 整库 AES-256 加密（可选）。旧库的 PBKDF2 参数写入 sidecar 以便继续校验，改主密码时自动升级到当前默认算法
+- 🔐 本地加密：主密码经 **Argon2id**（内存硬性 64 MiB）派生主密钥，再经 HKDF 分出数据库密钥与凭据密钥；凭据 Fernet 加密；SQLCipher 整库 AES-256 加密（**发布包已内置并默认启用**）。旧库的 PBKDF2 参数写入 sidecar 以便继续校验，改主密码时自动升级到当前默认算法
 - 🔓 **设备绑定免密解锁**（可选，默认关闭）：Windows DPAPI / macOS 钥匙串保护主密钥，带摘要损坏检测；只在提供真实 OS 级保护的平台上出现该开关
 - 🔒 空闲 15 分钟自动锁定（真·空闲判定，锁屏为完全不透明遮罩）；主密码连续输错按 1/2/4/8… 秒退避（**跨进程持久化**，重启不清零）
 
 ## 更新日志
 
-见 [`CHANGELOG.md`](CHANGELOG.md)。当前版本 **v1.6.0**。
+见 [`CHANGELOG.md`](CHANGELOG.md)。当前版本 **v1.6.1**。
 
 ## 许可证
 
@@ -48,7 +48,7 @@ python main.py --theme light
 
 > 演示模式主密码为 `unimail-demo`（**仅演示模式**；正常使用时首次设置的主密码要求至少 12 位，并会实时提示强度）。
 
-**可选增强**：`pip install "sqlcipher3-wheels==0.5.6"` 可启用整库 AES-256 加密（未安装时自动降级为 SQLite + 字段级加密，启动时会明确提示当前加密等级）。库文件由哪种驱动创建会记在 sidecar 中，因此先降级运行、之后补装 SQLCipher 也能正常打开，并可在启动提示或「文件 → 数据库加密设置」中一键迁移。
+**加密等级**：**Windows 发布包已内置 `sqlcipher3-wheels==0.5.6`，新建的库默认就是整库 AES-256 加密**（v1.0.0–v1.6.0 的发布包漏带了该驱动，实际一直跑在字段级加密下）。从源码运行时它是可选依赖，`pip install "sqlcipher3-wheels==0.5.6"` 即可启用；未安装时自动降级为 SQLite + 字段级加密，启动时会明确提示当前加密等级。库文件由哪种驱动创建会记在 sidecar 中，因此先降级运行、之后补装（或换成含驱动的发布包）也能正常打开，并可在启动提示或「文件 → 数据库加密设置」中一键迁移。
 
 > 为什么是 `sqlcipher3-wheels` 而不是 `sqlcipher3-binary`：后者只发布了 **Linux x86_64** 轮子，Windows / macOS / Linux aarch64 上都装不到预编译版本。`sqlcipher3-wheels` 是唯一在 Windows、macOS、Linux 三端都有轮子的发行线。版本锁在 0.5.6 是因为 0.5.7 在 Windows 上与 `PRAGMA cipher_memory_security = ON` 组合会栈溢出崩溃（详见 `requirements.txt` 注释）。
 
@@ -93,7 +93,7 @@ python main.py --theme light
 
 签名不改变程序行为：凭据始终**只在本机加密存储**，不会上传到任何服务器。
 
-> **当前状态**：v1.6.0 及更早的发布物**尚未签名**（下载时可能触发 SmartScreen
+> **当前状态**：v1.6.1 及更早的发布物**尚未签名**（下载时可能触发 SmartScreen
 > 的「仍要运行」提示）。签名能力已实现并验证，正在申请面向开源项目的免费签名
 > 服务；获得证书后将从下一个版本起对发布物签名。
 
@@ -113,8 +113,8 @@ Linux 为 `$XDG_DATA_HOME/UniMail`）。
 ## 测试
 
 ```bash
-# 核心层 + UI 层回归套件：32 组、424~427 项断言
-# （断言数随环境浮动 3 项：装了 sqlcipher3 为 427 项，未装为 424 项）
+# 核心层 + UI 层回归套件：48 组、570~573 项断言
+# （断言数随环境浮动 3 项：装了 sqlcipher3 为 573 项，未装为 570 项）
 python tests/smoke.py
 ```
 
@@ -143,15 +143,18 @@ pip-audit -r requirements.txt   # 依赖漏洞扫描
 ```text
 unimail/
 ├── main.py                  # 入口（--seed / --reset / --export-recovery）
+├── 使用说明.md               # 随发布 zip 一起分发的用户说明（面向下载者）
 ├── requirements.txt         # 运行依赖（含 SQLCipher 驱动）
 ├── requirements-dev.txt     # 开发/CI 依赖
 ├── requirements.lock        # 已验证的版本组合
 ├── pyproject.toml           # 打包元数据（版本/依赖走 dynamic）+ ruff/mypy/pytest
+├── build_exe.py             # 打包脚本（PyInstaller；打包前校验 SQLCipher 等必需依赖）
 ├── .github/workflows/ci.yml # CI：lint + 类型检查 + 双环境测试 + 漏洞扫描
 ├── docs/架构设计.md          # 完整架构设计文档
 ├── docs/发布规范.md          # 版本号来源 / tag 约定 / 发版检查清单
 ├── docs/代码签名.md          # 证书来源 / 签名与校验方式 / 本地自签名验证
 ├── tools/self_sign.ps1      # 本地自签名证书（仅 CurrentUser，用于验证签名链路）
+├── tools/pack_release.py    # 组装发布 zip（校验版本号一致 + 随包文件齐全）
 ├── tests/smoke.py           # 核心层回归套件
 └── unimail/
     ├── config.py            # 平台配置 / 路径 / 安全参数
