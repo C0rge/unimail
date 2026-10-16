@@ -1,0 +1,43 @@
+# 统一行尾为 LF（仓库与工作区一致）。
+#
+# 背景：此前没有本文件，Windows 上 core.autocrlf=true 会把检出结果转成 CRLF，
+# 导致每次提交都出现 "LF will be replaced by CRLF" 警告，且同一份文件在不同
+# 平台上 diff 结果不一致。仓库索引里一直是 LF，所以本文件不产生内容变更，
+# 只把工作区也固定为 LF。
+* text=auto eol=lf
+
+# 二进制文件禁止任何文本/行尾转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.bmp   binary
+*.ico   binary
+*.icns  binary
+*.svg   text
+*.zip   binary
+*.tar   binary
+*.gz    binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.pdf   binary
+
+# Windows 批处理与 PowerShell 脚本必须保留 CRLF，否则 cmd.exe / 部分解析器异常
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 显式声明语言类型：让 GitHub 语言统计与 diff 高亮按正确语法处理
+*.py      text diff=python
+*.pyi     text diff=python
+*.md      text diff=markdown
+*.yml     text
+*.yaml    text
+*.toml    text
+*.json    text
+*.ini     text
+*.cfg     text
+*.txt     text
+*.lock    text
