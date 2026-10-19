@@ -7,6 +7,10 @@
     python build_exe.py --sign --cert-thumbprint <SHA1>     # 用证书存储里的证书签
     python build_exe.py --sign --pfx cert.pfx --pfx-password-env UNIMAIL_PFX_PW
 
+    图标相关：
+    python build_exe.py --make-icon            # 只从 assets/*.svg 重新生成 dist/icon.ico
+    python build_exe.py --no-icon              # 不给 exe 带图标（调试用）
+
 打包前会检查 `REQUIRED_RUNTIME` 里的依赖是否齐全（目前是 SQLCipher）——原因见该常量的注释：
 缺了它 exe 照样能跑，只是永远降级为字段级加密，属于「静默少一块能力」，必须在构建期拦住。
 确实要打降级包时显式加 `--allow-degraded`。
@@ -31,6 +35,7 @@ from pathlib import Path, PureWindowsPath
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
+ICON = DIST / "icon.ico"
 
 # 明确排除：项目只用 QtCore/QtGui/QtWidgets，WebEngine 等会让体积暴涨
 EXCLUDES = [
@@ -242,12 +247,76 @@ def check_required_runtime() -> list[str]:
     return missing
 
 
-def build(onedir: bool, clean: bool) -> Path:
+def ensure_icon(make: bool = False) -> Path | None:
+    """确保 dist/icon.ico 存在，返回路径（或 None 表示本次不带图标）。
+
+    图标源文件是 `assets/icon.svg`（设计依据见 assets/README.md），ico 是
+    构建产物。这里的行为：
+
+    * `--make-icon`：强制从 SVG 重新生成，然后直接退出（供改完图标单独跑）；
+    * ico 已存在且比两个 SVG 都新：直接用（增量构建不该每次都重画图标）；
+    * ico 缺失或比 SVG 旧：自动重新生成。
+
+    自动生成失败时**不阻断打包**：图标是外观问题，缺了顶多是默认图标，
+    而因为一张图就打不出包是本末倒置。但会明确警告——静默缺一块能力
+    正是本项目在 SQLCipher 上栽过的跟头，这里不能再犯同样的错。
+    """
+    sources = [ROOT / "assets" / "icon.svg", ROOT / "assets" / "icon_light.svg"]
+    have_sources = all(p.exists() for p in sources)
+
+    if make:
+        if not have_sources:
+            print("[x] --make-icon 需要 assets/icon.svg 与 assets/icon_light.svg")
+            sys.exit(1)
+        print("[i] 从 assets/*.svg 重新生成图标…")
+        _run_make_icon()
+        return ICON if ICON.exists() else None
+
+    if not ICON.exists():
+        if not have_sources:
+            print("[!] 未找到 dist/icon.ico，也没有 assets/*.svg 可自动生成；"
+                  "本次打包不带图标（--no-icon 可显式跳过该检查）")
+            return None
+        print("[i] dist/icon.ico 不存在，自动从 assets/*.svg 生成…")
+        if _run_make_icon():
+            return ICON
+        print("[!] 图标生成失败，本次打包不带图标")
+        return None
+
+    # 已存在：源文件比产物新才重画，否则直接用。
+    if have_sources and any(p.stat().st_mtime > ICON.stat().st_mtime for p in sources):
+        print("[i] assets/*.svg 有更新，重新生成图标…")
+        _run_make_icon()
+    return ICON
+
+
+def _run_make_icon() -> bool:
+    """调用 tools/make_icon.py。返回是否成功。"""
+    script = ROOT / "tools" / "make_icon.py"
+    if not script.exists():
+        print(f"[!] 找不到 {script}")
+        return False
+    result = subprocess.run([sys.executable, str(script)], cwd=str(ROOT))
+    if result.returncode != 0:
+        print("[!] tools/make_icon.py 执行失败")
+        return False
+    return ICON.exists()
+
+
+def build(onedir: bool, clean: bool, icon: Path | None = None) -> Path:
     if clean:
         for d in (DIST, BUILD):
             if d.exists():
                 shutil.rmtree(d)
         print(f"[i] 已清理 {DIST} 与 {BUILD}")
+        # `--clean` 清的是整个 dist，而 icon.ico 是我们放在那里的**输入**
+        # 文件（由 assets/*.svg 生成），不是 PyInstaller 的产物。
+        # 不清掉它，否则这次打包就变成「图标生成了、又被自己删了」。
+        if icon is not None and icon.parent == DIST:
+            ensure_icon()
+            if not icon.exists():
+                print("[!] 清理后图标未能重新生成，本次不带图标")
+                icon = None
 
     pyi = Path(sys.executable).parent / "Scripts" / "pyinstaller.exe"
     if not pyi.exists():
@@ -270,6 +339,11 @@ def build(onedir: bool, clean: bool) -> Path:
         "--workpath", str(BUILD),
         "--specpath", str(ROOT),
     ]
+    # 图标放在 `--name` 之后、脚本路径之前。PyInstaller 对参数顺序不敏感，
+    # 但图标要显式排除在 --clean 的清理范围外：--clean 清的是 BUILD 缓存，
+    # 而 dist/icon.ico 是我们自己放的输入文件，不是它的产物。
+    if icon is not None:
+        cmd += ["--icon", str(icon)]
     for mod in EXCLUDES:
         cmd += ["--exclude-module", mod]
     for mod in HIDDEN:
@@ -309,7 +383,19 @@ def main() -> int:
     ap.add_argument("--skip-verify", action="store_true", help="跳过签名后校验")
     ap.add_argument("--allow-degraded", action="store_true",
                     help="允许打出缺少 SQLCipher 的降级包（默认不允许，见 REQUIRED_RUNTIME）")
+    ap.add_argument("--make-icon", action="store_true",
+                    help="只从 assets/*.svg 重新生成 dist/icon.ico 后退出")
+    ap.add_argument("--no-icon", action="store_true",
+                    help="不给 exe 带图标（调试用；正常情况下会自动生成）")
+    ap.add_argument("--icon", type=Path, default=None,
+                    help="显式指定 .ico 文件（默认 dist/icon.ico，缺失时自动生成）")
     args = ap.parse_args()
+
+    # 图标处理放在依赖检查之前：--make-icon 是个独立的快速命令，
+    # 不该因为打包环境少个依赖就被拦住。
+    if args.make_icon:
+        ensure_icon(make=True)
+        return 0
 
     if not args.allow_degraded:
         missing = check_required_runtime()
@@ -321,7 +407,18 @@ def main() -> int:
             print("    安装后重试；确实需要降级包请显式加 --allow-degraded。")
             return 1
 
-    exe = build(args.onedir, clean=not args.no_clean)
+    if args.no_icon:
+        icon: Path | None = None
+        print("[!] --no-icon：本次打包不带应用图标")
+    elif args.icon is not None:
+        icon = args.icon
+        if not icon.exists():
+            print(f"[x] 指定的图标文件不存在：{icon}")
+            return 1
+    else:
+        icon = ensure_icon()
+
+    exe = build(args.onedir, clean=not args.no_clean, icon=icon)
 
     if not args.sign:
         return 0

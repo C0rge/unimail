@@ -272,6 +272,12 @@ class DetailPanel(QFrame):
     export_requested = Signal(str)             # mail_id
     star_requested = Signal(str)               # mail_id
     open_external_requested = Signal(str)      # url
+    # 发信三连。刻意带 mail_id 而不是让面板自己持有账号信息：
+    # 回复要用**原账号**发（From 才对），而「哪封邮件属于哪个账号」只有
+    # 主窗口知道，面板不查数据库。
+    reply_requested = Signal(str)              # mail_id
+    reply_all_requested = Signal(str)          # mail_id
+    forward_requested = Signal(str)            # mail_id
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -358,6 +364,21 @@ class DetailPanel(QFrame):
         # ---- 动作行
         actions = QHBoxLayout()
         actions.setSpacing(6)
+        self.btn_reply = QPushButton("回复")
+        self.btn_reply.setObjectName("Ghost")
+        self.btn_reply.clicked.connect(self._request_reply)
+        actions.addWidget(self.btn_reply)
+
+        self.btn_reply_all = QPushButton("全部回复")
+        self.btn_reply_all.setObjectName("Ghost")
+        self.btn_reply_all.clicked.connect(self._request_reply_all)
+        actions.addWidget(self.btn_reply_all)
+
+        self.btn_forward = QPushButton("转发")
+        self.btn_forward.setObjectName("Ghost")
+        self.btn_forward.clicked.connect(self._request_forward)
+        actions.addWidget(self.btn_forward)
+
         self.btn_star = QPushButton("星标")
         self.btn_star.setObjectName("Ghost")
         self.btn_star.clicked.connect(self._toggle_star)
@@ -567,6 +588,18 @@ class DetailPanel(QFrame):
     def _request_inline(self) -> None:
         if self._mail is not None:
             self.inline_download_requested.emit(self._mail.id)
+
+    def _request_reply(self) -> None:
+        if self._mail is not None:
+            self.reply_requested.emit(self._mail.id)
+
+    def _request_reply_all(self) -> None:
+        if self._mail is not None:
+            self.reply_all_requested.emit(self._mail.id)
+
+    def _request_forward(self) -> None:
+        if self._mail is not None:
+            self.forward_requested.emit(self._mail.id)
 
     def _toggle_star(self) -> None:
         if self._mail is not None:

@@ -28,6 +28,7 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from ..config import APP_NAME
 from . import icons
+from .app_icon import app_icon
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +90,12 @@ class TrayIcon(QObject):
     def apply_theme(self, palette: dict) -> None:
         self._theme = dict(palette or {})
         color = self._theme.get("text", "#e6edf3")
-        self.icon.setIcon(icons.icon("mailbox", color, 22))
+        accent = self._theme.get("accent", "#4c8dff")
+        # 托盘用**应用标志**而不是通用的 mailbox 图标：托盘是应用的身份入口，
+        # 用通用图标会让「这是 UniMail」在系统托盘里失去辨识度。
+        # 取 accent 色：托盘背景由系统决定（跟随系统深浅），accent 在深浅两种
+        # 背景下都能保持可辨，而 text 色在深色托盘上会糊进背景。
+        self.icon.setIcon(app_icon(accent, 22))
         for act, name in ((self.act_show, "mail-open"), (self.act_sync, "refresh"),
                           (self.act_lock, "lock"), (self.act_settings, "settings"),
                           (self.act_quit, "close")):

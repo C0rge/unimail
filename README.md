@@ -13,10 +13,13 @@
 - 🔍 多维筛选：平台、关键词（**FTS5 全文检索**，中文按字切分、可走索引）、时间范围（预设 + 自定义）、仅未读；命中数与高亮一并呈现
 - ⌨️ 键盘流：`J/K` 移动、`Shift+J/K` 追加选中、`U` 切已读、`S` 切星标、`Space` 展开会话、`Ctrl+A` 全选，配套批量操作与排序菜单
 - 📄 邮件详情：正文渲染（HTML 已白名单清洗，屏蔽远程跟踪像素，外链二次确认）+ 附件卡片（图片预览 / 可执行类型保留 `.download`）+ `cid:` 内嵌图按需加载
+- 📤 **写邮件**：新邮件 / 回复 / 全部回复 / 转发，`In-Reply-To` 与 `References`
+  按 RFC 2822 正确构造（对方客户端能归并会话）；先入队再发送，失败保留原文
+  可一键重试；**不自动重发**（服务器可能已收下，重发会让对方收到两封）
 - 📤 导出：单封 `.eml`（优先取服务器原始报文）、多封 `.mbox`（mboxo 转义）、当前筛选结果 CSV（带 BOM，Excel 不乱码）
 - ⚡ 正文按需拉取 + 有界并发后台预取；IMAP **会话池**复用连接（`NOOP` 探活 + 空闲回收），附件 / 正文不再每次重新登录
 - 🔄 自动同步：IMAP UID 增量拉取 + 按账号周期定时刷新 + 失败指数退避；已读 / 星标**回写服务器**（离线先排队，下次同步 `STORE ±FLAGS`）；单次入库上限 500 封（可调），达上限不丢邮件，游标停在连续区间末尾、下次继续
-- 🌐 **IMAP 代理**：支持 SOCKS5（含用户名密码认证）与 HTTP CONNECT 隧道，`UNIMAIL_PROXY` 可填显式地址、`auto`（读系统代理）或 `env`（读通用变量），`UNIMAIL_NO_PROXY` 指定例外；手写协议握手，**不引入新依赖**。走代理**不降低**证书校验强度（SNI 与主机名仍按真实服务器校验）
+- 🌐 **IMAP 代理**：支持 SOCKS5（含用户名密码认证）与 HTTP CONNECT 隧道，`UNIMAIL_PROXY` 可填显式地址、`auto`（读系统代理）或 `env`（读通用变量），`UNIMAIL_NO_PROXY` 指定例外；手写协议握手，**不引入新依赖**。走代理**不降低**证书校验强度（SNI 与主机名仍按真实服务器校验）；SMTP 发信走同一套隧道
 - 🖥️ 系统托盘常驻 + 新邮件通知（节流；锁屏 / 托盘态不弹，避免绕过锁定）
 - 🎨 深浅双主题（跟随系统 / 手动覆盖）+ 4 档字号 + 内联 SVG 图标集，全部由设计令牌生成
 - 🔐 本地加密：主密码经 **Argon2id**（内存硬性 64 MiB）派生主密钥，再经 HKDF 分出数据库密钥与凭据密钥；凭据 Fernet 加密；SQLCipher 整库 AES-256 加密（**发布包已内置并默认启用**）。旧库的 PBKDF2 参数写入 sidecar 以便继续校验，改主密码时自动升级到当前默认算法
@@ -25,7 +28,7 @@
 
 ## 更新日志
 
-见 [`CHANGELOG.md`](CHANGELOG.md)。当前版本 **v1.6.3**。
+见 [`CHANGELOG.md`](CHANGELOG.md)。当前版本 **v1.6.3**（发信能力与应用图标在 `[未发布]` 小节，将随下一个版本发布）。
 
 ## 许可证
 
@@ -125,8 +128,8 @@ Linux 为 `$XDG_DATA_HOME/UniMail`）。
 ## 测试
 
 ```bash
-# 核心层 + UI 层回归套件：57 组、659~664 项断言
-# （断言数随环境浮动 5 项：装了 sqlcipher3 为 664 项，未装为 659 项）
+# 核心层 + UI 层回归套件：60 组、约 700 项断言
+# （断言数随环境浮动：装了 sqlcipher3 与未装会差几项）
 python tests/smoke.py
 ```
 
@@ -136,6 +139,10 @@ python tests/smoke.py
 |---|---|
 | 未装 `sqlcipher3-wheels` | SQLite + 字段级加密（降级模式），迁移入口应被明确拒绝 |
 | 已装 `sqlcipher3-wheels` | 整库 AES-256，含 v3→v4 迁移、迁移中断回滚 |
+
+> 在**沙箱 / 受限环境**里（临时目录被拒创建子目录）套件会大面积报
+> 「环境异常」而非真实断言失败，此时可用 `python tools/run_tests_fixed.py`
+> 跑同一套用例。它只是换掉临时目录的位置，不改变任何断言。
 
 开发/CI 依赖（lint + 类型检查 + 漏洞扫描）见 `requirements-dev.txt`：
 
@@ -160,18 +167,20 @@ unimail/
 ├── requirements-dev.txt     # 开发/CI 依赖
 ├── requirements.lock        # 已验证的版本组合
 ├── pyproject.toml           # 打包元数据（版本/依赖走 dynamic）+ ruff/mypy/pytest
-├── build_exe.py             # 打包脚本（PyInstaller；打包前校验 SQLCipher 等必需依赖）
+├── build_exe.py             # 打包脚本（PyInstaller；自动带上应用图标，可选签名）
 ├── .github/workflows/ci.yml # CI：lint + 类型检查 + 双环境测试 + 漏洞扫描
 ├── docs/架构设计.md          # 完整架构设计文档
 ├── docs/发布规范.md          # 版本号来源 / tag 约定 / 发版检查清单
 ├── docs/代码签名.md          # 证书来源 / 签名与校验方式 / 本地自签名验证
+├── assets/                  # 应用图标源文件（SVG）+ 设计说明；ico/png 为构建产物
 ├── tools/self_sign.ps1      # 本地自签名证书（仅 CurrentUser，用于验证签名链路）
 ├── tools/pack_release.py    # 组装发布 zip（校验版本号一致 + 随包文件齐全）
+├── tools/make_icon.py       # SVG → ICO/PNG（改图标请改 SVG 后重跑它）
 ├── tests/smoke.py           # 核心层回归套件
 └── unimail/
     ├── config.py            # 平台配置 / 路径 / 安全参数
     ├── core/                # 领域模型 / 安全服务 / 用例服务 / 事件总线 / 设备绑定
-    ├── storage/             # 加密数据库 + 仓储层（含 FTS5 与待回写队列）
+    ├── storage/             # 加密数据库 + 仓储层（含 FTS5、待回写队列与发件箱）
     ├── platforms/           # IMAP 适配器（QQ/163/Gmail/Outlook/自定义）+ MIME 解析
     │                        #   proxy.py：SOCKS5 / HTTP CONNECT 隧道（无第三方依赖）
     ├── sync/                # QThread 同步工作单元 + 心跳调度器 + IMAP 会话池

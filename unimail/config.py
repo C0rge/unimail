@@ -47,7 +47,7 @@ UNLOCK_MAX_ATTEMPTS = 5               # 单次运行内的尝试次数上限（�
 UNLOCK_BACKOFF_BASE = 1.0             # 退避基数（秒）：1,2,4,8… 上限见下
 UNLOCK_BACKOFF_MAX = 30.0
 
-DB_VERSION = 7                    # v7: accounts.auth_type（OAuth2 凭据类型）
+DB_VERSION = 8                    # v8: outbox 发件箱 + accounts.smtp_host/smtp_port
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
 IDLE_POLL_SECONDS = 20            # 空闲检查间隔（秒）
 

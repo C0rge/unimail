@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- OAuth2 账号的 credentials.ciphertext 里存的是 refresh_token，
     -- 登录走 `AUTHENTICATE XOAUTH2`。
     auth_type       TEXT NOT NULL DEFAULT 'password',
+    -- SMTP 服务器覆盖（v8）。空 = 从 imap_host 推断（imap.qq.com → smtp.qq.com）。
+    -- 自定义 IMAP 必须显式填：自建服务器的 SMTP 与 IMAP 没有必然关系。
+    smtp_host       TEXT,
+    smtp_port       INTEGER,
     created_at      TEXT NOT NULL,
     UNIQUE(platform, email)
 );
@@ -169,6 +173,28 @@ CREATE TABLE IF NOT EXISTS pending_flags (
     add_flags    TEXT,
     remove_flags TEXT,
     created_at   TEXT NOT NULL
+);
+
+-- 发件箱（v8）。存**完整 RFC 5322 原文**而不是「收件人+主题」：
+-- 失败重发必须能原样重放，附件尤其不能在中途重组（重组失败会产出一封
+-- 「少了附件」的邮件，比发不出去更糟）。原文是明文，但整库已 AES-256。
+-- 状态机见 core/models.py 的 OUTBOX_* 常量。
+-- 列名 `ref_chain` 而非 `references`：后者是 SQLite 保留字，直接用作列名会
+-- `near "references": syntax error`（v5 加 mails 引用链列时踩过同一个坑）。
+CREATE TABLE IF NOT EXISTS outbox (
+    id           TEXT PRIMARY KEY,
+    account_id   TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    subject      TEXT,
+    to_addrs     TEXT,
+    in_reply_to  TEXT,
+    ref_chain    TEXT,
+    raw          TEXT NOT NULL,
+    error        TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    sent_at      TEXT,
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 """
 
@@ -483,6 +509,22 @@ class Database:
                 "accounts", "auth_type", "TEXT NOT NULL DEFAULT 'password'")
             current = 7
             log.info("数据库已从 v%d 迁移到 v7（账号认证类型 auth_type）", from_version)
+        if current < 8:
+            # v8：发信能力。三处改动：
+            #   1. `outbox` 表 —— 由 SCHEMA 的 CREATE TABLE IF NOT EXISTS 建好；
+            #   2. `accounts.smtp_host` / `smtp_port` —— 覆盖值，默认空表示
+            #      「从 imap_host 推断」（imap.qq.com → smtp.qq.com）。
+            #      自定义 IMAP 尤其需要它：自建服务器的 SMTP 与 IMAP 没有必然关系。
+            #   3. 迁移历史 sending 状态为 pending：进程在发送途中崩溃会留下
+            #      sending 行，重启后必须允许重试，否则那封邮件永远卡在「发送中」。
+            self._add_column_if_missing("accounts", "smtp_host", "TEXT")
+            self._add_column_if_missing("accounts", "smtp_port", "INTEGER")
+            self.execute(
+                "UPDATE outbox SET status = 'pending', error = '上次发送中断，待重试' "
+                "WHERE status = 'sending'"
+            )
+            current = 8
+            log.info("数据库已从 v%d 迁移到 v8（发件箱 outbox + SMTP 服务器覆盖列）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
 

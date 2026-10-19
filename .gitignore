@@ -47,3 +47,17 @@ build/
 
 # 本地构建备份（重打包前把旧 dist 移到这里，避免误删）
 _old_build/
+
+# 测试与调试的本地临时目录。tests/smoke.py 正常用系统 temp；在沙箱 / 受限
+# 环境里 mkdtemp 会被拒，tools/run_tests_fixed.py 会退到仓库内，这些目录
+# 因此可能出现在工作区里——绝不能进版本库。
+_test_fixed/
+_testtmp/
+_t/
+_probe/
+_tmp_test/
+
+# 图标构建产物（源文件在 assets/*.svg，生成方式见 tools/make_icon.py）
+dist/icon.ico
+assets/icon_dark_*.png
+assets/icon_light_*.png

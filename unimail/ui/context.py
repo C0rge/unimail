@@ -20,7 +20,7 @@ from ..core.security import (
     UnlockGuard,
     password_policy_error,
 )
-from ..core.services import AccountService, MailService
+from ..core.services import AccountService, ComposeService, MailService
 from ..storage import (
     AccountRepository,
     AttachmentRepository,
@@ -28,6 +28,7 @@ from ..storage import (
     Database,
     DatabaseError,
     MailRepository,
+    OutboxRepository,
     PendingFlagRepository,
     sqlcipher_available,
 )
@@ -99,6 +100,7 @@ class AppContext:
         self.bus = EventBus()
         self.accounts: AccountService | None = None
         self.mails: MailService | None = None
+        self.compose: ComposeService | None = None
         self.scheduler: Scheduler | None = None
         self.pool: WorkerPool | None = None
         self.body_pool: BodyFetchPool | None = None
@@ -551,6 +553,9 @@ class AppContext:
                                        self.bus, pending_repo)
         self.mails = MailService(mail_repo, attach_repo, account_repo,
                                  self.security, self.bus, pending_repo)
+        # 发信用例。邮件仓储传进去：回复/转发要读原邮件的线程头。
+        self.compose = ComposeService(account_repo, OutboxRepository(self.db),
+                                      self.security, self.bus, mails=mail_repo)
         # core 层不能反向依赖 sync 层（会形成 import 循环），
         # 因此会话池由这里注入。
         self.mails.sessions = self.sessions

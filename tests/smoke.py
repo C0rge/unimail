@@ -4710,6 +4710,283 @@ def test_oauth_xoauth2():
     db.close()
 
 
+def test_compose_and_outbox():
+    """发信：入队 → 发送 → 状态机 → 回复/转发的线程头。
+
+    覆盖的重点是**不连网也能验证**的部分：
+      * outbox 状态机的四个状态与迁移（v8）；
+      * RFC 5322 原文的构造（From / References / 附件）；
+      * 回复与转发的线程头——这是「对方客户端能正确归并会话」的唯一依据，
+        填错会让回复显示成独立新邮件，且 UniMail 自己的会话视图也会断链。
+    真正的 SMTP 投递依赖网络，用假服务器验证协议交互（见下方 _FakeSmtp）。
+    """
+    _tmp, _cfg, _ctxmod, _svc = setup_env("cx_")
+    from unimail.core.models import AccountDraft, Mail, NormalizedMail
+    from unimail.core.services import ComposeDraft, ComposeService
+    from unimail.platforms import smtp as smtpmod
+    from unimail.storage import OutboxRepository
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    acc = ctx.accounts.add(AccountDraft(
+        platform="qq", email="me@qq.com", password="authcode",
+        display_name="Me", imap_host="imap.qq.com", imap_port=993))
+    store = OutboxRepository(ctx.db)
+    cs = ComposeService(ctx.accounts.accounts, store, ctx.security, ctx.bus,
+                        mails=ctx.mails.mails)
+    ctx.compose = cs
+
+    # ---- v8 迁移与 SMTP 覆盖列 ----
+    check("数据库已迁移到 v8", ctx.db.get_meta("db_version") == "8",
+          f"实际 {ctx.db.get_meta('db_version')}")
+    row = ctx.db.query_one("SELECT smtp_host, smtp_port FROM accounts WHERE id = ?", (acc.id,))
+    check("新库 accounts 带 smtp_host/smtp_port 列", row is not None)
+    check("smtp_host 默认为空（按 imap 推断）", (row or {}).get("smtp_host") in (None, ""),
+          f"实际 {(row or {}).get('smtp_host')!r}")
+    ctx.accounts.accounts.update_fields(acc.id, {"smtp_host": "smtp.corp.com", "smtp_port": 587})
+    acc2 = ctx.accounts.get(acc.id)
+    check("smtp_host 覆盖可写可读", acc2.smtp_host == "smtp.corp.com" and acc2.smtp_port == 587,
+          f"实际 {acc2.smtp_host}:{acc2.smtp_port}")
+
+    # ---- 入队：完整原文进 outbox ----
+    draft = ComposeDraft(account_id=acc.id, to=["a@b.com", "c@d.com"], cc=["e@f.com"],
+                         subject="会议纪要", body="周一开会。",
+                         attachments=[("note.txt", b"hello", "text/plain")])
+    mid = cs.queue(draft)
+    item = store.get(mid)
+    check("入队后状态为 pending", item.status == "pending", f"实际 {item.status}")
+    check("原文含发件人（含显示名）", "Me <me@qq.com>" in item.raw, item.raw[:80])
+    check("原文含全部收件人与抄送",
+          "a@b.com" in item.raw and "c@d.com" in item.raw and "e@f.com" in item.raw)
+    check("原文含附件文件名", "note.txt" in item.raw)
+    check("原文有 MIME-Version", "MIME-Version: 1.0" in item.raw)
+    check("待发送计数为 1", cs.pending_count() == 1, f"实际 {cs.pending_count()}")
+
+    # ---- 发送失败 → 保留原文 + 错误可读 + 可重试 ----
+    # 注意 patch 的目标：`core/services.py` 用的是 `from ..platforms.smtp import
+    # send as smtp_send`（导入时绑定），因此必须 patch **services 模块里的引用**，
+    # patch smtp 模块的同名属性对它无效（那只会改到一个没人用的名字）。
+    import unimail.core.services as services_mod
+
+    original_send = services_mod.smtp_send
+
+    def _boom(cfg, message):
+        raise smtpmod.SmtpError("SMTP 认证被拒绝：535 用户名或密码错误")
+
+    services_mod.smtp_send = _boom
+    try:
+        r = cs.send_one(mid)
+    finally:
+        services_mod.smtp_send = original_send
+    check("发送失败返回 ok=False", r.ok is False)
+    check("失败后状态为 failed", store.get(mid).status == "failed",
+          f"实际 {store.get(mid).status}")
+    check("失败原文仍保留（可重发）", store.get(mid).raw != "")
+    check("失败原因可读", "认证" in store.get(mid).error,
+          f"实际 {store.get(mid).error!r}")
+    r2 = cs.retry(mid)
+    check("重试仍然失败但状态一致", r2.ok is False and store.get(mid).status == "failed")
+
+    # ---- 发送成功 → sent + sent_at ----
+    sent_calls: list[tuple] = []
+
+    def _fake_send(cfg, message):
+        sent_calls.append((cfg, message))
+
+    services_mod.smtp_send = _fake_send
+    try:
+        r3 = cs.retry(mid)
+    finally:
+        services_mod.smtp_send = original_send
+    check("重试成功", r3.ok is True)
+    check("成功后状态为 sent", store.get(mid).status == "sent")
+    check("sent_at 已写入", bool(store.get(mid).sent_at))
+    check("待发送归零", cs.pending_count() == 0, f"实际 {cs.pending_count()}")
+    check("SMTP 配置从账号派生", sent_calls[0][0].host == "smtp.corp.com",
+          f"实际 {sent_calls[0][0].host}")
+    # 投递内容必须与队列里的原文一致。刻意**不做逐字节比较**：
+    # `as_bytes()` 落库时用 CRLF，而 `message_from_string().as_string()`
+    # 会按 policy 重新规范换行（CRLF→LF）。逐字节相等既不成立，也不是
+    # 真正的风险点——该断言的是「同一封邮件、同样的收件人与主题、同样的附件」。
+    # 主题要解码后比较：队列里存的是明文，message 对象里是 RFC 2047 编码形式。
+    from email.header import decode_header, make_header
+
+    delivered = sent_calls[0][1]
+    delivered_subject = str(make_header(decode_header(str(delivered["Subject"]))))
+    check("投递的是队列里的邮件（主题一致）",
+          delivered_subject == item.subject,
+          f"队列 {item.subject!r} vs 投递 {delivered_subject!r}")
+    check("投递的收件人与队列一致", "a@b.com" in str(delivered["To"]),
+          f"实际 {delivered['To']!r}")
+    # `message_from_string` 返回的是兼容层 `Message`（没有 `iter_attachments()`，
+    # 那是 `EmailMessage` 的方法），因此按 walk() 自己找附件部件。
+    delivered_atts = sorted(p.get_filename() or "" for p in delivered.walk()
+                            if p.get_filename())
+    check("投递的附件不丢", delivered_atts == ["note.txt"],
+          f"实际 {delivered_atts}")
+
+    # ---- 回复 / 转发的线程头 ----
+    nm = NormalizedMail(uid="10", subject="原主题", from_addr="sender@x.com",
+                        from_name="Sender", to_addrs=["me@qq.com", "other@x.com"],
+                        message_id="<orig@mail.com>",
+                        references=["<root@mail.com>", "<mid@mail.com>"],
+                        date=datetime.now(timezone.utc))
+    mail_id = ctx.mails.mails.insert_mail(acc.id, "qq", nm)
+    mail = ctx.mails.get(mail_id)
+
+    rd = cs.build_reply(mail_id, reply_all=True)
+    check("回复主题加 Re: 前缀", rd.subject == "Re: 原主题", f"实际 {rd.subject}")
+    check("回复默认带上原发件人", "sender@x.com" in rd.to, f"实际 {rd.to}")
+    check("全部回复带上原 To 的其他人", "other@x.com" in rd.to, f"实际 {rd.to}")
+    check("In-Reply-To 填原邮件 Message-ID",
+          rd.in_reply_to == "<orig@mail.com>", f"实际 {rd.in_reply_to}")
+    check("References 累积原链 + 自身 ID",
+          rd.ref_chain == ["<root@mail.com>", "<mid@mail.com>", "<orig@mail.com>"],
+          f"实际 {rd.ref_chain}")
+    check("回复用原账号（From 才对）", rd.account_id == acc.id)
+
+    rd_single = cs.build_reply(mail_id, reply_all=False)
+    check("单人回复只回发件人", rd_single.to == ["sender@x.com"], f"实际 {rd_single.to}")
+    check("单人回复不带 CC", rd_single.cc == [], f"实际 {rd_single.cc}")
+
+    # 已带 Re: 的主题不重复加前缀
+    nm_re = NormalizedMail(uid="11", subject="Re: 已经是回复", from_addr="s@x.com",
+                           to_addrs=["me@qq.com"], message_id="<x@m>",
+                           date=datetime.now(timezone.utc))
+    mail_re_id = ctx.mails.mails.insert_mail(acc.id, "qq", nm_re)
+    check("已有 Re: 前缀不重复添加",
+          cs.build_reply(mail_re_id).subject == "Re: 已经是回复",
+          f"实际 {cs.build_reply(mail_re_id).subject}")
+
+    fd = cs.build_forward(mail_id)
+    check("转发主题加 Fwd: 前缀", fd.subject == "Fwd: 原主题", f"实际 {fd.subject}")
+    check("转发正文带原发件人信息", "sender@x.com" in fd.body)
+    check("转发不带线程头（不是线程的一部分）",
+          fd.in_reply_to == "" and fd.ref_chain == [])
+
+    # ---- 入队阶段的校验 ----
+    try:
+        cs.queue(ComposeDraft(account_id=acc.id, to=[], subject="x", body="y"))
+        check("空收件人应被拒绝", False, "未抛异常")
+    except ValueError:
+        check("空收件人应被拒绝", True)
+    try:
+        cs.queue(ComposeDraft(account_id=acc.id, to=["a@b.com"], subject="", body=""))
+        check("主题与正文都为空应被拒绝", False, "未抛异常")
+    except ValueError:
+        check("主题与正文都为空应被拒绝", True)
+
+    # ---- 25 端口明文拒绝（凭据不外泄）----
+    err25 = _smtp_port_error(cs, acc, "smtp.plain.invalid", 25)
+    check("25 端口明文 SMTP 被拒绝", "明文" in err25, err25)
+    # 587 是合法加密入口：错误来自「域名不存在」这类网络层，而不是被明文规则误伤。
+    # 用一个必然解析失败的域名，保证离线环境下结论也确定。
+    err587 = _smtp_port_error(cs, acc, "smtp.plain.invalid", 587)
+    check("587 端口不被明文规则误拒", "明文" not in err587, err587)
+
+
+def _smtp_port_error(cs, account, host: str, port: int) -> str:
+    """把账号的 SMTP 端口改成 `port` 后发送，返回错误文本。
+
+    用于断言「25 端口一律拒绝」。**刻意不 patch 发送函数**：那条拒绝规则
+    就在 `platforms.smtp.send()` 开头的显式检查里，patch 掉它等于把被测
+    逻辑本身换掉，断言会变成永真。真实的 `send()` 在建连前就抛
+    `SmtpError`，不会产生任何网络流量，因此在离线环境里也是确定的。
+    """
+    from unimail.core.services import ComposeDraft
+
+    prev_host = account.smtp_host
+    prev_port = account.smtp_port
+    try:
+        cs.accounts.update_fields(account.id, {"smtp_host": host, "smtp_port": port})
+        draft = ComposeDraft(account_id=account.id, to=["a@b.com"],
+                             subject="s", body="b")
+        mid = cs.queue(draft)
+        return cs.send_one(mid).error
+    finally:
+        cs.accounts.update_fields(account.id, {"smtp_host": prev_host,
+                                               "smtp_port": prev_port})
+
+
+def test_smtp_message_construction():
+    """RFC 5322 构造：线程头顺序、编码、附件类型。"""
+    from unimail.platforms.smtp import build_message
+
+    msg = build_message(from_addr="me@qq.com", from_name="Me", to=["a@b.com"],
+                        subject="S", body_text="B",
+                        in_reply_to="<self@m>",
+                        references=["<r1@m>", "<r2@m>"])
+    check("From 含显示名", msg["From"] == "Me <me@qq.com>", f"实际 {msg['From']}")
+    check("无显示名时只有地址",
+          build_message(from_addr="me@qq.com", from_name="", to=["a@b.com"],
+                        subject="S", body_text="B")["From"] == "me@qq.com")
+    check("In-Reply-To 透传", msg["In-Reply-To"] == "<self@m>")
+    # 自身 ID 必须追加在链尾：收件方按最后一个元素找父邮件，
+    # 写成「自身在前」会把线程接到错误的位置。
+    check("References 把自身 ID 追加到链尾",
+          msg["References"] == "<r1@m> <r2@m> <self@m>",
+          f"实际 {msg['References']}")
+    check("Message-ID 带域", "@" in msg["Message-ID"], f"实际 {msg['Message-ID']}")
+    check("有 Date 头", bool(msg["Date"]))
+
+    # 中文主题必须按 RFC 2047 编码，否则收件端看到乱码
+    cn = build_message(from_addr="me@qq.com", from_name="我", to=["a@b.com"],
+                       subject="中文主题", body_text="正文")
+    raw = cn.as_bytes().decode("utf-8", errors="replace")
+    check("中文显示名/主题按 RFC2047 编码", "=?utf-8?" in raw, raw[:120])
+    check("中文正文不丢字", "正文" in raw)
+
+    # 附件
+    att = build_message(from_addr="me@qq.com", from_name="", to=["a@b.com"],
+                        subject="S", body_text="B",
+                        attachments=[("a.txt", b"hello", "text/plain"),
+                                     ("b.bin", b"\x00\x01", "application/octet-stream")])
+    check("两个附件都挂上", len(list(att.iter_attachments())) == 2)
+    names = sorted(p.get_filename() or "" for p in att.iter_attachments())
+    check("附件名保留", names == ["a.txt", "b.bin"], f"实际 {names}")
+
+    # HTML 正文与纯文本并存（双格式）
+    both = build_message(from_addr="me@qq.com", from_name="", to=["a@b.com"],
+                         subject="S", body_text="plain", body_html="<b>rich</b>")
+    types = [p.get_content_type() for p in both.walk() if p.get_content_maintype() == "text"]
+    check("纯文本与 HTML 并存", "text/plain" in types and "text/html" in types,
+          f"实际 {types}")
+
+
+def test_smtp_config_derivation():
+    """SMTP 连接参数从账号派生：主机推断、端口、OAuth2 标记。"""
+    from unimail.core.models import Account
+    from unimail.platforms.smtp import SmtpConfig
+
+    qq = Account(id="1", platform="qq", email="a@qq.com", imap_host="imap.qq.com",
+                 imap_port=993, use_ssl=True, username="a@qq.com")
+    cfg = SmtpConfig.from_account(qq, "authcode")
+    check("imap.qq.com → smtp.qq.com", cfg.host == "smtp.qq.com", f"实际 {cfg.host}")
+    check("SSL 账号走 465", cfg.port == 465, f"实际 {cfg.port}")
+    check("密码型账号不走 OAuth2", cfg.oauth2 is False)
+    check("平台键带入（用于认证失败提示）", cfg.platform == "qq", f"实际 {cfg.platform}")
+
+    # 自定义 IMAP：显式覆盖优先，且不会把 imap 主机猜成 smtp
+    corp = Account(id="2", platform="custom", email="b@corp.com",
+                   imap_host="mail.corp.com", imap_port=993, use_ssl=False,
+                   username="b@corp.com")
+    cfg2 = SmtpConfig.from_account(corp, "pw", host="smtp.corp.com", port=587)
+    check("显式 smtp_host 优先", cfg2.host == "smtp.corp.com", f"实际 {cfg2.host}")
+    check("显式 smtp_port 优先", cfg2.port == 587, f"实际 {cfg2.port}")
+    check("非 SSL 账号默认 587（STARTTLS）",
+          SmtpConfig.from_account(corp, "pw").port == 587)
+
+    # OAuth2 账号
+    out = Account(id="3", platform="outlook", email="c@outlook.com",
+                  imap_host="outlook.office365.com", imap_port=993, use_ssl=True,
+                  username="c@outlook.com", auth_type="oauth2_outlook")
+    cfg3 = SmtpConfig.from_account(out, "refresh-token")
+    check("OAuth2 账号标记 oauth2=True", cfg3.oauth2 is True)
+    check("OAuth2 账号的密码位承载 refresh_token",
+          cfg3.password == "refresh-token")
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -4774,6 +5051,9 @@ SUITES = [
     ("S-4 明文备份与清理清单", test_plaintext_backup_cleanup),
     ("F-3 分页 · P-1 会话 · P-2 索引", test_keyset_pagination_and_threads),
     ("F-1 OAuth2 / XOAUTH2", test_oauth_xoauth2),
+    ("F-2 发信：撰写入队与 outbox 状态机", test_compose_and_outbox),
+    ("F-2 发信：RFC 5322 构造与线程头", test_smtp_message_construction),
+    ("F-2 发信：SMTP 连接参数派生", test_smtp_config_derivation),
 ]
 
 

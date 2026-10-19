@@ -84,6 +84,10 @@ class Account:
     # 它不是「界面选项」而是**认证协议的选择**：OAuth2 账号的凭据栏里
     # 存的是 refresh_token，登录走 `AUTHENTICATE XOAUTH2` 而不是 `LOGIN`。
     auth_type: str = "password"
+    # SMTP 覆盖值。空 = 从 imap_host 推断（imap.qq.com → smtp.qq.com）。
+    # 自定义 IMAP 必须显式填：自建服务器的 SMTP 与 IMAP 没有必然关系。
+    smtp_host: str = ""
+    smtp_port: int = 0
     unread_count: int = 0          # 运行时统计，非持久化
     total_count: int = 0
 
@@ -102,6 +106,8 @@ class Account:
             last_synced_at=_parse_dt(row.get("last_synced_at")),
             status=row.get("status") or AccountStatus.OK.value,
             auth_type=row.get("auth_type") or "password",
+            smtp_host=row.get("smtp_host") or "",
+            smtp_port=int(row.get("smtp_port") or 0),
         )
 
     @property
@@ -137,7 +143,6 @@ class AttachmentMeta:
     size: int
     content_id: str | None = None
     part_index: str = ""       # IMAP part 编号，用于按需下载
-
 
 @dataclass
 class Attachment:
@@ -408,3 +413,60 @@ class MailFilter:
     # 「已加载的 200 封里的顺序」。排序必须下推到 SQL。
     order: str = "date"                # 白名单：date/sender/subject/platform/read/starred
     desc: bool = True
+
+
+# ---------------------------------------------------------------- 发信（outbox）
+# 发信状态机的四个状态。刻意与「同步」的状态机分开：发送是一次性的
+# 短连接动作，失败重试的语义是「这封还没出去」，而不是「这封的状态要回写」。
+OUTBOX_PENDING = "pending"        # 已入队，尚未发送
+OUTBOX_SENDING = "sending"        # 正在发送（崩溃后重启会被回收重试）
+OUTBOX_SENT = "sent"              # 服务器已接收
+OUTBOX_FAILED = "failed"          # 发送失败（保留原文与错误，供用户重试）
+
+
+@dataclass
+class OutboxMessage:
+    """一封待发 / 已发的邮件。
+
+    为什么整封邮件原文入库而不是只存「收件人 + 主题」
+    -------------------------------------------------
+    发送失败时用户需要能**原样重发**，包括附件。附件是二进制，单独存一张表
+    会让「重发」变成一次跨表重组，而重组过程任何一步出错都会产出一封
+    「少了附件」的邮件——那比发不出去更糟（对方以为附件是空的）。
+    因此这里存完整的 RFC 5322 原文（`raw`），发送时原样交给 SMTP，
+    重发时原样再交给 SMTP，中间不做任何解析与重组。
+
+    `raw` 是明文：outbox 表在加密数据库里（整库 AES-256），
+    与 credentials 同级保护，不额外加密。
+    """
+    id: str
+    account_id: str
+    status: str = OUTBOX_PENDING
+    subject: str = ""
+    to_addrs: str = ""              # 逗号分隔，仅用于列表展示
+    in_reply_to: str = ""
+    # 列名叫 ref_chain 而非 references：后者是 SQLite 保留字
+    # （`near "references": syntax error`，v5 已为同一原因避开一次）。
+    ref_chain: str = ""             # 空格分隔的 message-id 链
+    raw: str = ""                   # 完整 RFC 5322 原文
+    error: str = ""
+    attempts: int = 0
+    created_at: str = ""
+    sent_at: str = ""
+
+    @classmethod
+    def from_row(cls, row: dict) -> OutboxMessage:
+        return cls(
+            id=row["id"],
+            account_id=row["account_id"],
+            status=row.get("status") or OUTBOX_PENDING,
+            subject=row.get("subject") or "",
+            to_addrs=row.get("to_addrs") or "",
+            in_reply_to=row.get("in_reply_to") or "",
+            ref_chain=row.get("ref_chain") or "",
+            raw=row.get("raw") or "",
+            error=row.get("error") or "",
+            attempts=int(row.get("attempts") or 0),
+            created_at=row.get("created_at") or "",
+            sent_at=row.get("sent_at") or "",
+        )

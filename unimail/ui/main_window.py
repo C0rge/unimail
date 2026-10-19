@@ -44,6 +44,7 @@ from ..core.security import SecurityError
 from ..platforms import ImapError
 from . import icons
 from .account_panel import AccountPanel
+from .compose import ComposeDialog
 from .context import AppContext
 from .detail_panel import DetailPanel
 from .dialogs import AboutDialog, AddAccountDialog, FirstRunWizard, SettingsDialog
@@ -176,6 +177,11 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
 
         m_file = menubar.addMenu("文件")
+        act_compose = QAction(icons.icon("mail", "#8b98a9", 14), "写邮件…", self)
+        act_compose.setShortcut("Ctrl+E")
+        act_compose.triggered.connect(self._on_compose)
+        m_file.addAction(act_compose)
+
         act_add = QAction(icons.icon("plus", "#8b98a9", 14), "添加邮箱账号…", self)
         act_add.setShortcut("Ctrl+N")
         act_add.triggered.connect(self._on_add_account)
@@ -350,6 +356,9 @@ class MainWindow(QMainWindow):
         dp.inline_download_requested.connect(self._on_download_inline)
         dp.star_requested.connect(self._on_star)
         dp.export_requested.connect(lambda mid: self._on_export("eml", [mid] if mid else []))
+        dp.reply_requested.connect(lambda mid: self._on_reply(mid, reply_all=False))
+        dp.reply_all_requested.connect(lambda mid: self._on_reply(mid, reply_all=True))
+        dp.forward_requested.connect(self._on_forward)
 
         self.task_panel.cancel_requested.connect(self._on_cancel_task)
 
@@ -473,16 +482,117 @@ class MainWindow(QMainWindow):
     def _refresh_security_labels(self) -> None:
         level = self.ctx.db.encryption_level if self.ctx.db else ""
         self.encryption_label.setText(f"🔒 {level}" if level else "")
-        pending = 0
+        self._refresh_outbox_label()
+
+    def _refresh_outbox_label(self) -> None:
+        """状态栏的「待办」区：待同步标记 + 待发送邮件合并显示。
+
+        两者本质不同——「待同步标记」是本地已知、只差推到服务器的已读/星标，
+        用户无需干预；「待发送」是整封邮件还没送达，可能要重试。但状态栏
+        空间有限，合并成一段比各占一个常驻标签更清晰。
+        """
+        flags = 0
         try:
-            pending = self.ctx.mails.pending_flag_count() if self.ctx.mails else 0
+            flags = self.ctx.mails.pending_flag_count() if self.ctx.mails else 0
         except Exception:  # noqa: BLE001 - 仅状态展示
-            pending = 0
-        self.pending_label.setText(f"待同步标记 {pending}" if pending else "")
+            flags = 0
+        pending = failed = 0
+        if self.ctx.compose is not None:
+            try:
+                counts = self.ctx.compose.counts()
+                pending = counts.get("pending", 0) + counts.get("sending", 0)
+                failed = counts.get("failed", 0)
+            except Exception:  # noqa: BLE001 - 仅状态展示
+                pending = failed = 0
+        parts = []
+        if flags:
+            parts.append(f"待同步标记 {flags}")
+        if pending:
+            parts.append(f"待发送 {pending} 封")
+        if failed:
+            parts.append(f"发送失败 {failed} 封")
+        self.pending_label.setText(" · ".join(parts))
 
     def _on_account_selected(self, account) -> None:
         if self.ctx.accounts:
             self.ctx.accounts.set_active(account.id if account else None)
+
+    # ================================================================ 发信
+    def _on_compose(self) -> None:
+        """写新邮件。"""
+        if self._locked or self.ctx.compose is None:
+            return
+        accounts = self.ctx.accounts.list()
+        if not accounts:
+            QMessageBox.information(
+                self, "还没有邮箱账号",
+                "请先在「文件 → 添加邮箱账号」中添加一个账号，然后就能在这里写邮件了。")
+            return
+        dlg = ComposeDialog(self.ctx.compose, accounts, parent=self)
+        dlg.sent.connect(self._on_mail_sent)
+        dlg.exec()
+
+    def _on_reply(self, mail_id: str, *, reply_all: bool = False) -> None:
+        """回复（或全部回复）一封已收邮件。"""
+        if self._locked or self.ctx.compose is None:
+            return
+        try:
+            draft = self.ctx.compose.build_reply(mail_id, reply_all=reply_all)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法回复", str(exc))
+            return
+        accounts = self.ctx.accounts.list()
+        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self)
+        dlg.sent.connect(self._on_mail_sent)
+        dlg.exec()
+
+    def _on_forward(self, mail_id: str) -> None:
+        """转发一封已收邮件。"""
+        if self._locked or self.ctx.compose is None:
+            return
+        try:
+            draft = self.ctx.compose.build_forward(mail_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法转发", str(exc))
+            return
+        accounts = self.ctx.accounts.list()
+        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self)
+        dlg.sent.connect(self._on_mail_sent)
+        dlg.exec()
+
+    def send_outbox_item(self, msg_id: str) -> None:
+        """在后台线程投递一封已入队的邮件。
+
+        为什么不在 `ComposeDialog` 里同步发送：那一步包含完整 SMTP 会话
+        （最坏 30 秒），放在对话框的 `accept()` 之前会冻结界面。对话框只负责
+        「写入队列 + 关闭」，实际投递交给这里——与附件下载、导出走同一条
+        后台 IO 通道（`io_runner.py`），结果回主线程后如实汇报。
+        """
+        if self.ctx.compose is None:
+            return
+
+        def done(result, error) -> None:
+            if error is not None:
+                self.set_status("发送失败")
+                QMessageBox.warning(self, "发送失败",
+                                    f"邮件未能发出：\n\n{_io_error_text(error)}\n\n"
+                                    "它已保存在发件箱里，可以从那里重试。")
+                self._refresh_outbox_label()
+                return
+            if result.ok:
+                self.set_status("邮件已发送")
+            else:
+                self.set_status("发送失败")
+                QMessageBox.warning(self, "发送失败",
+                                    f"{result.error}\n\n邮件已保存在发件箱里，可以从那里重试。")
+            self._refresh_outbox_label()
+
+        self._run_io(lambda: self.ctx.compose.send_one(msg_id), done,
+                     key=f"smtp:{msg_id}")
+
+    def _on_mail_sent(self) -> None:
+        """撰写对话框关闭后刷新发件箱计数。"""
+        self._refresh_outbox_label()
 
     def _on_add_account(self) -> None:
         # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与

@@ -30,11 +30,13 @@ from ..platforms.oauth import (
     provider_for,
     refresh_access_token,
 )
+from ..platforms.smtp import SmtpConfig, SmtpError, build_message, send as smtp_send
 from ..storage import (
     AccountRepository,
     AttachmentRepository,
     CursorRepository,
     MailRepository,
+    OutboxRepository,
     PendingFlagRepository,
 )
 from .events import EventBus
@@ -46,6 +48,11 @@ from .models import (
     Mail,
     MailFilter,
     MailSummary,
+    OUTBOX_FAILED,
+    OUTBOX_PENDING,
+    OUTBOX_SENDING,
+    OUTBOX_SENT,
+    OutboxMessage,
     ThreadSummary,
 )
 from .security import SecurityError, SecurityService
@@ -1092,3 +1099,293 @@ def humanize_time(dt: datetime | None) -> str:
     if local.year == now.astimezone().year:
         return local.strftime("%m-%d %H:%M")
     return local.strftime("%Y-%m-%d")
+
+
+@dataclass
+class ComposeDraft:
+    """撰写界面的输入载体（含明文正文与附件字节，仅存活于内存）。
+
+    与 `AccountDraft` 同一性质：这是「用户正在写、还没发」的状态，
+    落库前一律经过加密库；`attachments` 里的字节在 `queue()` 时被编码进
+    RFC 5322 原文，之后即从内存丢弃（需要原文时从 outbox 的 `raw` 列取）。
+    """
+    account_id: str
+    to: list[str] = field(default_factory=list)
+    cc: list[str] = field(default_factory=list)
+    subject: str = ""
+    body: str = ""
+    in_reply_to: str = ""
+    ref_chain: list[str] = field(default_factory=list)
+    # [(文件名, 字节, MIME 类型)]
+    attachments: list[tuple[str, bytes, str]] = field(default_factory=list)
+
+    @property
+    def to_display(self) -> str:
+        return ", ".join(self.to)
+
+
+@dataclass
+class SendResult:
+    ok: bool
+    message_id: str = ""        # outbox 行 id
+    error: str = ""
+    queued: bool = False        # True = 只入队未发送（离线模式）
+
+
+class ComposeService:
+    """发信用例：构造邮件 → 入队 → 发送 → 状态回写。
+
+    为什么先入队再发送
+    ----------------
+    直接「点发送 → SMTP 同步调用」看起来更简单，但有两个真问题：
+    1. **失败即丢失**。SMTP 失败（网络抖动、认证过期、服务器 5xx）时邮件
+       只在内存里，用户点过发送就只能重写——包括重选附件。
+    2. **无法跨重启**。应用在发送途中崩溃（或用户手动杀进程），那封邮件
+       连记录都不存在。
+
+    因此顺序固定为：`queue()` 落库（含完整原文）→ `send_one()` 发送 →
+    状态回写。`queue()` 与 `send_one()` 分开，也顺带给出了「离线排队、
+    稍后统一发送」的形态——发送失败时邮件留在 outbox 里，用户随时可重试。
+
+    为什么不自动重发
+    ----------------
+    邮件不能盲目重试：SMTP 的 `DATA` 阶段服务器可能已经收下、只是响应
+    丢了，此时重发会让对方收到两封完全相同的邮件。因此失败态由**用户**
+    决定是否重试（`retry()`），attempts 计数只是让界面能显示「已试过 N 次」。
+    """
+
+    def __init__(self, accounts: AccountRepository, outbox: OutboxRepository,
+                 security, bus: EventBus | None = None,
+                 mails: MailRepository | None = None) -> None:
+        self.accounts = accounts
+        self.outbox = outbox
+        self.security = security
+        self.bus = bus
+        # 邮件仓储仅「回复/转发」需要（读原邮件的线程头），新邮件不需要。
+        # 做成可选参数而不是必填：调用方只发新邮件时不必关心它。
+        self.mails = mails
+        # access_token 内存缓存（与 AccountService 各持一份，避免为了发一封邮件
+        # 把整个 AccountService 拖进来）。同样不落盘。
+        self._tokens: dict[str, TokenSet] = {}
+
+    # ------------------------------------------------------------ 凭据
+    def _account_and_secret(self, account_id: str) -> tuple[Account, str]:
+        """取账号与**可用密码/token**。
+
+        OAuth2 账号在此换成短期 access_token：SMTP 的 XOAUTH2 要的是
+        access_token，而库里存的是 refresh_token。不换的话发送必然失败，
+        而用户看到的是「认证被拒」——他会去改密码，那条路对 OAuth2 账号
+        根本不存在。
+        """
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise ValueError("账号不存在或已被删除")
+        ciphertext = self.accounts.get_credential(account.id)
+        if ciphertext is None:
+            raise ValueError("无法获取该账号凭据，请重新添加账号")
+        secret = self.security.decrypt_secret(ciphertext)
+        if str(getattr(account, "auth_type", "")).startswith("oauth2"):
+            secret = self._access_token(account, secret)
+        return account, secret
+
+    def _access_token(self, account: Account, refresh_token: str) -> str:
+        cached = self._tokens.get(account.id)
+        if cached is not None and not cached.expired():
+            return cached.access_token
+        try:
+            tokens = refresh_access_token(provider_for(account.platform), refresh_token)
+        except OAuthError as exc:
+            raise ValueError(
+                f"OAuth2 授权已失效，无法发送：{exc}\n请在账号管理中重新授权。"
+            ) from exc
+        self._tokens[account.id] = tokens
+        return tokens.access_token
+
+    # ------------------------------------------------------------ 队列
+    def queue(self, draft: ComposeDraft) -> str:
+        """把一封邮件写入 outbox（完整原文），返回 outbox id。"""
+        account, secret = self._account_and_secret(draft.account_id)
+        if not draft.to:
+            raise ValueError("请填写收件人")
+        if not draft.subject.strip() and not draft.body.strip():
+            raise ValueError("主题与正文不能都为空")
+
+        msg = build_message(
+            from_addr=account.email,
+            from_name=account.display_name or "",
+            to=draft.to,
+            subject=draft.subject,
+            body_text=draft.body,
+            cc=draft.cc or None,
+            in_reply_to=draft.in_reply_to,
+            references=draft.ref_chain or None,
+            attachments=draft.attachments or None,
+        )
+        # `as_bytes()` 而非 `as_string()`：后者按 policy 重新编码，
+        # 含非 ASCII 附件名时可能改变字节序；原文要原样重放，必须是确定性字节。
+        raw = msg.as_bytes().decode("utf-8", errors="replace")
+        msg_id = self.outbox.add(
+            draft.account_id, draft.subject, draft.to_display, raw,
+            in_reply_to=draft.in_reply_to, ref_chain=" ".join(draft.ref_chain),
+        )
+        log.info("邮件已入队：%s → %s", account.email, draft.to_display)
+        return msg_id
+
+    # ------------------------------------------------------------ 发送
+    def send_one(self, outbox_id: str) -> SendResult:
+        """发送队列里的一封。失败时保留原文与错误，供用户重试。"""
+        item = self.outbox.get(outbox_id)
+        if item is None:
+            return SendResult(ok=False, error="找不到该封待发邮件")
+        if item.status == OUTBOX_SENT:
+            return SendResult(ok=True, message_id=outbox_id)
+
+        try:
+            account, secret = self._account_and_secret(item.account_id)
+        except ValueError as exc:
+            self.outbox.mark_failed(outbox_id, str(exc))
+            return SendResult(ok=False, message_id=outbox_id, error=str(exc))
+
+        self.outbox.mark_sending(outbox_id)
+        cfg = SmtpConfig.from_account(account, secret)
+        # outbox 里存的是完整 RFC 5322 原文，**原样**交给 SMTP：
+        # 中途解析再重组会引入「附件丢失 / 头顺序变化 / 编码被改」的风险，
+        # 而原样重放保证「发出去的与用户看到的队列内容完全一致」。
+        message = email.message_from_string(item.raw)
+        try:
+            smtp_send(cfg, message)
+        except (SmtpError, OAuthError) as exc:
+            self.outbox.mark_failed(outbox_id, str(exc))
+            log.warning("发送失败（%s）：%s", outbox_id, exc)
+            return SendResult(ok=False, message_id=outbox_id, error=str(exc))
+        self.outbox.mark_sent(outbox_id)
+        log.info("邮件已发送：%s", item.subject)
+        return SendResult(ok=True, message_id=outbox_id)
+
+    def send_all_pending(self, account_id: str | None = None) -> list[SendResult]:
+        """把队列里全部待发邮件依次发出（串行：SMTP 是短连接，并发无收益，
+        且多数服务商对同一账号的并发登录有限制）。"""
+        results = []
+        for item in self.outbox.pending(account_id):
+            results.append(self.send_one(item.id))
+        return results
+
+    def retry(self, outbox_id: str) -> SendResult:
+        """用户主动重试：清掉错误态后重新发送。"""
+        item = self.outbox.get(outbox_id)
+        if item is None:
+            return SendResult(ok=False, error="找不到该封邮件")
+        self.outbox.reset_to_pending(outbox_id)
+        return self.send_one(outbox_id)
+
+    # ------------------------------------------------------------ 查询
+    def list(self, account_id: str | None = None, limit: int = 100) -> list[OutboxMessage]:
+        return self.outbox.list(account_id, limit)
+
+    def pending_count(self, account_id: str | None = None) -> int:
+        return len(self.outbox.pending(account_id))
+
+    def counts(self, account_id: str | None = None) -> dict[str, int]:
+        return self.outbox.counts(account_id)
+
+    def delete(self, outbox_id: str) -> None:
+        self.outbox.delete(outbox_id)
+
+    # ------------------------------------------------------------ 回复/转发
+    def build_reply(self, mail_id: str, *, reply_all: bool = False,
+                    account_id: str = "") -> ComposeDraft:
+        """按一封已收邮件构造回复草稿（不含引用原文，正文由界面预填）。
+
+        **线程头必须从原邮件取**：`In-Reply-To` 填原邮件的 Message-ID，
+        `References` 是「原邮件的 References + 其 Message-ID」。这两项填错，
+        对方客户端（以及 UniMail 自己的会话视图）会把回复显示成独立新邮件，
+        会话就此断链——这是「回复」功能最核心的正确性要求，比正文格式重要得多。
+
+        引用原文刻意**不**在此处拼进 body：顶部引用 vs 底部引用、
+        是否带「在 … 写道：」前缀，是见仁见智的界面选择，属于 UI 层的决策。
+        """
+        from .models import load_str_list
+
+        mail = self.mails_get(mail_id)
+        if mail is None:
+            raise ValueError("找不到该邮件")
+        draft = ComposeDraft(account_id=account_id or mail.account_id)
+        draft.subject = self._reply_subject(mail.subject or "")
+        draft.in_reply_to = mail.message_id or ""
+        chain = list(mail.references)
+        if mail.message_id and mail.message_id not in chain:
+            chain.append(mail.message_id)
+        draft.ref_chain = chain
+        draft.to = self._reply_recipients(mail, reply_all=reply_all)
+        if reply_all and mail.to_addrs:
+            draft.cc = self._cc_recipients(mail)
+        return draft
+
+    def build_forward(self, mail_id: str, *, account_id: str = "") -> ComposeDraft:
+        """构造转发草稿（不带线程头——转发不是线程的一部分）。"""
+        mail = self.mails_get(mail_id)
+        if mail is None:
+            raise ValueError("找不到该邮件")
+        draft = ComposeDraft(account_id=account_id or mail.account_id)
+        draft.subject = self._forward_subject(mail.subject or "")
+        # 转发保留原邮件的基本信息，正文由界面拼装（含附件提示）。
+        header = [
+            "",
+            "---------- 转发的邮件 ----------",
+            f"发件人：{mail.from_name} <{mail.from_addr}>",
+            f"日期：{mail.date.isoformat() if mail.date else ''}",
+            f"主题：{mail.subject or ''}",
+            "",
+        ]
+        draft.body = "\n".join(header) + (mail.body_text or "")
+        return draft
+
+    def mails_get(self, mail_id: str):
+        """经 MailRepository 取一封邮件。
+
+        `self.mails` 为 None 时给出可读错误而不是 AttributeError：
+        构造时没传邮件仓储（只发新邮件的用法）却调了回复/转发，
+        那是调用方的接线疏漏，错误信息要说明缺什么。
+        """
+        if self.mails is None:
+            raise ValueError("邮件仓储未配置，无法读取原邮件（回复/转发不可用）")
+        return self.mails.get(mail_id)
+
+    @staticmethod
+    def _reply_subject(subject: str) -> str:
+        s = subject.strip()
+        if s.lower().startswith("re:"):
+            return s
+        return f"Re: {s}" if s else "Re:"
+
+    @staticmethod
+    def _forward_subject(subject: str) -> str:
+        s = subject.strip()
+        if s.lower().startswith("fwd:"):
+            return s
+        return f"Fwd: {s}" if s else "Fwd:"
+
+    @staticmethod
+    def _reply_recipients(mail, *, reply_all: bool) -> list[str]:
+        """回复的收件人：默认只回发件人；reply_all 时加上原 To 里的其他人。"""
+        to: list[str] = []
+        if mail.from_addr:
+            to.append(mail.from_addr)
+        if reply_all:
+            for addr in (mail.to_addrs or []):
+                if addr and addr not in to:
+                    to.append(addr)
+        return to
+
+    @staticmethod
+    def _cc_recipients(mail) -> list[str]:
+        """reply_all 的 CC：原邮件的 To 里除发件人与主收件人之外的人。
+
+        刻意**不**把原 CC 的人带进回复的 CC：原邮件的 CC 往往是上一线程的
+        旁观者，继续抄送会把讨论扩散给不相关的人。
+        """
+        cc: list[str] = []
+        for addr in (mail.to_addrs or []):
+            if addr and addr != mail.from_addr and addr not in cc:
+                cc.append(addr)
+        return cc

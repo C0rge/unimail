@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from ..config import PLATFORMS
 from ..core.models import (
     MAIL_SUMMARY_COLUMNS,
+    OUTBOX_PENDING,
     Account,
     AccountStatus,
     Attachment,
@@ -16,6 +17,7 @@ from ..core.models import (
     MailFilter,
     MailSummary,
     NormalizedMail,
+    OutboxMessage,
     ThreadSummary,
     load_str_list,
     make_preview,
@@ -62,7 +64,7 @@ _ORDER_COLUMNS = {
 _ACCOUNT_UPDATABLE = frozenset({
     "platform", "email", "display_name", "imap_host", "imap_port",
     "use_ssl", "username", "sync_interval", "last_synced_at", "status",
-    "auth_type",
+    "auth_type", "smtp_host", "smtp_port",
 })
 
 # 附件落盘路径列表。
@@ -117,13 +119,15 @@ class AccountRepository:
         self.db.execute(
             """INSERT INTO accounts
                (id, platform, email, display_name, imap_host, imap_port, use_ssl,
-                username, sync_interval, status, auth_type, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                username, sync_interval, status, auth_type, smtp_host, smtp_port, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 acc_id, draft.platform, draft.email.lower().strip(),
                 draft.display_name or "", host, port, 1 if use_ssl else 0,
                 draft.username, draft.sync_interval, AccountStatus.OK.value,
                 getattr(draft, "auth_type", "password") or "password",
+                getattr(draft, "smtp_host", "") or "",
+                int(getattr(draft, "smtp_port", 0) or 0),
                 utcnow_iso(),
             ),
         )
@@ -1176,3 +1180,93 @@ class PendingFlagRepository:
             "DELETE FROM pending_flags WHERE account_id = ? AND folder = ? AND uid = ?",
             (account_id, folder or "INBOX", str(uid)),
         )
+
+
+class OutboxRepository:
+    """发件箱：待发 / 已发邮件的持久化队列。
+
+    与 `PendingFlagRepository` 的分工
+    -------------------------------
+    那是「标记回写」队列（本地状态已知、只差推到服务器）；这里是「整封邮件」
+    队列（内容本身还没送达）。两者的失败语义不同：标记推失败可以无限重试
+    （幂等），而邮件**不能盲目重发**——服务器可能已经收下只是响应丢了，
+    重发会让对方收到两封。因此这里的状态机带 `attempts` 与明确的失败态，
+    由用户决定是否重试，不自动重发。
+    """
+
+    def __init__(self, db) -> None:
+        self.db = db
+
+    def add(self, account_id: str, subject: str, to_addrs: str, raw: str,
+            in_reply_to: str = "", ref_chain: str = "") -> str:
+        msg_id = new_id()
+        self.db.execute(
+            "INSERT INTO outbox"
+            "(id, account_id, status, subject, to_addrs, in_reply_to, ref_chain,"
+            " raw, error, attempts, created_at, sent_at) "
+            "VALUES(?,?,?,?,?,?,?,?,'',0,?,'')",
+            (msg_id, account_id, OUTBOX_PENDING, subject, to_addrs,
+             in_reply_to, ref_chain, raw, utcnow_iso()),
+        )
+        return msg_id
+
+    def get(self, msg_id: str) -> OutboxMessage | None:
+        row = self.db.query_one("SELECT * FROM outbox WHERE id = ?", (msg_id,))
+        return OutboxMessage.from_row(row) if row else None
+
+    def list(self, account_id: str | None = None, limit: int = 200) -> list[OutboxMessage]:
+        if account_id:
+            rows = self.db.query_all(
+                "SELECT * FROM outbox WHERE account_id = ? ORDER BY created_at DESC LIMIT ?",
+                (account_id, limit))
+        else:
+            rows = self.db.query_all(
+                "SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?", (limit,))
+        return [OutboxMessage.from_row(r) for r in rows]
+
+    def pending(self, account_id: str | None = None) -> list[OutboxMessage]:
+        """所有待发送的邮件（含上次中断留下的 sending，由迁移回收为 pending）。"""
+        if account_id:
+            rows = self.db.query_all(
+                "SELECT * FROM outbox WHERE status IN ('pending','sending') "
+                "AND account_id = ? ORDER BY created_at ASC", (account_id,))
+        else:
+            rows = self.db.query_all(
+                "SELECT * FROM outbox WHERE status IN ('pending','sending') "
+                "ORDER BY created_at ASC")
+        return [OutboxMessage.from_row(r) for r in rows]
+
+    def mark_sending(self, msg_id: str) -> None:
+        self.db.execute(
+            "UPDATE outbox SET status = 'sending', attempts = attempts + 1 WHERE id = ?",
+            (msg_id,))
+
+    def mark_sent(self, msg_id: str) -> None:
+        self.db.execute(
+            "UPDATE outbox SET status = 'sent', sent_at = ?, error = '' WHERE id = ?",
+            (utcnow_iso(), msg_id))
+
+    def mark_failed(self, msg_id: str, error: str) -> None:
+        """失败但保留原文：用户要能原样重发，因此**不删除**。"""
+        self.db.execute(
+            "UPDATE outbox SET status = 'failed', error = ? WHERE id = ?",
+            (error[:2000], msg_id))
+
+    def reset_to_pending(self, msg_id: str) -> None:
+        """用户点「重试」：清掉错误回到待发。"""
+        self.db.execute(
+            "UPDATE outbox SET status = 'pending', error = '' WHERE id = ?", (msg_id,))
+
+    def delete(self, msg_id: str) -> None:
+        self.db.execute("DELETE FROM outbox WHERE id = ?", (msg_id,))
+
+    def counts(self, account_id: str | None = None) -> dict[str, int]:
+        """按状态计数，供界面显示「N 封待发送」。"""
+        if account_id:
+            rows = self.db.query_all(
+                "SELECT status, COUNT(*) AS n FROM outbox WHERE account_id = ? "
+                "GROUP BY status", (account_id,))
+        else:
+            rows = self.db.query_all(
+                "SELECT status, COUNT(*) AS n FROM outbox GROUP BY status")
+        return {str(r["status"]): int(r["n"] or 0) for r in rows}

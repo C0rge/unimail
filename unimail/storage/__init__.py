@@ -11,6 +11,7 @@ from .repositories import (
     AttachmentRepository,
     CursorRepository,
     MailRepository,
+    OutboxRepository,
     PendingFlagRepository,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
     "Database",
     "DatabaseError",
     "MailRepository",
+    "OutboxRepository",
     "PendingFlagRepository",
     "sqlcipher_available",
 ]
