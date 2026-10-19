@@ -218,7 +218,7 @@ def sign_exe(exe: Path, cfg: SignConfig) -> bool:
         print("[x] 签名失败：")
         print((result.stdout or "") + (result.stderr or ""))
         return False
-    print("[✓] 签名完成")
+    print("[OK] 签名完成")
 
     if cfg.verify:
         status = signature_status(exe)
@@ -363,7 +363,7 @@ def build(onedir: bool, clean: bool, icon: Path | None = None) -> Path:
         print(f"[x] 未找到产物：{exe}")
         sys.exit(1)
     size_mb = exe.stat().st_size / (1024 * 1024)
-    print(f"[✓] 打包完成：{exe}  ({size_mb:.1f} MB)")
+    print(f"[OK] 打包完成：{exe}  ({size_mb:.1f} MB)")
     return exe
 
 

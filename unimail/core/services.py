@@ -1,6 +1,7 @@
 """应用服务层：用例编排（账号管理、邮件查询、附件）。"""
 from __future__ import annotations
 
+import builtins
 import contextlib
 import csv
 import email
