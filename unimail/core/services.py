@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List as _List
 
 from ..config import (
     ATTACHMENT_DIR,
@@ -1265,7 +1266,7 @@ class ComposeService:
         log.info("邮件已发送：%s", item.subject)
         return SendResult(ok=True, message_id=outbox_id)
 
-    def send_all_pending(self, account_id: str | None = None) -> list[SendResult]:
+    def send_all_pending(self, account_id: str | None = None) -> _List[SendResult]:
         """把队列里全部待发邮件依次发出（串行：SMTP 是短连接，并发无收益，
         且多数服务商对同一账号的并发登录有限制）。"""
         results = []
@@ -1282,7 +1283,12 @@ class ComposeService:
         return self.send_one(outbox_id)
 
     # ------------------------------------------------------------ 查询
-    def list(self, account_id: str | None = None, limit: int = 100) -> list[OutboxMessage]:
+    def list(self, account_id: str | None = None, limit: int = 100) -> _List[OutboxMessage]:
+        # 注解用 `_List` 而不是 `list`：本类自己有个叫 `list` 的方法，
+        # 而 PEP 563 的字符串注解是在**类作用域**内解析的，`list[X]` 会被
+        # 解析成那个方法本身（mypy: "Function ... is not valid as a type"）。
+        # `storage/repositories.py` 为同一个原因给 `AccountRepository.list`
+        # 做了同样的处理（见该文件顶部的 `StoredPaths` 别名说明）。
         return self.outbox.list(account_id, limit)
 
     def pending_count(self, account_id: str | None = None) -> int:
@@ -1367,7 +1373,7 @@ class ComposeService:
         return f"Fwd: {s}" if s else "Fwd:"
 
     @staticmethod
-    def _reply_recipients(mail, *, reply_all: bool) -> list[str]:
+    def _reply_recipients(mail, *, reply_all: bool) -> _List[str]:
         """回复的收件人：默认只回发件人；reply_all 时加上原 To 里的其他人。"""
         to: list[str] = []
         if mail.from_addr:
@@ -1379,7 +1385,7 @@ class ComposeService:
         return to
 
     @staticmethod
-    def _cc_recipients(mail) -> list[str]:
+    def _cc_recipients(mail) -> _List[str]:
         """reply_all 的 CC：原邮件的 To 里除发件人与主收件人之外的人。
 
         刻意**不**把原 CC 的人带进回复的 CC：原邮件的 CC 往往是上一线程的

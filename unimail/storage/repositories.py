@@ -74,6 +74,10 @@ _ACCOUNT_UPDATABLE = frozenset({
 # type"）。用具名别名即可回避，也顺便说明了这个返回值的语义。
 StoredPaths = list[str]
 
+# 同上：`OutboxRepository` 与 `AccountRepository` 一样有名为 `list` 的方法，
+# 因此它的返回注解也要用别名（否则 mypy 报 valid-type）。
+OutboxList = list[OutboxMessage]
+
 
 @dataclass
 class BatchInsertResult:
@@ -1214,7 +1218,7 @@ class OutboxRepository:
         row = self.db.query_one("SELECT * FROM outbox WHERE id = ?", (msg_id,))
         return OutboxMessage.from_row(row) if row else None
 
-    def list(self, account_id: str | None = None, limit: int = 200) -> list[OutboxMessage]:
+    def list(self, account_id: str | None = None, limit: int = 200) -> OutboxList:
         if account_id:
             rows = self.db.query_all(
                 "SELECT * FROM outbox WHERE account_id = ? ORDER BY created_at DESC LIMIT ?",
@@ -1224,7 +1228,7 @@ class OutboxRepository:
                 "SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?", (limit,))
         return [OutboxMessage.from_row(r) for r in rows]
 
-    def pending(self, account_id: str | None = None) -> list[OutboxMessage]:
+    def pending(self, account_id: str | None = None) -> OutboxList:
         """所有待发送的邮件（含上次中断留下的 sending，由迁移回收为 pending）。"""
         if account_id:
             rows = self.db.query_all(

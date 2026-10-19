@@ -34,6 +34,7 @@ Thunderbird、Spark 全都把「写邮件」当作第一公民）。
 from __future__ import annotations
 
 import contextlib
+import email.message
 import logging
 import smtplib
 import ssl
@@ -151,7 +152,9 @@ class _ProxiedSMTP(smtplib.SMTP_SSL):
 
     def _get_socket(self, host, port, timeout):  # type: ignore[no-untyped-def]
         if self.proxy is None:
-            return super()._get_socket(host, port, timeout)
+            # typeshed 未在 SMTP/SMTP_SSL 上声明 `_get_socket`，运行期它一定在。
+            # 与 platforms/base.py 的 `_create_socket` 同一处理。
+            return super()._get_socket(host, port, timeout)  # type: ignore[misc]
         sock = open_proxy_tunnel(self.proxy, host, port, timeout)
         return self.context.wrap_socket(sock, server_hostname=host)
 
@@ -172,7 +175,7 @@ class _ProxiedSMTPStartTLS(smtplib.SMTP):
 
     def _get_socket(self, host, port, timeout):  # type: ignore[no-untyped-def]
         if self.proxy is None:
-            return super()._get_socket(host, port, timeout)
+            return super()._get_socket(host, port, timeout)  # type: ignore[misc]
         return open_proxy_tunnel(self.proxy, host, port, timeout)
 
     def starttls(self, *, context: ssl.SSLContext | None = None):  # type: ignore[override]
@@ -236,8 +239,14 @@ def _domain_of(addr: str) -> str:
     return addr.split("@", 1)[1] if "@" in addr else "localhost"
 
 
-def send(cfg: SmtpConfig, message: EmailMessage) -> None:
+def send(cfg: SmtpConfig, message: email.message.Message) -> None:
     """发一封邮件。失败抛 `SmtpError`（消息面向用户）。
+
+    参数类型是 `email.message.Message` 而不是 `EmailMessage`：
+    outbox 里存的是 RFC 5322 原文，重放时用 `message_from_string()` 解析，
+    它返回的是兼容层 `Message`（没有 `iter_attachments()` 等新 API）。
+    `smtplib.send_message()` 本身也只要求 `Message`，因此这里按实际
+    接受的范围声明，而不是逼调用方做一次无意义的类型转换。
 
     端口语义
     --------
@@ -353,11 +362,15 @@ def _login(server: smtplib.SMTP, cfg: SmtpConfig) -> None:
     """认证。OAuth2 走 XOAUTH2，其余走 LOGIN。"""
     if cfg.oauth2:
         payload = xoauth2_string(cfg.username, cfg.password)
-        # 不在 EHLO 阶段预发 initial response：部分服务器（尤其企业邮）
-        # 对 `AUTH XOAUTH2 <initial>` 的处理与标准 SASL-IR 不一致，
-        # 等服务器发出 334 挑战后再回同样的 payload，兼容性更好。
+
+        def _respond(_challenge):     # noqa: ANN001 - 签名由 smtplib 的协议决定
+            # 不在 EHLO 阶段预发 initial response：部分服务器（尤其企业邮）
+            # 对 `AUTH XOAUTH2 <initial>` 的处理与标准 SASL-IR 不一致，
+            # 等服务器发出 334 挑战后再回同样的 payload，兼容性更好。
+            return payload
+
         try:
-            server.auth("XOAUTH2", lambda _challenge: payload)
+            server.auth("XOAUTH2", _respond)
         except smtplib.SMTPException as exc:
             raise OAuthError(f"XOAUTH2 认证失败：{exc}") from exc
         return
