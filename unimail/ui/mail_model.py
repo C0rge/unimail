@@ -392,6 +392,24 @@ class MailTableModel(QAbstractTableModel):
     def set_expanded_threads(self, keys) -> None:
         self._expanded = set(keys)
 
+    def append_mails(self, mails: list[Row]) -> int:
+        """在末尾追加一页（滚动加载），已存在的 id 跳过。
+
+        与 `insert_rows(front=True)` 的区别：这是「时间倒序列表的下一页」，
+        必须落在尾部。顺序由服务端 `ORDER BY` 决定，模型不再本地重排——
+        在分页场景下本地重排会让游标边界失效（下一页又从旧的边界开始）。
+        """
+        fresh = [m for m in mails if m.id not in self._row_index]
+        if not fresh:
+            return 0
+        start = len(self._rows)
+        self.beginInsertRows(QModelIndex(), start, start + len(fresh) - 1)
+        self._rows.extend(fresh)
+        self._meta.extend(RowMeta() for _ in fresh)
+        self.endInsertRows()
+        self._reindex()
+        return len(fresh)
+
     def _apply(self, rows: list[Row], metas: list[RowMeta]) -> None:
         self.beginResetModel()
         self._rows = list(rows)

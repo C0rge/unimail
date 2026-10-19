@@ -1,6 +1,7 @@
 """应用上下文：组装所有服务，管理数据库生命周期。"""
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -108,6 +109,9 @@ class AppContext:
         self.device_binding = DeviceBinding()
         self.is_first_run = not DB_PATH.exists()
         self.kdf_upgrade_pending = False      # 现有库的 KDF 参数是否弱于当前默认
+        # 上一次加密迁移遗留在磁盘上的明文备份（正常路径下已被清理，为 None）。
+        # UI 据此如实告知用户，而不是笼统地说「迁移完成」。
+        self.last_plaintext_backup: Path | None = None
         self._quiesced = False                # 「改密码 / 迁移加密」期间暂停后台 IO
         self._closed = False                  # 让 shutdown() 可重复调用
 
@@ -232,13 +236,17 @@ class AppContext:
         log.info("已初始化新数据库，加密等级：%s，KDF：%s",
                  self.db.encryption_level, params.display)
 
-    def unlock(self, password: str) -> None:
-        """后续启动：校验主密码并解锁。
+    def unlock(self, password: str, guard: UnlockGuard | None = None) -> None:
+        """后续启动（或锁屏后）校验主密码并解锁。
 
         失败按次退避且**跨进程持久化**——否则「关掉重开」就能把尝试次数清零，
         3 次上限形同虚设。
+
+        `guard` 允许调用方注入自己那一个实例：锁屏界面与登录框必须共用
+        **同一个**退避对象，否则两边各自计数，等于把上限翻倍；测试也需要
+        把状态指到临时文件而不是真实数据目录。
         """
-        guard = UnlockGuard()
+        guard = guard or UnlockGuard()
         guard.check()
         params, verifier, driver = self._read_security_meta()
         try:
@@ -259,6 +267,58 @@ class AppContext:
         self._wire()
         log.info("数据库已解锁，加密等级：%s，KDF：%s",
                  self.db.encryption_level, params.display)
+
+    def lock(self, *, stop_timeout_ms: int = 2000) -> None:
+        """把应用降回「未解锁」状态（锁屏语义，**可逆**）。
+
+        与 `shutdown()` 的区别是之后还能再解锁。锁屏必须真的走到这一步：
+        只盖一层遮罩、却把主密钥与数据库连接留在内存里，那道遮罩就只防肩窥——
+        任何能操作这台机器的人都能绕过它直接读数据。
+
+        顺序刻意如此：先停后台（它们持有明文凭据、可能正在写库），再断会话，
+        最后才关库与清密钥。反过来会让正在跑的线程拿着已清空的密钥抛异常。
+        后台线程由 `stop_all` 的超时上界兜住，不在这里无限等。
+        """
+        if self.db is not None:
+            if self.scheduler:
+                self.scheduler.stop()
+            if self.pool:
+                self.pool.stop_all(timeout_ms=stop_timeout_ms)
+            if self.body_pool:
+                self.body_pool.cancel_running(timeout=stop_timeout_ms / 1000.0)
+            # 同步摘除 + 异步断开：摘除一旦生效，池里就不可能再借出
+            # 带着明文凭据的旧会话。
+            self.sessions.close_all()
+            try:
+                self.db.close()
+            except Exception:
+                log.warning("锁屏时关闭数据库失败", exc_info=True)
+        self.db = None
+        self.accounts = None
+        self.mails = None
+        self.pool = None
+        self.body_pool = None
+        self.scheduler = None
+        self.security.lock()
+        log.info("安全上下文已锁定（密钥已清除、数据库连接已关闭）")
+
+    def unlock_with_master_key(self, master_key: bytes) -> None:
+        """设备绑定免密解锁：用已保存的主密钥恢复会话并重开数据库。
+
+        主密钥等价于主密码，所以必须**先**确认它与当前库匹配：改过主密码
+        但没解绑设备时，旧密钥仍能从 DPAPI / Keychain 取回，不校验就会
+        用一个对不上的密钥去开库。
+        """
+        params, verifier, driver = self._read_security_meta()
+        if not hmac.compare_digest(
+                SecurityService.make_verifier(master_key), verifier or ""):
+            raise SecurityError("设备绑定与本数据库不匹配，请用主密码解锁")
+        self.security.restore_from_master_key(master_key)
+        self.db = self._open_database(self.security.db_key(), driver)
+        self._write_security_meta(params, verifier, driver=self.db.driver_name)
+        self.kdf_upgrade_pending = SecurityService.needs_upgrade(params)
+        self._wire()
+        log.info("已通过设备绑定解锁，加密等级：%s", self.db.encryption_level)
 
     def _open_database(self, db_key: bytes, driver: str | None) -> Database:
         """按 sidecar 记录的驱动打开数据库；记录缺失时双向回退探测。
@@ -305,8 +365,10 @@ class AppContext:
         try:
             key = self.security.db_key()
             if target == "encrypted":
-                self.db.migrate_to_encrypted(key)
+                # 返回值是「仍留在磁盘上的明文备份」；正常路径下已被清理。
+                self.last_plaintext_backup = self.db.migrate_to_encrypted(key)
             else:
+                self.last_plaintext_backup = None
                 self.db.migrate_to_plaintext()
         finally:
             self._resume(resume)

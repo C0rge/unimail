@@ -43,11 +43,26 @@ def escape_like(value: str) -> str:
                  .replace("_", "\\_"))
 
 
+# 列表排序的列白名单：键来自 UI 表头，值拼进 ORDER BY。
+# `ORDER BY` 无法用占位符参数化，任何把用户输入直接拼进去的写法都是注入面，
+# 因此这里只接受固定键，未知键回落到 date。
+_ORDER_COLUMNS = {
+    "time": "m.date",
+    "date": "m.date",
+    "sender": "m.from_name COLLATE NOCASE",
+    "subject": "m.subject COLLATE NOCASE",
+    "platform": "m.platform",
+    "read": "m.is_read",
+    "starred": "m.is_starred",
+}
+
+
 # accounts 表允许被 update_fields 修改的列。动态列名在 SQL 里是典型的注入 sink，
 # 即使当前调用方全是内部常量，也必须用白名单把它收口。
 _ACCOUNT_UPDATABLE = frozenset({
     "platform", "email", "display_name", "imap_host", "imap_port",
     "use_ssl", "username", "sync_interval", "last_synced_at", "status",
+    "auth_type",
 })
 
 # 附件落盘路径列表。
@@ -102,12 +117,13 @@ class AccountRepository:
         self.db.execute(
             """INSERT INTO accounts
                (id, platform, email, display_name, imap_host, imap_port, use_ssl,
-                username, sync_interval, status, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                username, sync_interval, status, auth_type, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 acc_id, draft.platform, draft.email.lower().strip(),
                 draft.display_name or "", host, port, 1 if use_ssl else 0,
                 draft.username, draft.sync_interval, AccountStatus.OK.value,
+                getattr(draft, "auth_type", "password") or "password",
                 utcnow_iso(),
             ),
         )
@@ -715,11 +731,18 @@ class MailRepository:
           * 不可用 / 关键词没有可检索词元 → 回退 `LIKE`（功能不缺失，只是更慢）
 
         `order` 为 `"rank"` 时按相关度排序（只对 FTS 路径有意义）。
+        其余情况按 `flt.order` 走白名单列排序——排序**必须**在服务端完成，
+        否则分页之后「按发件人排序」只排了已加载的那一页。
         """
         sql, params, use_fts = self._base_sql(flt, cols)
         if use_fts and order == "rank":
             return sql + " ORDER BY rank LIMIT ?", [*params, flt.limit]
-        return sql + " ORDER BY m.date DESC LIMIT ?", [*params, flt.limit]
+        column = _ORDER_COLUMNS.get(flt.order, "m.date")
+        direction = "DESC" if flt.desc else "ASC"
+        # 二级键用 id：同一个 date 值可能有多封（服务器时间精度只到秒），
+        # 没有稳定次序时 keyset 分页会在边界重复或漏行。
+        return (f"{sql} ORDER BY {column} {direction}, m.id {direction} LIMIT ?",
+                [*params, flt.limit])
 
     @staticmethod
     def _project(cols: str, alias: str) -> str:
@@ -750,6 +773,15 @@ class MailRepository:
             params.append(flt.date_to.isoformat())
         if flt.unread_only:
             sql.append(f"AND {alias}.is_read = 0")
+        if flt.before_date is not None:
+            # keyset 分页：只要严格排在游标那一行之后的记录。
+            # date 在库里是统一格式的 ISO8601 字符串，字典序等于时间序，
+            # 因此可以直接比较；id 是同一秒多封邮件之间的 tie-break。
+            sql.append(
+                f"AND ({alias}.date < ? OR ({alias}.date = ? AND {alias}.id < ?))"
+            )
+            iso = flt.before_date.isoformat()
+            params.extend([iso, iso, flt.before_id or ""])
         return sql, params
 
     def _base_sql(self, flt: MailFilter, cols: str) -> tuple[str, list, bool]:
@@ -833,29 +865,40 @@ class MailRepository:
         return [found[mid] for mid in mail_ids if mid in found]
 
     def thread_summaries(self, flt: MailFilter) -> list[ThreadSummary]:
-        """按 `thread_key` 归并的会话列表。
+        """按 `thread_key` 归并的会话列表（两阶段查询）。
 
-        「每组取最新一封 + 组内总数/未读数」全部交给窗口函数在**数据库里**完成。
-        若先取回全部投影再在 Python 里分组，2 万封邮件会先物化 2 万行，
-        与「列表只取几百行」的初衷完全相悖。
+        反例就是本方法早先的写法：把 `ROW_NUMBER()` + `COUNT()` + `SUM()`
+        三个窗口函数套在同一层 CTE 上。窗口函数要求先看到完整分区，SQLite
+        只能把**过滤后的全部行**物化成临时结果集再逐行求值——10 万封实测
+        475–970 ms，而且是切换视图时在 GUI 线程上跑。
 
-        `_rn = 1` 取的是组内最新一封（`ORDER BY date DESC`），它既是折叠态的
-        展示行，也是排序依据。
+        拆成两步后，代价从「与邮件总数成正比」变成「与邮件总数成正比地扫
+        **索引**」+「与会话数成正比地回表」：
+
+          1. 只投影 `thread_key / date / is_read` 三列（正好覆盖
+             `idx_mails_thread(thread_key, date DESC)`），`GROUP BY thread_key`
+             拿到每个会话的最新时间、总封数、未读数，按最新时间取前 `limit` 个；
+          2. 只对这 `limit` 个会话各做一次索引查找，回表取最新那一封。
         """
+        # 列名不带 `m.` 前缀：`_base_sql` 内部会用 `_project()` 统一加，
+        # 再传一次就变成 `m.m.thread_key`。
         inner, params, _use_fts = self._base_sql(
-            flt, ", ".join(MAIL_SUMMARY_COLUMNS)
+            flt, "thread_key, date, is_read"
         )
-        projected = ", ".join(MAIL_SUMMARY_COLUMNS)
+        projected = self._project(",".join(MAIL_SUMMARY_COLUMNS), "m")
         sql = (
-            "WITH filtered AS (" + inner + "), "  # noqa: S608
-            "ranked AS (SELECT filtered.*, "
-            "ROW_NUMBER() OVER (PARTITION BY thread_key ORDER BY date DESC) AS _rn, "
-            "COUNT(*) OVER (PARTITION BY thread_key) AS _total, "
-            "SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) "
-            "OVER (PARTITION BY thread_key) AS _unread "
-            "FROM filtered) "
-            f"SELECT {projected}, _total, _unread FROM ranked WHERE _rn = 1 "
-            "ORDER BY date DESC LIMIT ?"
+            "WITH agg AS ("  # noqa: S608
+            "SELECT thread_key AS thread_key, MAX(date) AS last_date, "
+            "COUNT(*) AS _total, "
+            "SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS _unread "
+            f"FROM ({inner}) AS f GROUP BY thread_key "
+            "ORDER BY last_date DESC LIMIT ?) "
+            f"SELECT {projected}, a._total, a._unread "
+            "FROM agg a JOIN mails m ON m.thread_key = a.thread_key "
+            "WHERE m.id = (SELECT m2.id FROM mails m2 "
+            "              WHERE m2.thread_key = a.thread_key "
+            "              ORDER BY m2.date DESC LIMIT 1) "
+            "ORDER BY a.last_date DESC"
         )
         rows = self.db.query_all(sql, [*params, flt.limit])
         return [ThreadSummary.from_row(r) for r in rows]

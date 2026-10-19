@@ -8,9 +8,13 @@
 用户的实际感受是「它把我的程序关了」。
 
 现在的语义是「锁屏」而不是「退出」：遮罩盖住窗口内容，键盘鼠标事件被
-遮罩吃掉，后台同步照常进行（同步线程不读屏幕，也没有新的数据暴露面）。
-重新认证走 `SecurityService.verify_password()`——它只校验，不重建会话密钥，
-因此不存在「重新解密数据库」这一步。
+遮罩吃掉，界面状态与滚动位置全部保留。但**密钥与数据库连接会被真正释放**：
+`AppContext.lock()` 会停掉后台同步、断开 IMAP 会话、关闭数据库并清空驻留
+密钥，解锁时重新跑一次 KDF 并重开库。
+
+早先的实现只校验密码（`verify_password`）而不重建会话密钥——那让遮罩退化成
+「防肩窥」：主密钥、凭据密钥、数据库连接全都还活着，任何能操作这台机器的
+人绕过遮罩就能读到全部邮件。锁屏的安全承诺必须包含「无密码不可读」。
 
 遮罩必须**真正挡住内容**：用的是完全不透明的底色，而不是半透明+模糊——
 后者仍能让人辨认出邮件主题的大致轮廓（截图、肩窥都算泄露）。
@@ -33,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.security import UnlockGuard
+from ..core.security import SecurityError, UnlockGuard
 from . import icons
 
 log = logging.getLogger(__name__)
@@ -217,38 +221,41 @@ class LockOverlay(QWidget):
         password = self.password.text()
         if not password:
             return
-        try:
-            params, verifier, _driver = self.ctx._read_security_meta()   # noqa: SLF001
-        except Exception as exc:  # noqa: BLE001 - 元数据坏了要如实说明
-            self._fail(f"无法读取安全元数据：{exc}")
-            return
 
-        # 校验要在 GUI 线程里跑一遍 Argon2id（约 0.4 s）。给一个忙碌提示，并且
-        # 只 repaint 不 processEvents —— 后者会让「解锁」按钮在等待期内被再次
-        # 点中，触发并发的第二次密钥派生。
-        self.error.setText("正在校验…")
+        # 锁屏时密钥与数据库连接都已释放（见 `AppContext.lock()`），
+        # 所以这里必须**真正重跑一次 KDF 并重开库**，而不是只校验密码。
+        # Argon2id 约 0.1–0.4 s，期间禁用按钮：否则连点会并发跑第二次派生。
+        self.error.setText("正在解锁…")
         self.error.show()
         self.password.setEnabled(False)
         self.unlock_btn.setEnabled(False)
         self.error.repaint()
         try:
-            ok = self.ctx.security.verify_password(password, params, verifier)
-        finally:
-            self.password.setEnabled(True)
-            self.unlock_btn.setEnabled(True)
-
-        if ok:
-            self._guard.reset()
-            self._cooldown_timer.stop()
-            self.error.hide()
-            self.password.clear()
-            self.hide()
-            self.unlocked.emit()
+            # 传自己的 guard：锁屏与登录框必须共用同一份失败计数，
+            # 否则两处各自累加，等于把尝试上限翻倍。
+            self.ctx.unlock(password, guard=self._guard)
+        except SecurityError as exc:
+            # 失败计数由 ctx.unlock 写进同一个 guard（含持久化），这里只呈现
+            self._attempts += 1
+            self._fail(f"{str(exc).strip() or '主密码不正确'}（第 {self._attempts} 次尝试）")
+            self._sync_cooldown()
             return
-        delay = self._guard.record_failure()
-        self._attempts += 1
-        self._fail(f"主密码不正确（第 {self._attempts} 次，需等待 {delay:.0f} 秒）")
-        self._sync_cooldown()
+        except Exception as exc:  # noqa: BLE001 - 打不开库要如实说明原因
+            self._fail(f"无法打开数据库：{exc}")
+            return
+        finally:
+            # 冷却期内必须**保持禁用**：`_sync_cooldown()` 已经按剩余等待时间
+            # 算好了控件状态，这里无条件 enable 会把它覆盖掉（回归测试抓到过）。
+            if self._guard.remaining_wait() <= 0:
+                self.password.setEnabled(True)
+                self.unlock_btn.setEnabled(True)
+
+        self._guard.reset()
+        self._cooldown_timer.stop()
+        self.error.hide()
+        self.password.clear()
+        self.hide()
+        self.unlocked.emit()
 
     def _try_device_unlock(self) -> None:
         binding = getattr(self.ctx, "device_binding", None)
@@ -261,27 +268,24 @@ class LockOverlay(QWidget):
             self._fail("设备绑定在本机不可用，请改用主密码")
             return
         try:
-            self.ctx.security.restore_from_master_key(key)
+            self.ctx.unlock_with_master_key(key)
+        except SecurityError as exc:
+            # 设备解锁失败也要计入退避：否则它就是一条绕开尝试次数上限的通道
+            # （密钥取回失败仍可无限重试，与密码路径的约束不对等）。
+            self.ctx.security.lock()
+            self._guard.record_failure()
+            self._fail(str(exc))
+            self._sync_cooldown()
+            return
         except Exception as exc:  # noqa: BLE001
+            self.ctx.security.lock()
             self._fail(f"设备解锁失败：{exc}")
             return
-        # 设备密钥与当前库对不上（例如改过主密码但绑定没解）：退回密码
-        if not self._verify_key_matches():
-            self.ctx.security.lock()
-            self._fail("设备绑定与本数据库不匹配，请用主密码解锁")
-            return
+        self._guard.reset()
+        self._cooldown_timer.stop()
+        self.error.hide()
         self.hide()
         self.unlocked.emit()
-
-    def _verify_key_matches(self) -> bool:
-        try:
-            _params, verifier, _driver = self.ctx._read_security_meta()   # noqa: SLF001
-            from ..core.security import SecurityService
-            return SecurityService.make_verifier(
-                self.ctx.security.master_key_copy()) == verifier
-        except Exception:
-            log.warning("设备解锁后校验主密钥失败", exc_info=True)
-            return False
 
     def _fail(self, message: str) -> None:
         self.error.setText(message)

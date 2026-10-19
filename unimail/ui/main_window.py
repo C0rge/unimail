@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from datetime import datetime
 
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -56,6 +58,14 @@ from .tray import TrayIcon
 
 log = logging.getLogger(__name__)
 
+# 列表每页行数（滚动加载）。200 是「一屏多一点」的量：再小会让滚动频繁等查询，
+# 再大会让首屏查询变慢、内存占用上升。
+PAGE_SIZE = 200
+# 非时间排序时一次性取多少。这些排序键（发件人/主题/平台…）没有
+# `(col, date DESC)` 形式的覆盖索引，而且 keyset 游标只对 (date, id) 成立，
+# 所以不做滚动加载——取一个足够大的窗口，并在界面上说明范围。
+SORT_SCAN_LIMIT = 2000
+
 
 class MainWindow(QMainWindow):
     def __init__(self, context: AppContext, settings: UiSettings | None = None,
@@ -73,6 +83,10 @@ class MainWindow(QMainWindow):
         self._locked = False
         self._quitting = False
         self._view_mode = self.settings.view_mode
+        # 列表分页游标：上一页最后一行的 (date, id)。None 表示已经到末页。
+        self._page_cursor: tuple[datetime, str] | None = None
+        self._has_more = False
+        self._loading_more = False
         # 后台 IO 提交点：复用正文补拉池的线程池，不另起第三条线程生命周期。
         self._io = IoTaskRunner(context.body_pool, self)
         self._search_timer = QTimer(self)
@@ -327,6 +341,7 @@ class MainWindow(QMainWindow):
         ip.delete_many_requested.connect(self._on_delete_many)
         ip.export_requested.connect(self._on_export)
         ip.thread_toggle_requested.connect(self._on_thread_toggle)
+        ip.load_more_requested.connect(self._load_more)
         ip.notice.connect(self.set_status)
 
         dp = self.detail_panel
@@ -470,6 +485,10 @@ class MainWindow(QMainWindow):
             self.ctx.accounts.set_active(account.id if account else None)
 
     def _on_add_account(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         dlg = AddAccountDialog(self)
         if dlg.exec() != AddAccountDialog.Accepted or dlg.draft is None:
             return
@@ -514,6 +533,10 @@ class MainWindow(QMainWindow):
         self._on_sync_account(account.id)
 
     def _on_remove_account(self, account_id: str) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         account = self.ctx.accounts.get(account_id)
         if account is None:
             return
@@ -546,6 +569,10 @@ class MainWindow(QMainWindow):
             )
 
     def _on_manage_account(self, account_id: str) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         account = self.ctx.accounts.get(account_id)
         if account is None:
             return
@@ -568,12 +595,20 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 同步
     def _sync_all(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         if not self.ctx.scheduler:
             return
         n = self.ctx.scheduler.sync_now(None)
         self.set_status(f"已派发 {n} 个账号的同步任务" if n else "暂无需要同步的账号")
 
     def _on_sync_account(self, account_id: str) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         if not account_id:
             self._sync_all()
             return
@@ -653,6 +688,13 @@ class MainWindow(QMainWindow):
         flt = self._current_filter()
         keyword = flt.keyword
         hint = None
+        # 只有「按时间倒序」能安全地 keyset 翻页：游标就是 (date, id)。
+        # 换成别的排序键时游标与排序不一致，翻页会重复或漏行，因此那几种
+        # 排序一次性取够（排序仍然下推到 SQL，不会出现「只排当前页」）。
+        paged = flt.order == "time" and flt.desc
+        flt.limit = PAGE_SIZE if paged else SORT_SCAN_LIMIT
+        self._page_cursor = None
+        self._has_more = False
 
         if self._view_mode == "thread":
             threads = self.ctx.mails.threads(flt)
@@ -662,6 +704,7 @@ class MainWindow(QMainWindow):
                 hint = self._empty_hint(flt)
             self.inbox_panel.set_mails(mails, hint, hit_count=hit, keyword=keyword,
                                        thread_mode=True, threads=threads)
+            self.inbox_panel.set_has_more(False)
             self._reopen_expanded_threads()
         else:
             mails = self.ctx.mails.inbox(flt)
@@ -669,14 +712,61 @@ class MainWindow(QMainWindow):
             if not mails:
                 hint = self._empty_hint(flt)
             self.inbox_panel.set_mails(mails, hint, hit_count=hit, keyword=keyword)
+            if paged and len(mails) >= PAGE_SIZE:
+                self._page_cursor = self._cursor_of(mails)
+            self._has_more = self._page_cursor is not None
+            self.inbox_panel.set_has_more(self._has_more)
 
         self.refresh_accounts()
         self._maybe_prefetch()
         if keyword:
             self.set_status(f"「{keyword}」命中 {hit if hit is not None else len(mails)} 封")
+        elif not paged:
+            self.set_status(f"已按当前列排序 · 最多显示 {SORT_SCAN_LIMIT} 封")
+
+    @staticmethod
+    def _cursor_of(mails) -> tuple[datetime, str] | None:
+        """取这一页最后一行的 `(date, id)` 作为下一页的游标。"""
+        for mail in reversed(mails):
+            if mail.date is not None:
+                return mail.date, mail.id
+        return None
+
+    def _load_more(self) -> None:
+        """列表视图：加载下一页（keyset 游标，不重排已加载的行）。
+
+        串行化由 `_loading_more` 保证：滚动事件在快速拖动时会连续触发，
+        没有这个闩就会同时发出多个相同游标的查询。
+        """
+        if (self._locked or self._loading_more or not self._has_more
+                or self._page_cursor is None or not self.ctx.mails
+                or self._view_mode != "list"):
+            return
+        self._loading_more = True
+        try:
+            flt = self._current_filter()
+            flt.limit = PAGE_SIZE
+            flt.before_date, flt.before_id = self._page_cursor
+            mails = self.ctx.mails.inbox(flt)
+            if not mails:
+                self._has_more = False
+                self._page_cursor = None
+                self.inbox_panel.set_has_more(False)
+                return
+            self.inbox_panel.append_mails(mails)
+            self._page_cursor = self._cursor_of(mails)
+            self._has_more = len(mails) >= PAGE_SIZE and self._page_cursor is not None
+            self.inbox_panel.set_has_more(self._has_more)
+        except Exception:
+            log.exception("加载下一页失败")
+            self._has_more = False
+            self.inbox_panel.set_has_more(False)
+        finally:
+            self._loading_more = False
 
     def _current_filter(self) -> MailFilter:
         d_from, d_to = self.filter_bar.date_range()
+        order_key, desc = self.inbox_panel.model.sort_state
         return MailFilter(
             account_id=self.ctx.accounts.active_id,
             platform=self.filter_bar.current_platform(),
@@ -684,6 +774,10 @@ class MainWindow(QMainWindow):
             date_from=d_from,
             date_to=d_to,
             unread_only=self.filter_bar.is_unread_only(),
+            # 排序下推到 SQL：只在已加载的一页内排序会让「按发件人排序」
+            # 显示的是一个残缺的顺序，用户无从知道它只覆盖了 200 封。
+            order="time" if order_key == "time" else order_key,
+            desc=desc,
         )
 
     def _empty_hint(self, flt: MailFilter) -> str:
@@ -918,6 +1012,10 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 导出
     def _on_export(self, kind: str, mail_ids: list[str]) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         if kind == "csv":
             self._export_csv()
             return
@@ -1106,16 +1204,56 @@ class MainWindow(QMainWindow):
         # 锁定时把详情面板里的正文清掉：遮罩是实心层，但详情面板的内容
         # 仍然留在内存与 DWM 缩略图缓存里，清掉更彻底。
         self.detail_panel.clear()
+
+        # 遮罩是主窗口的**子控件**，盖不住同级顶层窗口：图片/文本预览是
+        # 独立 QDialog，同步错误是 QMessageBox，锁定后它们仍会置顶显示，
+        # 正文与图片保持可见、可拖动、可最大化。
+        self._close_transient_windows()
+
+        # 真正降回未解锁态：停后台 → 断会话 → 关库 → 清密钥。
+        # 解锁时重新跑 KDF 并重建服务（见 `AppContext.lock()`）。
+        # 只盖遮罩而不清密钥，「锁屏」就只是防肩窥，不是防物理接触。
+        self.set_status("正在锁定…")
+        QApplication.processEvents()
+        try:
+            self.ctx.lock()
+        except Exception:
+            log.exception("锁屏时释放安全上下文失败")
+
+        self.menuBar().setEnabled(False)
+        if self.tray is not None:
+            self.tray.set_locked(True)
+
         self.lock_overlay.lock(reason)
         log.info("界面已锁定")
+
+    def _close_transient_windows(self) -> None:
+        """关闭所有会盖在遮罩之上的顶层窗口。
+
+        `QApplication.topLevelWidgets()` 里既有主窗口也有独立对话框；
+        逐个关掉 `QDialog`（`QMessageBox` 是它的子类）即可覆盖预览与错误弹窗。
+        """
+        for widget in QApplication.topLevelWidgets():
+            if widget is self or widget is self.lock_overlay:
+                continue
+            if widget.isVisible() and isinstance(widget, QDialog):
+                widget.close()
 
     def _on_unlocked(self) -> None:
         self._locked = False
         # 不依赖信号发送方（遮罩/未来的其它解锁入口）顺手隐藏自己：
         # 这里是「已解锁」的唯一权威落点，漏掉一次就是明文内容裸露。
         self.lock_overlay.hide()
+        self.menuBar().setEnabled(True)
+        if self.tray is not None:
+            self.tray.set_locked(False)
         self.ctx.security.touch()
+        # 锁屏时数据库连接被关闭、密钥被清空，解锁是**重新打开**的：
+        # 内存里的模型、计数缓存、会话池全部是新的，必须整表重载。
+        self.refresh_accounts()
         self.reload_mails()
+        if self.ctx.scheduler:
+            self.ctx.scheduler.start()
         # 放在 reload 之后：刷新过程可能自己写状态栏，别把提示盖掉
         self.set_status("已解锁")
 
@@ -1212,6 +1350,10 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 菜单动作
     def _on_settings(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         dlg = SettingsDialog(self.ctx, self.settings, self)
         dlg.preview_requested.connect(self._preview_theme)
         if dlg.exec() == SettingsDialog.Accepted:
@@ -1227,6 +1369,10 @@ class MainWindow(QMainWindow):
         self._apply_theme()
 
     def _on_about(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         level = self.ctx.db.encryption_level if self.ctx.db else "未知"
         kdf = ""
         # 元数据读不到（驱动不匹配等）不该挡住「关于」对话框
@@ -1236,6 +1382,10 @@ class MainWindow(QMainWindow):
         AboutDialog(level, self, kdf=kdf, ctx=self.ctx).exec()
 
     def _on_export_recovery(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         default = str(self.ctx._sidecar.with_name("unimail-recovery.json"))  # noqa: SLF001
         path, _ = QFileDialog.getSaveFileName(self, "导出恢复包", default,
                                              "JSON 文件 (*.json)")
@@ -1254,6 +1404,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_encryption_settings(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         from ..storage import sqlcipher_available
         db = self.ctx.db
         if db is None:
@@ -1302,9 +1456,22 @@ class MainWindow(QMainWindow):
 
         level = self.ctx.db.encryption_level if self.ctx.db else driver
         self._refresh_security_labels()
-        QMessageBox.information(self, "迁移完成", f"当前加密等级：{level}")
+        leftover = ""
+        backup = self.ctx.last_plaintext_backup
+        if backup is not None:
+            # 只有保留配置生效或删除失败时才会走到这里，必须说清楚
+            leftover = (
+                f"\n\n注意：明文备份仍留在 {backup.name}。"
+                "它是一份完整可读的数据库副本，会抵消整库加密的保护——"
+                "确认新库能正常打开后，请手工删除该文件。"
+            )
+        QMessageBox.information(self, "迁移完成", f"当前加密等级：{level}{leftover}")
 
     def _on_change_password(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
+        # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。
+        if self._locked:
+            return
         from PySide6.QtWidgets import QInputDialog
 
         from ..config import PASSWORD_MIN_LENGTH

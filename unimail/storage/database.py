@@ -29,6 +29,7 @@ from ..config import (
     DB_CACHE_KIB,
     DB_MMAP_BYTES,
     DB_VERSION,
+    KEEP_PLAINTEXT_BACKUP,
     sqlcipher_pip_hint,
 )
 from ..core.textsearch import segment
@@ -91,6 +92,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     sync_interval   INTEGER NOT NULL DEFAULT 300,
     last_synced_at  TEXT,
     status          TEXT NOT NULL DEFAULT 'ok',
+    -- password（授权码/应用密码）或 oauth2_<platform>。
+    -- OAuth2 账号的 credentials.ciphertext 里存的是 refresh_token，
+    -- 登录走 `AUTHENTICATE XOAUTH2`。
+    auth_type       TEXT NOT NULL DEFAULT 'password',
     created_at      TEXT NOT NULL,
     UNIQUE(platform, email)
 );
@@ -178,12 +183,20 @@ CREATE TABLE IF NOT EXISTS pending_flags (
 #   * 账号维度是 UI 最常用的组合，补 `(account_id, is_read, date DESC)`，
 #     它同时能高效服务「按账号统计未读数」的 GROUP BY。
 INDEXES = """
+-- 与 UNIQUE(account_id, folder, uid) 完全重复：唯一约束已经建了自动索引，
+-- 这一条只是让每次写入多维护一棵 B 树（实测写路径 +5~10%），没有任何查询
+-- 需要它。老库里必须显式 DROP —— `CREATE INDEX IF NOT EXISTS` 不会删东西。
+DROP INDEX IF EXISTS idx_mails_folder;
 CREATE INDEX IF NOT EXISTS idx_mails_date     ON mails(date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_account  ON mails(account_id, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_platform ON mails(platform, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_read     ON mails(is_read, date DESC);
 CREATE INDEX IF NOT EXISTS idx_mails_acc_read ON mails(account_id, is_read, date DESC);
-CREATE INDEX IF NOT EXISTS idx_mails_folder   ON mails(account_id, folder, uid);
+-- 未读计数的覆盖索引：`WHERE is_read = 0 GROUP BY account_id` 只读索引页，
+-- 不必回表取 account_id（10 万封实测 34–139 ms → 5–7 ms）。
+-- 与 idx_mails_acc_read 的区别是列序：那条以 account_id 打头，服务
+-- 「某账号的未读列表」；这条以 is_read 打头，服务「全库未读按账号分组」。
+CREATE INDEX IF NOT EXISTS idx_mails_read_acc ON mails(is_read, account_id);
 CREATE INDEX IF NOT EXISTS idx_mails_validity ON mails(account_id, folder, uid_validity);
 CREATE INDEX IF NOT EXISTS idx_mails_thread   ON mails(thread_key, date DESC);
 CREATE INDEX IF NOT EXISTS idx_attach_mail    ON attachments(mail_id);
@@ -461,6 +474,15 @@ class Database:
                 self.execute(f"DROP INDEX IF EXISTS {name}")
             current = 6
             log.info("数据库已从 v%d 迁移到 v6（待回写标记队列 + 会话索引）", from_version)
+        if current < 7:
+            # v7：OAuth2 支持。`auth_type` 决定凭据栏里存的是什么
+            # （密码 / refresh_token）以及登录走 `LOGIN` 还是 `AUTHENTICATE XOAUTH2`。
+            # 默认 'password'：历史账号全部是按密码/授权码添加的，
+            # 迁移后行为必须完全不变。
+            self._add_column_if_missing(
+                "accounts", "auth_type", "TEXT NOT NULL DEFAULT 'password'")
+            current = 7
+            log.info("数据库已从 v%d 迁移到 v7（账号认证类型 auth_type）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
 
@@ -665,21 +687,29 @@ class Database:
         self._db_key = new_key
 
     # ------------------------------------------------------------ 加密迁移
-    def migrate_to_encrypted(self, new_key: bytes) -> None:
+    def migrate_to_encrypted(self, new_key: bytes,
+                             *, keep_backup: bool | None = None) -> Path | None:
         """明文库 → SQLCipher 加密库（官方 sqlcipher_export 配方 + 原子替换）。
 
-        迁移前会保留 `*.plaintext.bak`；迁移后的文件会先校验（能否用新密钥打开、
-        行数是否一致）再替换，任一步失败都保持原库不变、并清掉半成品临时文件。
+        迁移后的文件会先校验（能否用新密钥打开、行数是否一致）再替换，
+        任一步失败都保持原库不变、并清掉半成品临时文件。
 
-        已知残留风险：最终是两次 `os.replace`（先备份原库、再把新库改名就位），
-        两者之间掉电会留下「原库已改名为 .bak、主文件缺失」的状态。这不是可以
-        用一次 rename 消除的问题（跨文件系统无法原子重命名两个文件），
-        但此时数据完整地躺在 `.plaintext.bak` 里，日志与错误提示都会给出该路径。
+        关于明文备份：迁移中途需要一次 `os.replace` 把原库挪开，所以过程中
+        必然短暂存在一份 `*.plaintext.bak`。校验通过后**默认把它删掉**——
+        留着它就是「主库加密了，旁边放一份全量明文」，同步盘、旧硬盘、任何
+        能读数据目录的进程都能直接拿走全部邮件，整库加密等于白做。
+        `keep_backup=True`（或环境变量 `UNIMAIL_KEEP_PLAINTEXT_BACKUP=1`）
+        可保留，仅用于排查迁移问题。
+
+        返回**仍留在磁盘上**的明文备份路径；已清理或压根没产生则为 None，
+        供调用方如实告知用户。已知残留风险：两次 `os.replace` 之间掉电会留下
+        「原库已改名为 .bak、主文件缺失」的状态；此时数据完整地躺在
+        `.plaintext.bak` 里，日志会给出该路径。
         """
         if not _SQLCIPHER_AVAILABLE:
             raise DatabaseError("未安装 sqlcipher3，无法启用整库加密")
         if self._encrypted:
-            return
+            return None
         src = self.path
         if not src.exists():
             raise DatabaseError("数据库文件不存在，无法迁移")
@@ -694,7 +724,11 @@ class Database:
 
         conn = sqlcipher_db.connect(str(src))
         try:
-            conn.execute("PRAGMA key = ''")   # 以明文方式打开源库
+            # 源库是**明文**：不执行 `PRAGMA key` 即为明文模式。
+            # 这里原先写的是 `PRAGMA key = ''`，但 SQLCipher 4 要求 key 至少
+            # 一个字符，那行会让迁移在第一步就失败，报的还是
+            # 「PRAGMA key requires a key of one or more characters」这种
+            # 与真实意图（打开明文库）完全无关的错误。
             conn.execute(
                 f"ATTACH DATABASE ? AS encrypted KEY \"x'{new_key.hex()}'\"", (str(tmp),)
             )
@@ -729,7 +763,22 @@ class Database:
         self._encrypted = True
         self.encrypted = True
         self._reopen()
-        log.info("数据库已迁移为整库加密（原明文库备份为 %s）", backup.name)
+
+        keep = KEEP_PLAINTEXT_BACKUP if keep_backup is None else keep_backup
+        if keep:
+            log.warning(
+                "数据库已迁移为整库加密，但按配置保留了明文备份 %s —— "
+                "这份文件会抵消整库加密的保护，确认无误后请手工删除", backup)
+            return backup
+        try:
+            backup.unlink()
+        except OSError as exc:
+            log.warning(
+                "数据库已迁移为整库加密，但明文备份 %s 删除失败（%s）—— "
+                "请手工删除，否则整库加密只保护了主文件", backup, exc)
+            return backup
+        log.info("数据库已迁移为整库加密（明文备份已安全删除）")
+        return None
 
     def migrate_to_plaintext(self) -> None:
         """SQLCipher 加密库 → 明文库（官方配方 + 原子替换）。

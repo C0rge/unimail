@@ -115,18 +115,18 @@ Linux 为 `$XDG_DATA_HOME/UniMail`）。
 
 ## 添加真实邮箱须知
 
-| 平台 | 密码要求 |
+| 平台 | 登录方式 |
 |---|---|
 | QQ 邮箱 | 设置 → 账户 → 开启 IMAP，使用 16 位**授权码**（不是 QQ 密码） |
 | 163 | 设置 → 开启 IMAP/SMTP，使用**授权码** |
-| Gmail | 开启两步验证后生成**应用专用密码** |
-| Outlook | 微软已停用基础认证，需应用密码（完整方案应接 OAuth2） |
+| Gmail | 应用专用密码，或 OAuth2 授权（需自备 `UNIMAIL_OAUTH_CLIENT_ID_GMAIL`） |
+| Outlook / M365 | **必须 OAuth2**：微软已于 2024-09-16 停用 IMAP 基础认证。需自备 `UNIMAIL_OAUTH_CLIENT_ID_OUTLOOK`，按 `使用说明.md` 注册应用后点「OAuth2 授权…」登录 |
 
 ## 测试
 
 ```bash
-# 核心层 + UI 层回归套件：52 组、614~617 项断言
-# （断言数随环境浮动 3 项：装了 sqlcipher3 为 617 项，未装为 614 项）
+# 核心层 + UI 层回归套件：57 组、659~664 项断言
+# （断言数随环境浮动 5 项：装了 sqlcipher3 为 664 项，未装为 659 项）
 python tests/smoke.py
 ```
 

@@ -8,6 +8,7 @@ import imaplib
 import logging
 
 from ..config import APP_VERSION
+from ..core.models import Account
 from .base import ImapAdapter, parse_list_line, utf7_decode
 
 log = logging.getLogger(__name__)
@@ -117,19 +118,27 @@ class GmailAdapter(ImapAdapter):
 class OutlookAdapter(ImapAdapter):
     """Outlook / Microsoft 365。
 
-    差异点：
-      - 微软已停用基础认证；如租户仍允许，可配合应用密码使用
-      - 完整方案应接入 OAuth2（XOAUTH2）
+    微软已于 2024-09-16 停用个人 Outlook.com 的 IMAP 基础认证（Exchange
+    Online 更早），应用密码在这条路上不再被接受——只能走 OAuth2 + XOAUTH2。
+    错误提示必须指向「重新授权」，而不是继续引导用户去生成已失效的应用密码。
     """
 
     platform = "outlook"
 
-    def _login_error_hint(self, exc: Exception) -> str:
+    def _login_error_hint(self, exc: Exception,
+                          account: Account | None = None) -> str:
+        if account is not None and str(
+                getattr(account, "auth_type", "")).startswith("oauth2"):
+            return (
+                f"OAuth2 登录被拒绝：{exc}\n"
+                "授权可能已过期、被管理员撤销，或该账号未开启 IMAP。"
+                "请删除该账号后重新用「OAuth2 授权」添加。"
+            )
         return (
             f"登录被拒绝：{exc}\n"
-            "微软已停止基础认证，请确认：\n"
-            "  1) 已开启两步验证并生成「应用密码」；\n"
-            "  2) 企业租户已由管理员开启 IMAP 访问。"
+            "微软已停用 IMAP 基础认证，应用密码不再可用。\n"
+            "请用添加账号对话框里的「OAuth2 授权…」登录；"
+            "企业租户还需管理员为该账号开启 IMAP。"
         )
 
 

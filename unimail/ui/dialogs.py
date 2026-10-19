@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -34,6 +36,13 @@ from ..config import (
 )
 from ..core.models import AccountDraft
 from ..core.security import password_policy_error, password_strength
+from ..platforms.oauth import (
+    OAuthError,
+    client_configured,
+    poll_token,
+    provider_for,
+    request_device_code,
+)
 from . import icons
 from .settings import FONT_SCALES, THEME_MODES, UiSettings
 
@@ -141,6 +150,143 @@ class LoginDialog(QDialog):
         self.accept()
 
 
+class OAuthDeviceDialog(QDialog):
+    """OAuth2 设备授权（RFC 8628 Device Code Flow）。
+
+    为什么用设备码而不是「把浏览器嵌进来」：桌面应用没有可注册的
+    redirect URI 回环，而设备码流程是唯一「不必在本机起 HTTP 回调服务、
+    也不需要在客户端里放 client secret」的标准做法。用户在**自己已登录的
+    浏览器**里确认授权，本程序只拿到令牌。
+
+    网络请求与轮询全部在后台线程：token 端点每 5 秒打一次、可能持续几分钟，
+    放在 GUI 线程会让对话框整段时间完全卡死（连「取消」都点不动）。
+    """
+
+    code_ready = Signal(str, str)        # user_code, verification_uri
+    finished_with = Signal(str, str)     # refresh_token, error
+
+    def __init__(self, platform: str, email: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("OAuth2 授权")
+        self.setMinimumWidth(480)
+        self.refresh_token = ""
+        self._platform = platform
+        self._email = email
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 18)
+        lay.setSpacing(12)
+
+        head = QLabel("按提示完成授权")
+        head.setStyleSheet("font-size: 15px; font-weight: 600;")
+        lay.addWidget(head)
+
+        self.step = QLabel("正在向授权服务器申请设备码…")
+        self.step.setWordWrap(True)
+        lay.addWidget(self.step)
+
+        self.code_label = QLabel("—")
+        self.code_label.setAlignment(Qt.AlignCenter)
+        self.code_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.code_label.setStyleSheet(
+            "font-size: 22px; font-weight: 600; letter-spacing: 4px; padding: 10px;")
+        lay.addWidget(self.code_label)
+
+        self.link = QLabel("")
+        self.link.setOpenExternalLinks(True)
+        self.link.setWordWrap(True)
+        lay.addWidget(self.link)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("font-size: 12px;")
+        lay.addWidget(self.status)
+
+        row = QHBoxLayout()
+        self.copy_btn = QPushButton("复制代码")
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self._copy_code)
+        row.addWidget(self.copy_btn)
+        row.addStretch(1)
+        self.close_btn = QPushButton("取消")
+        self.close_btn.clicked.connect(self._on_cancel)
+        row.addWidget(self.close_btn)
+        lay.addLayout(row)
+
+        self.code_ready.connect(self._on_code)
+        self.finished_with.connect(self._on_finished)
+        self._start()
+
+    # ------------------------------------------------------------ 流程
+    def _start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="oauth-device",
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        """后台线程：申请设备码 → 阻塞轮询直到用户完成授权。"""
+        try:
+            provider = provider_for(self._platform)
+            code = request_device_code(provider)
+        except OAuthError as exc:
+            self.finished_with.emit("", str(exc))
+            return
+        self.code_ready.emit(code.user_code, code.verification_uri)
+        try:
+            tokens = poll_token(provider, code, cancel=self._cancel)
+        except OAuthError as exc:
+            self.finished_with.emit("", str(exc))
+            return
+        if not tokens.refresh_token:
+            # 没有 refresh_token 就等于「只能用一小时」，下次同步立刻失败。
+            # 这通常意味着授权时没带 offline_access（或管理员禁用了它）。
+            self.finished_with.emit(
+                "", "授权服务器没有返回 refresh_token；请确认已申请 offline_access 权限")
+            return
+        self.finished_with.emit(tokens.refresh_token, "")
+
+    def _on_code(self, user_code: str, uri: str) -> None:
+        self.code_label.setText(user_code)
+        self.copy_btn.setEnabled(True)
+        self.link.setText(f'<a href="{uri}">{uri}</a>')
+        self.step.setText(
+            "第 1 步：浏览器已打开授权页（若没有，请点下面的链接）。\n"
+            "第 2 步：输入上方代码并确认授权。\n"
+            "第 3 步：回到这里等待，完成后会自动继续。"
+        )
+        with contextlib.suppress(Exception):
+            QDesktopServices.openUrl(QUrl(uri))
+
+    def _on_finished(self, refresh_token: str, error: str) -> None:
+        if error:
+            self.step.setText("授权未完成")
+            self.status.setText(error)
+            self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
+            self.close_btn.setText("关闭")
+            self.close_btn.clicked.disconnect()
+            self.close_btn.clicked.connect(self.reject)
+            return
+        self.refresh_token = refresh_token
+        self.status.setText("授权成功。")
+        self.accept()
+
+    def _copy_code(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        QApplication.clipboard().setText(self.code_label.text())
+
+    def _on_cancel(self) -> None:
+        # 先置取消位：轮询循环最多 0.5 秒内退出，不会留下一条后台线程
+        self._cancel.set()
+        self.reject()
+
+    def reject(self) -> None:
+        self._cancel.set()
+        super().reject()
+
+
 class AddAccountDialog(QDialog):
     """添加邮箱账号。"""
 
@@ -179,7 +325,24 @@ class AddAccountDialog(QDialog):
         self.pwd_edit = QLineEdit()
         self.pwd_edit.setEchoMode(QLineEdit.Password)
         self.pwd_edit.setPlaceholderText("密码 / 授权码")
-        form.addRow("密码/授权码", self.pwd_edit)
+        self.pwd_label = QLabel("密码/授权码")
+        form.addRow(self.pwd_label, self.pwd_edit)
+
+        # OAuth2 平台的登录入口。Outlook 的基础认证已被微软停用，
+        # 「输入应用密码」在那里是死路，必须换成浏览器授权。
+        self._refresh_token = ""
+        self.oauth_btn = QPushButton("OAuth2 授权…")
+        self.oauth_btn.clicked.connect(self._on_oauth)
+        self.oauth_state = QLabel("尚未授权")
+        self.oauth_state.setStyleSheet("font-size: 12px;")
+        self.oauth_row = QWidget()
+        oauth_layout = QHBoxLayout(self.oauth_row)
+        oauth_layout.setContentsMargins(0, 0, 0, 0)
+        oauth_layout.setSpacing(8)
+        oauth_layout.addWidget(self.oauth_btn)
+        oauth_layout.addWidget(self.oauth_state, 1)
+        self.oauth_label = QLabel("授权")
+        form.addRow(self.oauth_label, self.oauth_row)
 
         # 自定义服务器字段（仅自定义平台可见）
         self.host_edit = QLineEdit()
@@ -255,23 +418,70 @@ class AddAccountDialog(QDialog):
         hint = cfg.auth_hint
         if cfg.help_url:
             hint += f"\n帮助文档：{cfg.help_url}"
+
+        # 需要 OAuth2 的平台：密码框整行换掉，避免用户继续按提示去生成
+        # 「应用密码」——那条路在服务端已经被关掉了。
+        needs_oauth = bool(cfg.requires_oauth)
+        self.pwd_label.setVisible(not needs_oauth)
+        self.pwd_edit.setVisible(not needs_oauth)
+        self.oauth_label.setVisible(needs_oauth)
+        self.oauth_row.setVisible(needs_oauth)
+        if needs_oauth:
+            self._refresh_token = ""
+            self._update_oauth_state(key)
+            if not client_configured(key):
+                hint += ("\n\n注意：本机尚未配置该平台的应用 ID，授权按钮会说明"
+                         "如何申请（OAuth 要求每个应用有自己的 client_id）。")
+
         self.hint.setText(hint)
         self.status.setText("")
 
+    def _update_oauth_state(self, key: str) -> None:
+        if self._refresh_token:
+            self.oauth_state.setText("已授权，可以添加")
+        elif client_configured(key):
+            self.oauth_state.setText("尚未授权")
+        else:
+            self.oauth_state.setText("未配置应用 ID（点授权查看说明）")
+
+    def _on_oauth(self) -> None:
+        email = self.email_edit.text().strip()
+        if "@" not in email:
+            self.status.setText("请先填写邮箱地址，再发起授权")
+            self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
+            return
+        key = self._current_platform()
+        dlg = OAuthDeviceDialog(key, email, self)
+        if dlg.exec() == QDialog.Accepted and dlg.refresh_token:
+            self._refresh_token = dlg.refresh_token
+            self._update_oauth_state(key)
+            self.status.setText("授权成功，点「添加」完成绑定。")
+            self.status.setStyleSheet("color: #3fb950; font-size: 12px;")
+
     def _on_accept(self) -> None:
         email = self.email_edit.text().strip()
-        password = self.pwd_edit.text()
+        key = self._current_platform()
+        needs_oauth = bool(PLATFORMS[key].requires_oauth)
         if "@" not in email:
             self.status.setText("请输入有效的邮箱地址")
             self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
             return
-        if not password:
-            self.status.setText("请输入密码或授权码")
-            self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
-            return
+        if needs_oauth:
+            if not self._refresh_token:
+                self.status.setText("请先点「OAuth2 授权…」完成浏览器登录")
+                self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
+                return
+            # 对 OAuth2 账号，凭据栏里存的是 refresh_token（落库前同样加密）
+            password = self._refresh_token
+        else:
+            password = self.pwd_edit.text()
+            if not password:
+                self.status.setText("请输入密码或授权码")
+                self.status.setStyleSheet("color: #f2545b; font-size: 12px;")
+                return
 
         self.draft = AccountDraft(
-            platform=self._current_platform(),
+            platform=key,
             email=email,
             password=password,
             display_name=self.display_edit.text().strip(),
@@ -279,6 +489,7 @@ class AddAccountDialog(QDialog):
             imap_port=self.port_spin.value(),
             use_ssl=self.ssl_check.isChecked(),
             sync_interval=self.interval_spin.value(),
+            auth_type=f"oauth2_{key}" if needs_oauth else "password",
         )
         self.accept()
 
@@ -672,9 +883,38 @@ class SettingsDialog(QDialog):
             if self.btn_bind:
                 self.btn_bind.setEnabled(True)
 
+    def _confirm_master_password(self, action: str) -> bool:
+        """设备绑定相关操作前的二次认证。
+
+        绑定等价于把主密钥交给本机凭据库——拿到数据目录的人从此不需要
+        主密码。没有这一步，任何人趁你离开座位、在已解锁的设置页点两下，
+        就能给自己留一条永久免密通道；而且设置页在锁屏期间本来是可达的。
+        """
+        from PySide6.QtWidgets import QInputDialog
+
+        pwd, ok = QInputDialog.getText(
+            self, "校验主密码",
+            f"「{action}」会改变本机保存主密钥的方式，"
+            "请再输入一次主密码确认：",
+            QLineEdit.Password,
+        )
+        if not ok or not pwd:
+            return False
+        try:
+            params, verifier, _driver = self.ctx._read_security_meta()   # noqa: SLF001
+        except Exception as exc:  # noqa: BLE001 - 元数据坏了要如实说明
+            QMessageBox.warning(self, "无法校验", f"读取安全元数据失败：{exc}")
+            return False
+        if not self.ctx.security.verify_password(pwd, params, verifier):
+            QMessageBox.warning(self, "主密码不正确", f"「{action}」已取消。")
+            return False
+        return True
+
     def _on_bind(self) -> None:
         binding = getattr(self.ctx, "device_binding", None)
         if binding is None:
+            return
+        if not self._confirm_master_password("启用设备绑定"):
             return
         ret = QMessageBox.warning(
             self, "确认启用设备绑定",
@@ -697,6 +937,8 @@ class SettingsDialog(QDialog):
     def _on_unbind(self) -> None:
         binding = getattr(self.ctx, "device_binding", None)
         if binding is None:
+            return
+        if not self._confirm_master_password("解除设备绑定"):
             return
         binding.unbind()
         if self.chk_device:

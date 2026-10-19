@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from ..config import ALLOW_INVALID_TLS_CERT, FETCH_TIMEOUT, PLATFORMS, PlatformConfig
 from ..core.models import Account, NormalizedMail
 from . import parser
+from .oauth import OAuthError, xoauth2_string
 from .proxy import (
     ProxyConfig,
     ProxyError,
@@ -364,9 +365,17 @@ class ImapAdapter:
             raise ImapError(f"IMAP 握手失败：{exc}") from exc
 
         try:
-            imap.login(account.username or account.email, password)
+            if str(getattr(account, "auth_type", "password")).startswith("oauth2"):
+                # OAuth2 路径：此时 `password` 实为 access_token。
+                # 微软已停用 Outlook.com / Exchange Online 的 IMAP 基础认证，
+                # 这条分支是它们**唯一**还能用的登录方式。
+                self._xoauth2_login(imap, account, password)
+            else:
+                imap.login(account.username or account.email, password)
         except imaplib.IMAP4.error as exc:
-            raise ImapError(self._login_error_hint(exc)) from exc
+            raise ImapError(self._login_error_hint(exc, account=account)) from exc
+        except OAuthError as exc:
+            raise ImapError(f"OAuth2 登录失败：{exc}") from exc
         except OSError as exc:
             raise ImapError(f"登录过程中连接中断：{exc}") from exc
 
@@ -430,7 +439,27 @@ class ImapAdapter:
         )
         return "\n".join(lines)
 
-    def _login_error_hint(self, exc: Exception) -> str:
+    @staticmethod
+    def _xoauth2_login(imap: imaplib.IMAP4, account: Account,
+                       access_token: str) -> None:
+        """用 SASL XOAUTH2 登录。
+
+        `imaplib.authenticate()` 负责 base64 与处理服务端的续传挑战，
+        回调只需返回初始响应字节（`user=…\\x01auth=Bearer …\\x01\\x01`）。
+        注意它和 `login()` 的失败语义不同：凭据被拒时不会返回 `NO`，
+        而是抛 `IMAP4.error`，所以外层统一按异常处理。
+        """
+        payload = xoauth2_string(account.username or account.email, access_token)
+        imap.authenticate("XOAUTH2", lambda _challenge: payload)
+
+    def _login_error_hint(self, exc: Exception, account: Account | None = None) -> str:
+        if account is not None and str(
+                getattr(account, "auth_type", "")).startswith("oauth2"):
+            return (
+                f"OAuth2 登录被拒绝：{exc}\n"
+                "授权可能已过期、被管理员撤销，或该账号未开启 IMAP。"
+                "请在账号设置里重新授权。"
+            )
         return (f"登录被拒绝：{exc}\n提示：{self.config.auth_hint}")
 
     def post_login(self, imap: imaplib.IMAP4) -> None:
@@ -796,4 +825,7 @@ def make_account_stub(draft) -> Account:
         use_ssl=draft.use_ssl,
         username=draft.username,
         sync_interval=draft.sync_interval,
+        # 试连也要带认证类型：OAuth2 账号必须走 XOAUTH2，
+        # 否则会把 refresh_token 当密码去 LOGIN，必然失败。
+        auth_type=getattr(draft, "auth_type", "password") or "password",
     )

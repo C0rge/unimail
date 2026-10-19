@@ -830,8 +830,11 @@ def test_reset_data_paths():
 
     with patch.object(mainmod, "DB_PATH", db), \
             patch.object(mainmod, "ATTACHMENT_DIR", att):
-        mainmod.reset_data()
+        # confirm=False 对应 CLI 的 --yes：测试里没有可交互的终端，
+        # 走交互路径会停在 input() 上
+        code = mainmod.reset_data(confirm=False)
 
+    check("清理命令返回 0", code == 0)
     check("清掉真正的侧车文件", not meta.exists())
     check("清掉侧车备份", not meta.with_name(meta.name + ".bak").exists())
     check("清掉侧车临时文件", not meta.with_name(meta.name + ".tmp").exists())
@@ -4483,6 +4486,230 @@ def test_fetch_budget_semantics():
     ctx.db.close()
 
 
+# ============================================================ 60. 代码审查五项整改
+def test_csv_formula_guard():
+    """S-3：CSV 导出必须阻止公式注入（= + - @ 与制表符/回车开头）。"""
+    from unimail.core.models import (
+        AccountDraft,
+        MailFilter,
+        NormalizedMail,
+    )
+    from unimail.core.security import SecurityService
+    from unimail.core.services import MailService, csv_guard
+    from unimail.storage import (
+        AccountRepository,
+        AttachmentRepository,
+        Database,
+        MailRepository,
+    )
+
+    check("等号开头加前缀", csv_guard("=cmd|' /C calc'!A0") == "'=cmd|' /C calc'!A0")
+    check("加号开头加前缀", csv_guard("+86") == "'+86")
+    check("减号开头加前缀", csv_guard("-1+1") == "'-1+1")
+    check("@ 开头加前缀", csv_guard("@SUM(A1)") == "'@SUM(A1)")
+    check("前导空格后的等号也拦", csv_guard("  =HYPERLINK(1)").startswith("'"))
+    check("制表符开头加前缀", csv_guard("\t=1").startswith("'"))
+    check("回车开头加前缀", csv_guard("\r=1").startswith("'"))
+    check("普通中文原样保留", csv_guard("周报：本周进度") == "周报：本周进度")
+    check("空值归一为空串", csv_guard("") == "" and csv_guard(None) == "")
+
+    # 端到端：真实导出一封「主题是公式」的邮件，落盘内容必须带前缀
+    tmp, _cfg, _ctxmod, _svc = setup_env("csv_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "c.db", sec.db_key(), encrypted=False)
+    accounts, mails = AccountRepository(db), MailRepository(db)
+    acc = accounts.insert(AccountDraft(platform="qq", email="c@qq.com", password="x"))
+    mails.insert_mails_batch(acc.id, "qq", [
+        NormalizedMail(uid="1", subject="=cmd|' /C calc'!A0",
+                       from_name="=HYPERLINK(\"http://x\")", from_addr="a@b.com",
+                       date=datetime.now(timezone.utc), preview="=1+1"),
+    ], uid_validity=1)
+    from unimail.core.events import EventBus
+
+    svc = MailService(mails, AttachmentRepository(db), accounts, sec, EventBus())
+    path, rows = svc.export_csv(MailFilter(limit=10), tmp / "out.csv")
+    check("导出成功一行", rows == 1, f"实际 {rows}")
+    text = Path(path).read_text(encoding="utf-8-sig")
+    check("主题里的公式被前缀", "'=cmd" in text, text.splitlines()[-1][:80])
+    check("发件人里的公式被前缀", "'=HYPERLINK" in text)
+    check("摘要里的公式被前缀", "'=1+1" in text)
+    db.close()
+
+
+def test_lock_releases_secrets():
+    """S-1：锁屏必须清空驻留密钥并释放数据库连接，解锁能重建。"""
+    _tmp, _cfg, ctxmod, _svc = setup_env("lock_")
+    ctx = ctxmod.AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    check("初始已解锁", ctx.security.is_unlocked)
+    check("初始有数据库连接", ctx.db is not None)
+
+    ctx.lock()
+    check("锁屏后主密钥已清除", not ctx.security.is_unlocked)
+    check("锁屏后数据库连接已释放", ctx.db is None)
+    check("锁屏后服务对象已释放", ctx.accounts is None and ctx.mails is None)
+
+    ctx.unlock("pw-1234567890")
+    check("解锁后重新持有密钥", ctx.security.is_unlocked)
+    check("解锁后数据库重新打开", ctx.db is not None)
+    ctx.shutdown()
+
+
+def test_plaintext_backup_cleanup():
+    """S-4：加密迁移成功后不得留下明文库副本；--reset 覆盖全部数据文件。"""
+
+    from unimail.core.models import AccountDraft
+    from unimail.core.security import SecurityService
+    from unimail.storage import AccountRepository, Database, sqlcipher_available
+
+    tmp, cfg, _ctxmod, _svc = setup_env("bak_")
+    sec = SecurityService()
+    key = sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db_path = tmp / "m.db"
+    plain = Database(db_path, key, encrypted=False)
+    AccountRepository(plain).insert(
+        AccountDraft(platform="qq", email="m@qq.com", password="x"))
+
+    if sqlcipher_available():
+        leftover = plain.migrate_to_encrypted(b"k" * 32)
+        check("迁移后不返回残留备份", leftover is None, str(leftover))
+        check("明文备份已被删除", not Path(str(db_path) + ".plaintext.bak").exists())
+        check("迁移后库可用", plain.scalar("SELECT COUNT(*) FROM accounts") == 1)
+    else:
+        check("无 SQLCipher 时跳过迁移断言", True)
+    plain.close()
+
+    # --reset 的清理清单必须覆盖迁移备份与设备密钥等「非数据库」文件
+    (tmp / "m.db.plaintext.bak").write_bytes(b"plain")
+    (tmp / "denc.db").write_bytes(b"x")
+    cfg.DB_PATH = db_path
+
+    listed = {p.name for p in cfg.data_file_paths(db_path)}
+    check("清单包含明文备份", "m.db.plaintext.bak" in listed, str(sorted(listed)))
+    check("清单包含侧车", "m.meta.json" in listed)
+
+
+def test_keyset_pagination_and_threads():
+    """F-3 / P-1 / P-2：分页不重不漏、会话聚合正确、未读覆盖索引生效。"""
+    from unimail.core.models import AccountDraft, MailFilter, NormalizedMail
+    from unimail.core.security import SecurityService
+    from unimail.storage import AccountRepository, Database, MailRepository
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("page_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "p.db", sec.db_key(), encrypted=False)
+    accounts, mails = AccountRepository(db), MailRepository(db)
+    acc = accounts.insert(AccountDraft(platform="qq", email="p@qq.com", password="x"))
+
+    now = datetime.now(timezone.utc)
+    batch = [
+        NormalizedMail(
+            uid=str(i), subject=f"s{i:02d}", from_name=f"发件人{i:02d}",
+            from_addr=f"s{i}@example.com", date=now - timedelta(seconds=i),
+            preview="p", thread_key=("T1" if i <= 3 else f"T{i}"),
+        )
+        for i in range(1, 26)
+    ]
+    mails.insert_mails_batch(acc.id, "qq", batch, uid_validity=1)
+
+    full = mails.query_summaries(MailFilter(limit=100))
+    check("全量 25 封", len(full) == 25, f"实际 {len(full)}")
+
+    seen, pages, cursor = [], 0, None
+    while True:
+        flt = MailFilter(limit=10)
+        if cursor is not None:
+            flt.before_date, flt.before_id = cursor
+        page = mails.query_summaries(flt)
+        if not page:
+            break
+        seen.extend(page)
+        pages += 1
+        cursor = (page[-1].date, page[-1].id)
+        if len(page) < 10:
+            break
+    check("分 3 页取完", pages == 3, f"实际 {pages}")
+    check("分页无重复", len({m.id for m in seen}) == 25, f"实际 {len({m.id for m in seen})}")
+    check("分页顺序与全量一致", [m.id for m in seen] == [m.id for m in full])
+
+    threads = mails.thread_summaries(MailFilter(limit=100))
+    check("会话归并为 23 个", len(threads) == 23, f"实际 {len(threads)}")
+    merged = next((t for t in threads if t.thread_key == "T1"), None)
+    check("会话总数聚合正确", merged is not None and merged.total == 3,
+          str(merged.total if merged else "None"))
+    check("会话未读数正确", merged is not None and merged.unread == 3)
+    check("会话按最新时间倒序",
+          [t.latest.date for t in threads] == sorted(
+              [t.latest.date for t in threads], reverse=True))
+
+    plan = db.query_all(
+        "EXPLAIN QUERY PLAN SELECT account_id, COUNT(*) FROM mails "
+        "WHERE is_read = 0 GROUP BY account_id")
+    plan_text = " ".join(str(r) for r in plan)
+    check("未读计数走覆盖索引", "idx_mails_read_acc" in plan_text, plan_text[:120])
+    redundant = db.query_one(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_mails_folder'")
+    check("冗余索引已删除", redundant is None)
+
+    ordered = mails.query_summaries(MailFilter(limit=5, order="sender", desc=False))
+    check("服务端排序生效",
+          [m.from_name for m in ordered] == sorted(m.from_name for m in ordered))
+    db.close()
+
+
+def test_oauth_xoauth2():
+    """F-1：XOAUTH2 载荷、平台能力、client_id 缺失时的可操作提示、DB v7。"""
+    from unittest.mock import patch
+
+    from unimail.core.models import AccountDraft
+    from unimail.core.security import SecurityService
+    from unimail.platforms.oauth import (
+        OAuthError,
+        oauth_supported,
+        provider_for,
+        xoauth2_string,
+    )
+    from unimail.storage import AccountRepository, Database
+
+    check("XOAUTH2 载荷格式正确",
+          xoauth2_string("u@example.com", "tok")
+          == b"user=u@example.com\x01auth=Bearer tok\x01\x01")
+    try:
+        xoauth2_string("", "tok")
+        check("空用户名被拒绝", False)
+    except OAuthError:
+        check("空用户名被拒绝", True)
+    check("outlook 支持 OAuth", oauth_supported("outlook"))
+    check("gmail 支持 OAuth", oauth_supported("gmail"))
+    check("qq 不使用 OAuth", not oauth_supported("qq"))
+
+    with patch.dict(os.environ, {"UNIMAIL_OAUTH_CLIENT_ID_OUTLOOK": ""}):
+        try:
+            provider_for("outlook")
+            check("未配置 client_id 时报错", False)
+        except OAuthError as exc:
+            check("未配置 client_id 时给出注册指引",
+                  "UNIMAIL_OAUTH_CLIENT_ID_OUTLOOK" in str(exc))
+    with patch.dict(os.environ, {"UNIMAIL_OAUTH_CLIENT_ID_OUTLOOK": "cid-123"}):
+        check("配置后可取到 provider", provider_for("outlook").client_id == "cid-123")
+
+    tmp, _cfg, _ctxmod, _svc = setup_env("oauth_")
+    sec = SecurityService()
+    sec.setup("pw-1234567890", SecurityService.new_kdf_params())
+    db = Database(tmp / "o.db", sec.db_key(), encrypted=False)
+    cols = {r["name"] for r in db.query_all("PRAGMA table_info(accounts)")}
+    check("accounts 表有 auth_type 列", "auth_type" in cols, str(sorted(cols)))
+    repo = AccountRepository(db)
+    acc = repo.insert(AccountDraft(platform="outlook", email="o@x.com",
+                                   password="rt", auth_type="oauth2_outlook"))
+    check("auth_type 落库", acc.auth_type == "oauth2_outlook", acc.auth_type)
+    plain = repo.insert(AccountDraft(platform="qq", email="q@x.com", password="x"))
+    check("默认 auth_type 为 password", plain.auth_type == "password")
+    db.close()
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -4541,6 +4768,12 @@ SUITES = [
     ("P8 connect() 走代理的接线与失败提示", test_connect_uses_proxy_when_configured),
     ("P9 会话断开不在调用线程", test_session_teardown_off_caller_thread),
     ("P10 拉取上限语义与覆盖方式", test_fetch_budget_semantics),
+    # ---- 第七批（代码审查五项整改）
+    ("S-3 CSV 公式注入防护", test_csv_formula_guard),
+    ("S-1 锁屏释放密钥与连接", test_lock_releases_secrets),
+    ("S-4 明文备份与清理清单", test_plaintext_backup_cleanup),
+    ("F-3 分页 · P-1 会话 · P-2 索引", test_keyset_pagination_and_threads),
+    ("F-1 OAuth2 / XOAUTH2", test_oauth_xoauth2),
 ]
 
 

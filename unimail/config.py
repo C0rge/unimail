@@ -47,7 +47,7 @@ UNLOCK_MAX_ATTEMPTS = 5               # 单次运行内的尝试次数上限（�
 UNLOCK_BACKOFF_BASE = 1.0             # 退避基数（秒）：1,2,4,8… 上限见下
 UNLOCK_BACKOFF_MAX = 30.0
 
-DB_VERSION = 6                    # v6: 待回写服务器标记队列 + 会话索引（thread_key, date DESC）
+DB_VERSION = 7                    # v7: accounts.auth_type（OAuth2 凭据类型）
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
 IDLE_POLL_SECONDS = 20            # 空闲检查间隔（秒）
 
@@ -109,6 +109,31 @@ def _int_env(name: str, default: int) -> int:
 #   · 设环境变量 UNIMAIL_MAX_FETCH_PER_RUN=300（或 500）；
 #   · 设 0 表示「不限」——只有在明确知道自己在做什么时才这么做。
 MAX_FETCH_PER_RUN = _int_env("UNIMAIL_MAX_FETCH_PER_RUN", 500)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """读一个布尔环境变量；缺失或无法识别时回落到默认值。"""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    print(f"[warn] 环境变量 {name}={raw!r} 不是布尔值，已按默认值 {default} 处理",
+          file=sys.stderr)
+    return default
+
+
+# 加密迁移成功后是否保留 `unimail.db.plaintext.bak`。
+#
+# 默认 False：那份文件是**全量明文**，同步盘、旧硬盘、任何能读数据目录的
+# 进程都能直接拿到全部邮件；留着它，「整库加密」就只是给主文件加了把锁，
+# 旁边却放着没锁的副本。迁移在这之前已经校验过新库可打开、行数一致，
+# 所以正常路径下没有保留的必要。
+#
+# 仅在排查迁移问题时临时设为 1；设置后程序会在日志里持续告警。
+KEEP_PLAINTEXT_BACKUP = _bool_env("UNIMAIL_KEEP_PLAINTEXT_BACKUP", False)
 
 SCHEDULER_TICK = 30               # 调度器心跳（秒）
 FETCH_TIMEOUT = 30                # IMAP 超时
@@ -222,8 +247,13 @@ PLATFORMS: dict[str, PlatformConfig] = {
         imap_host="outlook.office365.com",
         imap_port=993,
         use_ssl=True,
-        auth_hint="微软已停用基础认证，建议开启两步验证后在「安全 → 应用密码」生成密码；"
-                  "企业租户需管理员开启 IMAP。",
+        # 微软已于 2024-09-16 停用个人 Outlook.com 的 IMAP/POP/SMTP 基础认证，
+        # Exchange Online 更早；应用密码在这些协议上不再被接受。
+        # 也就是说「用户名 + 应用密码」不是配置技巧问题，而是服务端取消了该能力。
+        auth_hint="微软已停用 IMAP 基础认证（应用密码不再可用），必须使用 OAuth2 授权。"
+                  "点击下方「OAuth2 授权」按钮，按提示在浏览器里完成登录；"
+                  "企业租户还需管理员为账号开启 IMAP。",
+        requires_oauth=True,
         help_url="https://support.microsoft.com/account-billing/app-passwords",
         trash_candidates=("Deleted Items", "已删除邮件", "Deleted"),
     ),
@@ -260,12 +290,19 @@ def guard_path(db_path: Path | None = None) -> Path:
 
 
 def data_file_paths(db_path: Path | None = None) -> list[Path]:
-    """数据库相关的全部本地文件：主库、WAL/SHM/journal、侧车及其备份/临时文件。
+    """数据目录里**全部**由本程序生成的文件。
 
-    「重置数据」与「备份」都必须覆盖同一组文件——历史上清理列表漏掉了真正的
-    侧车文件名，导致 `--reset` 之后旧 salt 残留、新旧库无法配对。
+    刻意把「看起来不像数据库」的那些也算进来：加密迁移留下的
+    `*.plaintext.bak` / `*.encrypted.bak`、设备绑定密钥、UI 设置、日志、
+    恢复包。`--reset` 承诺的是「彻底移除」，漏一个文件承诺就失效——
+    历史上就漏过一次侧车文件名（写成 `unimail.db.meta.json` 而非
+    `unimail.meta.json`），导致旧 salt 残留、新旧库无法配对。
+
+    通配是在 `db.parent` 上做的，所以测试用临时目录时不会误伤真实数据目录。
     """
     db = db_path or DB_PATH
+    data_dir = db.parent
+    stem = db.name
     files = [
         db,
         Path(str(db) + "-wal"),
@@ -275,7 +312,43 @@ def data_file_paths(db_path: Path | None = None) -> list[Path]:
     meta = sidecar_path(db)
     files += [meta, meta.with_name(meta.name + ".bak"), meta.with_name(meta.name + ".tmp")]
     files.append(guard_path(db))
-    return files
+
+    # 迁移过程的中间态与整份副本：一份明文库就等于整库加密白做了
+    for pattern in (
+        f"{stem}.plaintext.bak",
+        f"{stem}.encrypted.bak",
+        f"{stem}.enc-tmp",
+        f"{stem}.plain-tmp",
+        f"{stem}.*.tmp",
+        "device.key",
+        "ui.json",
+        "unimail-recovery.json",
+        "unimail.log*",
+    ):
+        files.extend(sorted(data_dir.glob(pattern)))
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    for p in files:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return ordered
+
+
+def plaintext_backup_paths(db_path: Path | None = None) -> list[Path]:
+    """数据目录里所有**明文**数据库副本（迁移备份与半成品）。
+
+    单独抽出来是因为它有一条独立的安全语义：只要这些文件还在，
+    「整库加密」就没有真正兑现。启动时据此提示，迁移后据此清理。
+    """
+    db = db_path or DB_PATH
+    stem = db.name
+    found = [
+        db.parent / f"{stem}.plaintext.bak",
+        db.parent / f"{stem}.plain-tmp",
+    ]
+    return [p for p in found if p.exists()]
 
 
 def platform_color(key: str) -> str:

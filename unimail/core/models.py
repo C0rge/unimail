@@ -80,6 +80,10 @@ class Account:
     sync_interval: int = 300
     last_synced_at: datetime | None = None
     status: str = AccountStatus.OK.value
+    # 凭据类型：password（授权码/应用密码）或 oauth2_<platform>。
+    # 它不是「界面选项」而是**认证协议的选择**：OAuth2 账号的凭据栏里
+    # 存的是 refresh_token，登录走 `AUTHENTICATE XOAUTH2` 而不是 `LOGIN`。
+    auth_type: str = "password"
     unread_count: int = 0          # 运行时统计，非持久化
     total_count: int = 0
 
@@ -97,6 +101,7 @@ class Account:
             sync_interval=row.get("sync_interval") or 300,
             last_synced_at=_parse_dt(row.get("last_synced_at")),
             status=row.get("status") or AccountStatus.OK.value,
+            auth_type=row.get("auth_type") or "password",
         )
 
     @property
@@ -106,7 +111,7 @@ class Account:
 
 @dataclass
 class AccountDraft:
-    """添加账号时的输入载体（含明文密码，仅存活于内存）。"""
+    """添加账号时的输入载体（含明文密码/令牌，仅存活于内存）。"""
     platform: str
     email: str
     password: str
@@ -115,6 +120,9 @@ class AccountDraft:
     imap_port: int = 993
     use_ssl: bool = True
     sync_interval: int = 300
+    # password 或 oauth2_<platform>。OAuth2 时 `password` 字段承载
+    # refresh_token（仍然只在内存里短暂存在，落库前一律加密）。
+    auth_type: str = "password"
 
     @property
     def username(self) -> str:
@@ -386,4 +394,17 @@ class MailFilter:
     date_from: datetime | None = None
     date_to: datetime | None = None
     unread_only: bool = False
-    limit: int = 300
+    limit: int = 200
+    # ---- keyset 分页游标（列表视图滚动加载）----
+    # 只取「严格排在 (before_date, before_id) 之后」的行。
+    # 不用 OFFSET：10 万封时 OFFSET 要先扫过前 N 行，而且同步进来的新邮件
+    # 会让已经翻过的位置整体错位（要么重复、要么漏行）。
+    # id 是必需的 tie-break —— 同一秒到达的多封邮件必须有稳定次序，
+    # 否则边界那一行会在两页里各出现一次（或都不出现）。
+    before_date: datetime | None = None
+    before_id: str | None = None
+    # ---- 服务端排序 ----
+    # 只在当前页内排序会把「按发件人排序」变成误导：用户看到的是
+    # 「已加载的 200 封里的顺序」。排序必须下推到 SQL。
+    order: str = "date"                # 白名单：date/sender/subject/platform/read/starred
+    desc: bool = True

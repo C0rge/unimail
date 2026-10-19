@@ -219,6 +219,7 @@ class InboxPanel(QFrame):
 
     export_requested = Signal(str, list)     # kind(eml|mbox|csv), mail_ids
     thread_toggle_requested = Signal(str, int)   # thread_key, row
+    load_more_requested = Signal()           # 滚动到接近底部：请主窗口取下一页
     notice = Signal(str)                     # 需要提示用户的短消息
 
     def __init__(self, parent=None) -> None:
@@ -229,6 +230,8 @@ class InboxPanel(QFrame):
         # 菜单里给用户看的删除文案。默认按「只删本机副本」措辞——这是默认
         # 行为，也是用户最需要被告知的一件事；主窗口会在设置变化时改写它。
         self.delete_label = "删除本地副本"
+        # 后面还有没有下一页；由主窗口在每次查询后告知，避免滚到底还反复请求。
+        self._has_more = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -295,6 +298,34 @@ class InboxPanel(QFrame):
         self.toolbar.sort_requested.connect(self._on_sort)
         self.toolbar.batch_requested.connect(self._on_batch)
         self.toolbar.select_all_requested.connect(self.select_all)
+        self.table.verticalScrollBar().valueChanged.connect(self._on_scrolled)
+
+    # ------------------------------------------------------------ 分页
+    def set_has_more(self, has_more: bool) -> None:
+        """告知「后面还有没有下一页」。
+
+        由主窗口在每次查询后调用。没有这个标志时，滚到底会反复发
+        `load_more_requested`——每滚一下就是一次（可能是空的）数据库查询。
+        """
+        self._has_more = bool(has_more)
+
+    def _on_scrolled(self, value: int) -> None:
+        if not self._has_more or self.model.thread_mode:
+            return
+        bar = self.table.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return
+        row_h = self.table.verticalHeader().defaultSectionSize() or 40
+        # 提前约 24 行开始取：滚动到底再等一次查询会明显「顿一下」
+        if value >= bar.maximum() - 24 * row_h:
+            self.load_more_requested.emit()
+
+    def append_mails(self, mails: list[MailSummary]) -> int:
+        """追加一页（滚动加载），返回实际新增的行数。"""
+        added = self.model.append_mails(mails)
+        if added:
+            self.toolbar.set_count(self.model.row_count(), None, self.model.keyword)
+        return added
 
     def _install_shortcuts(self) -> None:
         """快捷键挂在表格上（用 `WidgetShortcut` 上下文）。

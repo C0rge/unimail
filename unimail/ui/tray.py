@@ -95,6 +95,16 @@ class TrayIcon(QObject):
                           (self.act_quit, "close")):
             act.setIcon(icons.icon(name, self._theme.get("text_dim", "#8b98a9"), 14))
 
+    def set_locked(self, locked: bool) -> None:
+        """锁屏期间只保留「显示窗口 / 立即锁定 / 退出」。
+
+        「立即同步」与「设置…」是两条绕过遮罩的路径：设置页能改加密模式、
+        能在不重新认证的情况下绑定设备密钥；同步会带着明文凭据去连服务器。
+        托盘菜单不经过主窗口的遮罩，必须单独收紧。
+        """
+        self.act_sync.setEnabled(not locked)
+        self.act_settings.setEnabled(not locked)
+
     # ------------------------------------------------------------ 可用性
     @staticmethod
     def available() -> bool:

