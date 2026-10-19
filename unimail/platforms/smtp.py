@@ -361,9 +361,13 @@ def send(cfg: SmtpConfig, message: email.message.Message) -> None:
 def _login(server: smtplib.SMTP, cfg: SmtpConfig) -> None:
     """认证。OAuth2 走 XOAUTH2，其余走 LOGIN。"""
     if cfg.oauth2:
-        payload = xoauth2_string(cfg.username, cfg.password)
+        # smtplib 与 imaplib 的 SASL 回调**返回类型不同**：imaplib 要 bytes，
+        # smtplib 要 str（它会在内部按 command_encoding 再编码）。typeshed
+        # 对 SMTP.auth 的回调声明为 `(bytes) -> str`，因此这里不能直接复用
+        # `xoauth2_string()` 的 bytes 结果，必须解码成 str。
+        payload = xoauth2_string(cfg.username, cfg.password).decode("utf-8")
 
-        def _respond(_challenge: bytes) -> bytes:
+        def _respond(_challenge: bytes) -> str:
             # 不在 EHLO 阶段预发 initial response：部分服务器（尤其企业邮）
             # 对 `AUTH XOAUTH2 <initial>` 的处理与标准 SASL-IR 不一致，
             # 等服务器发出 334 挑战后再回同样的 payload，兼容性更好。
