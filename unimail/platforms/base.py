@@ -557,7 +557,7 @@ class ImapAdapter:
 
     # ------------------------------------------------------------ 邮件
     def search_new_uids(self, imap: imaplib.IMAP4, since_uid: int,
-                        limit: int = 200) -> list[str]:
+                        limit: int = 200, folder: str = "INBOX") -> list[str]:
         """查询 UID > since_uid 的邮件，返回**升序** UID 列表（最多 limit 条）。
 
         返回的是**最旧的一批**（UID 最小者优先），而不是最新的一批。
@@ -565,7 +565,7 @@ class ImapAdapter:
         若返回最新 N 条，游标会被直接推到邮箱末尾，中间的邮件将永久不再拉取。
         """
         try:
-            imap.select("INBOX", readonly=True)
+            imap.select(folder, readonly=True)
             # imaplib 的 uid() 会跳过 None 参数；这里直接给检索式即可
             if since_uid > 0:
                 typ, data = imap.uid("SEARCH", f"UID {since_uid + 1}:*")
@@ -713,9 +713,9 @@ class ImapAdapter:
             result[uid] = parser.parse_bodystructure(structure)
         return result
 
-    def uid_validity(self, imap: imaplib.IMAP4) -> int | None:
+    def uid_validity(self, imap: imaplib.IMAP4, folder: str = "INBOX") -> int | None:
         try:
-            typ, data = imap.status("INBOX", "(UIDVALIDITY)")
+            typ, data = imap.status(folder, "(UIDVALIDITY)")
             if typ == "OK" and data:
                 text = data[0].decode() if isinstance(data[0], bytes) else str(data[0])
                 if "UIDVALIDITY" in text.upper():

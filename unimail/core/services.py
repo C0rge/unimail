@@ -35,6 +35,7 @@ from ..platforms.smtp import SmtpConfig, SmtpError, build_message, send as smtp_
 from ..storage import (
     AccountRepository,
     AttachmentRepository,
+    ContactRepository,
     CursorRepository,
     MailRepository,
     OutboxRepository,
@@ -47,6 +48,7 @@ from .models import (
     AccountDraft,
     AccountStatus,
     Attachment,
+    Contact,
     Mail,
     MailFilter,
     MailSummary,
@@ -344,6 +346,46 @@ class AccountService:
         self.accounts.set_status(account_id, value)
 
 
+class ContactService:
+    """通讯录用例：封装仓储 + 通过事件总线通知 UI 刷新。
+
+    这是「联系人/通讯录」功能唯一被 UI 使用的入口，UI 不直接碰仓储。
+    自动学习由同步线程直接调仓储（`ContactRepository.learn_from_senders`），
+    那条路径不经过这里——它在后台线程跑，且高频批量，走信号会放大开销。
+    """
+
+    def __init__(self, contacts: ContactRepository, bus: EventBus) -> None:
+        self.contacts = contacts
+        self.bus = bus
+
+    # ------------------------------------------------------------ 查询
+    def list(self, keyword: str = "") -> builtins.list[Contact]:
+        # 注解用 builtins.list：本类有名为 list 的方法，PEP 563 字符串注解
+        # 在类作用域内解析，裸 list 会解析成方法本身（mypy valid-type）。
+        return self.contacts.list(keyword)
+
+    def get(self, contact_id: str) -> Contact | None:
+        return self.contacts.get(contact_id)
+
+    def find_by_email(self, email: str) -> Contact | None:
+        return self.contacts.find_by_email(email)
+
+    # ------------------------------------------------------------ 增删改
+    def add(self, email: str, name: str = "", account_id: str | None = None,
+            note: str = "") -> Contact:
+        contact = self.contacts.create(email, name, account_id, note)
+        self.bus.contacts_changed.emit()
+        return contact
+
+    def update(self, contact_id: str, fields: dict) -> None:
+        self.contacts.update(contact_id, fields)
+        self.bus.contacts_changed.emit()
+
+    def remove(self, contact_id: str) -> None:
+        self.contacts.delete(contact_id)
+        self.bus.contacts_changed.emit()
+
+
 class MailService:
     """邮件查询、详情、附件用例。"""
 
@@ -382,6 +424,10 @@ class MailService:
     def inbox(self, flt: MailFilter) -> list[MailSummary]:
         """收件箱列表（轻量投影，不含正文与附件明细）。"""
         return self.mails.query_summaries(flt)
+
+    def list_folders(self, account_id: str | None = None) -> list[tuple[str, int]]:
+        """本地已同步过的文件夹及邮件数（用于文件夹切换下拉）。"""
+        return self.mails.list_folders(account_id)
 
     def search_count(self, flt: MailFilter) -> int | None:
         """关键词命中总数（仅全文索引路径给得出；否则返回 None 表示「不显示」）。"""

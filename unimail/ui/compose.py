@@ -25,11 +25,13 @@ HTML 编辑的取舍
 from __future__ import annotations
 
 import logging
+import re
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QStringListModel, Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -44,7 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.models import Account
-from ..core.services import ComposeDraft, ComposeService
+from ..core.services import ComposeDraft, ComposeService, ContactService
 from . import icons
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,23 @@ log = logging.getLogger(__name__)
 # 这里是「一封邮件允许携带的总量」——SMTP 服务商通常对单封邮件有 25–50 MB
 # 的总量限制，超限会在 DATA 阶段才被拒，那时用户已经等了一轮上传。
 _MAX_TOTAL_ATTACH_BYTES = 25 * 1024 * 1024
+
+# 从补全候选「张三 <zs@example.com>」里抠出邮箱。
+_ADDR_IN_ANGLES = re.compile(r"<([^<>]+)>\s*$")
+
+
+class _ContactCompleter(QCompleter):
+    """按「最后一个收件人 token」做补全的 QCompleter。
+
+    收件人输入框是逗号分隔的多个地址，QCompleter 默认把**整个输入**当作前缀，
+    于是补全会把前面已经写好的收件人整段替换掉。覆盖 `splitPath` 只返回
+    「最后一个逗号之后的 token」，弹窗就只按当前正在写的那个地址过滤；
+    真正的插入动作在 `_insert_completion` 里重拼「前缀 + 新地址」。
+    """
+
+    def splitPath(self, path: str) -> list[str]:
+        token = path.rsplit(",", 1)[-1].strip()
+        return [token] if token else []
 
 
 class ComposeDialog(QDialog):
@@ -64,7 +83,8 @@ class ComposeDialog(QDialog):
     sent = Signal()
 
     def __init__(self, compose: ComposeService, accounts: list[Account],
-                 draft: ComposeDraft | None = None, parent: QWidget | None = None) -> None:
+                 draft: ComposeDraft | None = None, parent: QWidget | None = None,
+                 contacts: ContactService | None = None) -> None:
         super().__init__(parent)
         self.compose = compose
         self.accounts = accounts
@@ -104,6 +124,10 @@ class ComposeDialog(QDialog):
         self.cc_edit.setPlaceholderText("抄送（可选）")
         self.cc_edit.setText(", ".join(self.draft.cc))
         layout.addWidget(self.cc_edit)
+
+        # ---- 收件人自动补全（通讯录，可选依赖）----
+        # contacts 为 None（没有接线）时静默跳过：撰写功能本身不依赖通讯录。
+        self._setup_contact_completion(contacts)
 
         self.subject_edit = QLineEdit()
         self.subject_edit.setPlaceholderText("主题")
@@ -151,6 +175,45 @@ class ComposeDialog(QDialog):
         if not accounts:
             self.btn_send.setEnabled(False)
             self.err.setText("还没有添加任何邮箱账号，请先在「文件 → 添加邮箱账号」中添加。")
+
+    # ------------------------------------------------------------ 收件人补全
+    def _setup_contact_completion(self, contacts: ContactService | None) -> None:
+        """给收件人 / 抄送框挂上通讯录补全。
+
+        做在**这两个 QLineEdit** 上而非自定义控件：保持现有「逗号分隔多地址」
+        的输入习惯，补全只是「少打几个字」，不改变收件人字段的语义。
+        """
+        if contacts is None:
+            return
+        candidates = [f"{c.name} <{c.email}>" if c.name else c.email
+                      for c in contacts.list()]
+        if not candidates:
+            return
+        model = QStringListModel(candidates, self)
+
+        for line_edit in (self.to_edit, self.cc_edit):
+            completer = _ContactCompleter(model, self)
+            completer.setCompletionMode(QCompleter.PopupCompletion)
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchContains)
+            completer.activated.connect(
+                lambda text, le=line_edit: self._insert_completion(le, text))
+            line_edit.setCompleter(completer)
+
+    @staticmethod
+    def _insert_completion(line_edit: QLineEdit, text: str) -> None:
+        """把选中的候选「替换掉当前 token」地插回收件人框。
+
+        补全候选可能是 `张三 <zs@example.com>`；直接整段插入会破坏后续
+        「按 @ 校验地址」的逻辑（`_on_send` 用 `'@' not in a` 判非法），
+        因此只保留尖括号里的邮箱。若候选没有尖括号（纯邮箱），原样使用。
+        """
+        m = _ADDR_IN_ANGLES.search(text.strip())
+        addr = m.group(1) if m else text.strip()
+        current = line_edit.text()
+        prefix = current.rsplit(",", 1)[0]
+        line_edit.setText(
+            (prefix + ", " if prefix.strip() else "") + addr + ", ")
 
     # ------------------------------------------------------------ 附件
     def _pick_attachments(self) -> None:

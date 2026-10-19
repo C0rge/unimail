@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.7.0"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
@@ -47,7 +47,7 @@ UNLOCK_MAX_ATTEMPTS = 5               # 单次运行内的尝试次数上限（�
 UNLOCK_BACKOFF_BASE = 1.0             # 退避基数（秒）：1,2,4,8… 上限见下
 UNLOCK_BACKOFF_MAX = 30.0
 
-DB_VERSION = 8                    # v8: outbox 发件箱 + accounts.smtp_host/smtp_port
+DB_VERSION = 9                    # v9: contacts 通讯录（自动学习 + 手动管理）
 AUTO_LOCK_SECONDS = 15 * 60       # 空闲自动锁定
 IDLE_POLL_SECONDS = 20            # 空闲检查间隔（秒）
 

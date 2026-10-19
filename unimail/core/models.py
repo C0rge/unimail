@@ -14,6 +14,30 @@ def new_id() -> str:
     return uuid.uuid4().hex
 
 
+# 判定「是否像真实邮箱地址」的正则。用于自动学习阶段过滤掉明显不是邮箱的
+# from_addr（如 `=?utf-8?...?=` 解码残留、`noreply`、`MAILER-DAEMON`、
+# 空白、`root@localhost` 这类本机回环名）。
+#
+# 要求：一个「本地部分@域」，域至少含一个点。这样 `root@localhost`、`a@b`
+# 这类没有真实域后缀的字符串不会被当成联系人学进来。本地部分允许常见的
+# `+`（Gmail 别名）与 `.`，域名允许连字符与多段。
+_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}"
+    r"[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def is_email_like(value: str | None) -> bool:
+    """宽松地判断一个字符串是否可作联系人邮箱。
+
+    自动学习是「顺手收集」，误收比漏收更糟（通讯录会被噪声污染），
+    所以这里宁可严格一点。只在有 `@` 且域含点的完整地址上返回 True。
+    """
+    if not value:
+        return False
+    return bool(_EMAIL_RE.match(value.strip()))
+
+
 class AccountStatus(str, Enum):
     OK = "ok"
     SYNCING = "syncing"
@@ -395,7 +419,14 @@ class MailFilter:
     """收件箱筛选条件。"""
     account_id: str | None = None      # None = 全部账号
     platform: str | None = None        # None = 全部平台
+    folder: str | None = None          # None = 全部文件夹；否则只取该文件夹
     keyword: str = ""
+    # ---- 结构化搜索（from:/to:/subject:/has:/is: 前缀语法）----
+    from_addr: str = ""                # 模糊匹配 from_addr / from_name
+    to_addr: str = ""                  # 模糊匹配 to_addrs
+    subject: str = ""                  # 模糊匹配 subject
+    has_attachment: bool | None = None # has:attachment / None=不过滤
+    starred_only: bool | None = None   # is:starred / None=不过滤
     date_from: datetime | None = None
     date_to: datetime | None = None
     unread_only: bool = False
@@ -470,3 +501,40 @@ class OutboxMessage:
             created_at=row.get("created_at") or "",
             sent_at=row.get("sent_at") or "",
         )
+
+
+@dataclass
+class Contact:
+    """一条通讯录记录。
+
+    来源有两个（都落在同一张表、由 email 唯一约束去重）：
+      1. **自动学习**：同步/读信时从邮件发件人收集，name 只增不删、只长不短；
+      2. **手动添加**：用户在通讯录对话框里新建，可带备注、可不关联账号。
+
+    account_id 仅作「这人是哪个账号往来过的」提示信息，删账号不会删联系人
+    （外键 ON DELETE SET NULL），所以它可能为 None，UI 要能正常显示。
+    """
+    id: str
+    email: str
+    name: str = ""
+    account_id: str | None = None
+    note: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_row(cls, row: dict) -> Contact:
+        return cls(
+            id=row["id"],
+            email=row["email"],
+            name=row.get("name") or "",
+            account_id=row.get("account_id"),
+            note=row.get("note") or "",
+            created_at=row.get("created_at") or "",
+            updated_at=row.get("updated_at") or "",
+        )
+
+    @property
+    def label(self) -> str:
+        """列表展示名：有名显示名，无名退化为邮箱（与 Account.label 同策略）。"""
+        return self.name or self.email

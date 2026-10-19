@@ -40,11 +40,13 @@ from PySide6.QtWidgets import (
 
 from ..config import APP_NAME, AUTO_LOCK_SECONDS, IDLE_POLL_SECONDS
 from ..core.models import MailFilter
+from ..core.search_query import parse_query
 from ..core.security import SecurityError
 from ..platforms import ImapError
 from . import icons
 from .account_panel import AccountPanel
 from .compose import ComposeDialog
+from .contacts import ContactDialog
 from .context import AppContext
 from .detail_panel import DetailPanel
 from .dialogs import AboutDialog, AddAccountDialog, FirstRunWizard, SettingsDialog
@@ -193,6 +195,10 @@ class MainWindow(QMainWindow):
         m_file.addAction(act_sync)
 
         m_file.addSeparator()
+        act_contacts = QAction(icons.icon("contacts", "#8b98a9", 14), "通讯录…", self)
+        act_contacts.triggered.connect(self._on_contacts)
+        m_file.addAction(act_contacts)
+
         act_import = QAction(icons.icon("export", "#8b98a9", 14),
                              "导出当前列表为 CSV…", self)
         act_import.triggered.connect(lambda: self._on_export("csv", []))
@@ -516,6 +522,22 @@ class MainWindow(QMainWindow):
     def _on_account_selected(self, account) -> None:
         if self.ctx.accounts:
             self.ctx.accounts.set_active(account.id if account else None)
+        self._refresh_folders()
+
+    def _refresh_folders(self) -> None:
+        """刷新文件夹下拉：列出当前账号（或全部）已同步的文件夹。
+
+        数据来源是本地 mails 表（同步 worker 已经按服务器 LIST 拉过），
+        不额外发网络请求。在账号切换、同步完成后调用——文件夹集合会随
+        同步逐渐变全。
+        """
+        if self.ctx.mails is None:
+            return
+        try:
+            folders = self.ctx.mails.list_folders(self.ctx.accounts.active_id)
+        except Exception:  # noqa: BLE001 - 仅刷新下拉，不影响主流程
+            folders = []
+        self.filter_bar.set_folders(folders)
 
     # ================================================================ 发信
     def _on_compose(self) -> None:
@@ -528,7 +550,8 @@ class MainWindow(QMainWindow):
                 self, "还没有邮箱账号",
                 "请先在「文件 → 添加邮箱账号」中添加一个账号，然后就能在这里写邮件了。")
             return
-        dlg = ComposeDialog(self.ctx.compose, accounts, parent=self)
+        dlg = ComposeDialog(self.ctx.compose, accounts, parent=self,
+                            contacts=self.ctx.contacts)
         dlg.sent.connect(self._on_mail_sent)
         dlg.exec()
 
@@ -542,7 +565,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法回复", str(exc))
             return
         accounts = self.ctx.accounts.list()
-        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self)
+        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self,
+                            contacts=self.ctx.contacts)
         dlg.sent.connect(self._on_mail_sent)
         dlg.exec()
 
@@ -556,7 +580,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法转发", str(exc))
             return
         accounts = self.ctx.accounts.list()
-        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self)
+        dlg = ComposeDialog(self.ctx.compose, accounts, draft, parent=self,
+                            contacts=self.ctx.contacts)
         dlg.sent.connect(self._on_mail_sent)
         dlg.exec()
 
@@ -740,6 +765,8 @@ class MainWindow(QMainWindow):
                         else f"{name}：已是最新")
         self.refresh_accounts()
         self._refresh_security_labels()
+        # 同步可能带来新文件夹（首次同步把非 INBOX 文件夹拉进来），刷新下拉
+        self._refresh_folders()
         if new_count:
             self._notify_new_mail(account_id, name, new_count)
             self._maybe_prefetch()
@@ -877,13 +904,24 @@ class MainWindow(QMainWindow):
     def _current_filter(self) -> MailFilter:
         d_from, d_to = self.filter_bar.date_range()
         order_key, desc = self.inbox_panel.model.sort_state
+        # 搜索框支持前缀语法（from:/subject:/has:/is: 等），先解析再分别
+        # 填入结构化字段与自由关键词。语法解析失败（不认识的 has:xxx）
+        # 通过 _on_search_syntax_error 提示，不阻断查询。
+        parsed = parse_query(self.filter_bar.current_keyword())
         return MailFilter(
             account_id=self.ctx.accounts.active_id,
-            platform=self.filter_bar.current_platform(),
-            keyword=self.filter_bar.current_keyword(),
+            platform=self.filter_bar.current_platform() or parsed.platform or None,
+            folder=self.filter_bar.current_folder() or parsed.folder or None,
+            keyword=parsed.keyword,
+            from_addr=parsed.from_addr,
+            to_addr=parsed.to_addr,
+            subject=parsed.subject,
+            has_attachment=parsed.has_attachment,
+            starred_only=parsed.starred_only,
+            unread_only=(self.filter_bar.is_unread_only()
+                         if parsed.unread_only is None else parsed.unread_only),
             date_from=d_from,
             date_to=d_to,
-            unread_only=self.filter_bar.is_unread_only(),
             # 排序下推到 SQL：只在已加载的一页内排序会让「按发件人排序」
             # 显示的是一个残缺的顺序，用户无从知道它只覆盖了 200 封。
             order="time" if order_key == "time" else order_key,
@@ -1459,6 +1497,12 @@ class MainWindow(QMainWindow):
             self.removeEventFilter(self.lock_overlay)
 
     # ================================================================ 菜单动作
+    def _on_contacts(self) -> None:
+        # 锁屏期间遮罩之外的动作一律拒绝（与设置页同一条安全红线）。
+        if self._locked or self.ctx.contacts is None:
+            return
+        ContactDialog(self.ctx.contacts, self).exec()
+
     def _on_settings(self) -> None:
         # 锁屏期间遮罩之外的动作一律拒绝：遮罩只是视觉层，菜单快捷键与
         # 托盘菜单仍能触发这些入口（设置页尤其危险：可改加密模式、可绑定设备密钥）。

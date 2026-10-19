@@ -1,6 +1,7 @@
 """仓储层：账号、邮件、附件、同步游标的数据访问。"""
 from __future__ import annotations
 
+import builtins
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,12 +14,14 @@ from ..core.models import (
     AccountStatus,
     Attachment,
     AttachmentMeta,
+    Contact,
     Mail,
     MailFilter,
     MailSummary,
     NormalizedMail,
     OutboxMessage,
     ThreadSummary,
+    is_email_like,
     load_str_list,
     make_preview,
     new_id,
@@ -77,6 +80,9 @@ StoredPaths = list[str]
 # 同上：`OutboxRepository` 与 `AccountRepository` 一样有名为 `list` 的方法，
 # 因此它的返回注解也要用别名（否则 mypy 报 valid-type）。
 OutboxList = list[OutboxMessage]
+
+# 同上：`ContactRepository` 也有名为 `list` 的方法，返回注解用别名回避遮蔽。
+ContactList = list[Contact]
 
 
 @dataclass
@@ -279,6 +285,26 @@ class MailRepository:
             (account_id, folder),
         )
         return {int(r["uid_validity"] or 0) for r in rows}
+
+    def list_folders(self, account_id: str | None = None) -> list[tuple[str, int]]:
+        """本地已同步过的文件夹及各自邮件数，按邮件数倒序。
+
+        这是「文件夹可见性」的数据来源：同步 worker 已经按服务器 LIST 拉取
+        全部文件夹，这里只是把**本地已有的**文件夹维度暴露给 UI，不额外发
+        网络请求。`account_id` 为 None 时返回全部账号的并集（文件夹名去重）。
+        文件夹名是服务器给的（含中文/特殊字符），排序按邮件数倒序，
+        把用户最常用的文件夹排前面。
+        """
+        if account_id:
+            rows = self.db.query_all(
+                "SELECT folder, COUNT(*) AS n FROM mails "
+                "WHERE account_id = ? GROUP BY folder ORDER BY n DESC",
+                (account_id,))
+        else:
+            rows = self.db.query_all(
+                "SELECT folder, COUNT(*) AS n FROM mails "
+                "GROUP BY folder ORDER BY n DESC")
+        return [(str(r["folder"]), int(r["n"] or 0)) for r in rows]
 
     def purge_folder(self, account_id: str, folder: str = "INBOX") -> tuple[int, list[str]]:
         """删除某账号某文件夹的全部本地副本（UIDVALIDITY 变化时调用）。
@@ -773,6 +799,32 @@ class MailRepository:
         if flt.platform:
             sql.append(f"AND {alias}.platform = ?")
             params.append(flt.platform)
+        if flt.folder:
+            # 文件夹精确匹配：文件夹名是服务器给定的（含中文/特殊字符），
+            # 比较不涉及用户输入，无需 LIKE 或转义。
+            sql.append(f"AND {alias}.folder = ?")
+            params.append(flt.folder)
+        if flt.from_addr:
+            # from:/发件人：模糊匹配发件人地址与显示名（显示名里常有中文别名）。
+            sql.append(
+                f"AND ({alias}.from_addr LIKE ? ESCAPE '\\' "
+                f"OR {alias}.from_name LIKE ? ESCAPE '\\')"
+            )
+            kw = f"%{escape_like(flt.from_addr)}%"
+            params.extend([kw, kw])
+        if flt.to_addr:
+            # to: 匹配的是收件人列表（to_addrs 是 JSON 数组字符串）。
+            # 直接 LIKE 即可命中「含这个地址」的邮件，无需解析 JSON。
+            sql.append(f"AND {alias}.to_addrs LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(flt.to_addr)}%")
+        if flt.subject:
+            sql.append(f"AND {alias}.subject LIKE ? ESCAPE '\\'")
+            params.append(f"%{escape_like(flt.subject)}%")
+        if flt.has_attachment is not None:
+            sql.append(f"AND {alias}.has_attachments = ?")
+            params.append(1 if flt.has_attachment else 0)
+        if flt.starred_only:
+            sql.append(f"AND {alias}.is_starred = 1")
         if flt.date_from:
             sql.append(f"AND {alias}.date >= ?")
             params.append(flt.date_from.isoformat())
@@ -1274,3 +1326,162 @@ class OutboxRepository:
             rows = self.db.query_all(
                 "SELECT status, COUNT(*) AS n FROM outbox GROUP BY status")
         return {str(r["status"]): int(r["n"] or 0) for r in rows}
+
+
+# contacts 表允许被 update() 修改的列。与 _ACCOUNT_UPDATABLE 同理：动态列名
+# 是注入 sink，必须用白名单收口。email 不在其中——它是唯一键，改邮箱等价于
+# 「删旧建新」，应走 delete + create 而不是 update。
+_CONTACT_UPDATABLE = frozenset({"name", "account_id", "note"})
+
+
+class ContactRepository:
+    """通讯录仓储：CRUD + 模糊搜索 + 从邮件发件人自动学习。
+
+    自动学习（`learn_from_senders`）是本功能的「卖点」所在，它的去重语义
+    全部依赖 `contacts.email` 的唯一约束 + `ON CONFLICT(email)` upsert：
+    同一地址无论来自手动添加还是哪次同步，都收敛到一条记录。
+    """
+
+    def __init__(self, db) -> None:
+        self.db = db
+
+    # ------------------------------------------------------------ 查询
+    def list(self, keyword: str = "") -> ContactList:
+        """全部联系人（可带关键词）。排序：有名字的在前，再按 email。
+
+        为什么先按「有无名字」分组：自动学习的联系人 name 经常为空，
+        把它们沉到列表底部，让用户手动录入的、有名字的联系人更醒目。
+        """
+        if keyword.strip():
+            like = f"%{escape_like(keyword.strip())}%"
+            rows = self.db.query_all(
+                "SELECT * FROM contacts WHERE name LIKE ? ESCAPE '\\' "
+                "OR email LIKE ? ESCAPE '\\' "
+                "ORDER BY (name = '') ASC, email COLLATE NOCASE ASC",
+                (like, like),
+            )
+        else:
+            rows = self.db.query_all(
+                "SELECT * FROM contacts ORDER BY (name = '') ASC, email COLLATE NOCASE ASC"
+            )
+        return [Contact.from_row(r) for r in rows]
+
+    def get(self, contact_id: str) -> Contact | None:
+        row = self.db.query_one("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+        return Contact.from_row(row) if row else None
+
+    def find_by_email(self, email: str) -> Contact | None:
+        row = self.db.query_one(
+            "SELECT * FROM contacts WHERE email = ?", (email.strip().lower(),)
+        )
+        return Contact.from_row(row) if row else None
+
+    # ------------------------------------------------------------ 写入
+    def create(self, email: str, name: str = "", account_id: str | None = None,
+               note: str = "") -> Contact:
+        """手动添加一个联系人。email 冲突时抛 ValueError（交由 UI 提示）。
+
+        之所以在服务层语义上**不允许**覆盖已存在联系人的 name/note：
+        用户手动录的名字是有意的编辑，自动学习不能反过来把它洗掉。
+        """
+        email = email.strip().lower()
+        if not is_email_like(email):
+            raise ValueError("不是有效的邮箱地址")
+        if self.find_by_email(email) is not None:
+            raise ValueError(f"联系人 {email} 已存在")
+        now = utcnow_iso()
+        contact_id = new_id()
+        self.db.execute(
+            "INSERT INTO contacts(id, name, email, account_id, note, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (contact_id, name.strip(), email, account_id, note, now, now),
+        )
+        row = self.db.query_one("SELECT * FROM contacts WHERE id = ?", (contact_id,))
+        return Contact.from_row(row)  # type: ignore[arg-type]
+
+    def update(self, contact_id: str, fields: dict) -> None:
+        """按白名单更新字段。email 不可经此修改（唯一键，需删旧建新）。"""
+        if not fields:
+            return
+        unknown = set(fields) - _CONTACT_UPDATABLE
+        if unknown:
+            raise ValueError(f"不允许更新的字段：{sorted(unknown)}")
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        # 列名已按白名单校验，值全走占位符
+        self.db.execute(
+            f"UPDATE contacts SET {cols}, updated_at = ? WHERE id = ?",  # noqa: S608
+            (*fields.values(), utcnow_iso(), contact_id),
+        )
+
+    def delete(self, contact_id: str) -> None:
+        self.db.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+
+    # ------------------------------------------------------------ 自动学习
+    def learn_from_senders(self, senders: builtins.list[tuple[str, str]],
+                           account_id: str | None = None,
+                           skip: set[str] | None = None) -> int:
+        """从发件人列表批量 upsert 联系人，返回真正新增的行数。
+
+        `senders` 每项为 `(name, from_addr)`；`skip` 是「不要学进去」的地址集合
+        （同步侧传入**自身账号地址**，避免把自己学成联系人）。
+
+        写入用 `INSERT ... ON CONFLICT(email) DO UPDATE`：
+          * 已存在 → 只在「新 name 非空且比旧 name 更长」时更新 name。
+            这是「只增不删、只长不短」——自动学习不该用「更短的名字」
+            覆盖掉手动录的完整姓名，也不该把已有名字清成空。
+          * 新地址 → 插入一行（name 可为空，邮箱是唯一可靠身份）。
+        过滤发生在内存里：明显不是邮箱的 from_addr 直接丢弃，不进 SQL。
+        """
+        skip = skip or set()
+        now = utcnow_iso()
+        # 去重：同一批里同一地址可能出现多次（一个联系人发了多封），
+        # 逐条 upsert 会造成无谓的写放大。先按邮箱合并，保留「最长的名字」。
+        merged: dict[str, str] = {}
+        order: list[str] = []
+        for name, addr in senders:
+            addr = (addr or "").strip().lower()
+            if not addr or addr in skip or not is_email_like(addr):
+                continue
+            candidate = (name or "").strip()
+            if addr not in merged:
+                merged[addr] = candidate
+                order.append(addr)
+            elif len(candidate) > len(merged[addr]):
+                merged[addr] = candidate
+
+        if not merged:
+            return 0
+
+        # 先一次性查出哪些地址已经存在：`total_changes` / `changes()` 对
+        # `ON CONFLICT DO UPDATE` 也会 +1（更新同样算「改变了行」），
+        # 不能用来区分「新增」与「更新」。这里用 `IN` 查询预读已存在集合，
+        # 只对真正的新地址计数。
+        existing = set()
+        marks = ", ".join("?" * len(order))
+        for row in self.db.query_all(
+                f"SELECT email FROM contacts WHERE email IN ({marks})",  # noqa: S608
+                order):
+            existing.add(str(row["email"]))
+
+        inserted = 0
+        with self.db.transaction() as conn:
+            for addr in order:
+                name = merged[addr]
+                conn.execute(
+                    """INSERT INTO contacts(id, name, email, account_id, note,
+                                            created_at, updated_at)
+                       VALUES(?,?,?,?, '', ?, ?)
+                       ON CONFLICT(email) DO UPDATE SET
+                           account_id = COALESCE(contacts.account_id, excluded.account_id),
+                           name = CASE
+                               WHEN excluded.name <> ''
+                                    AND length(excluded.name) > length(contacts.name)
+                               THEN excluded.name
+                               ELSE contacts.name
+                           END,
+                           updated_at = excluded.updated_at""",
+                    (new_id(), name, addr, account_id, now, now),
+                )
+                if addr not in existing:
+                    inserted += 1
+        return inserted

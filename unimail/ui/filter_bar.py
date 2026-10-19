@@ -49,6 +49,13 @@ class FilterBar(QFrame):
         self.platform_box.currentIndexChanged.connect(lambda: self.filter_changed.emit())
         layout.addWidget(self.platform_box)
 
+        # 文件夹（本地已同步的维度；全部文件夹 = None）。选项由主窗口在
+        # 账号切换 / 同步完成后刷新，这里只负责「选择」与「发信号」。
+        self.folder_box = QComboBox()
+        self.folder_box.addItem("全部文件夹", None)
+        self.folder_box.currentIndexChanged.connect(lambda: self.filter_changed.emit())
+        layout.addWidget(self.folder_box)
+
         # 时间预设
         self.time_box = QComboBox()
         for label, val in TIME_PRESETS:
@@ -82,7 +89,7 @@ class FilterBar(QFrame):
         # 关键词
         self.search = QLineEdit()
         self.search.setObjectName("SearchBox")
-        self.search.setPlaceholderText("搜索发件人 / 主题 / 正文…")
+        self.search.setPlaceholderText("搜索… 支持 from: / subject: / has:附件 / is:未读")
         self.search.setClearButtonEnabled(True)
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -139,6 +146,23 @@ class FilterBar(QFrame):
         self.time_box.setCurrentIndex(0)
         self.search.clear()
         self.unread_only.setChecked(False)
+        self.folder_box.setCurrentIndex(0)
+
+    # ------------------------------------------------------------ 文件夹
+    def set_folders(self, folders: list[tuple[str, int]]) -> None:
+        """刷新文件夹下拉选项（保留「全部文件夹」与当前选择）。"""
+        current = self.folder_box.currentData()
+        self.folder_box.blockSignals(True)
+        self.folder_box.clear()
+        self.folder_box.addItem("全部文件夹", None)
+        for name, count in folders:
+            self.folder_box.addItem(f"{name}（{count}）", name)
+        idx = self.folder_box.findData(current)
+        self.folder_box.setCurrentIndex(idx if idx >= 0 else 0)
+        self.folder_box.blockSignals(False)
+
+    def current_folder(self) -> str | None:
+        return self.folder_box.currentData()
 
     # ------------------------------------------------------------ 取值
     def current_platform(self) -> str | None:

@@ -20,10 +20,11 @@ from ..core.security import (
     UnlockGuard,
     password_policy_error,
 )
-from ..core.services import AccountService, ComposeService, MailService
+from ..core.services import AccountService, ComposeService, ContactService, MailService
 from ..storage import (
     AccountRepository,
     AttachmentRepository,
+    ContactRepository,
     CursorRepository,
     Database,
     DatabaseError,
@@ -101,6 +102,7 @@ class AppContext:
         self.accounts: AccountService | None = None
         self.mails: MailService | None = None
         self.compose: ComposeService | None = None
+        self.contacts: ContactService | None = None
         self.scheduler: Scheduler | None = None
         self.pool: WorkerPool | None = None
         self.body_pool: BodyFetchPool | None = None
@@ -301,6 +303,7 @@ class AppContext:
         self.pool = None
         self.body_pool = None
         self.scheduler = None
+        self.contacts = None
         self.security.lock()
         log.info("安全上下文已锁定（密钥已清除、数据库连接已关闭）")
 
@@ -548,11 +551,14 @@ class AppContext:
         attach_repo = AttachmentRepository(self.db)
         cursor_repo = CursorRepository(self.db)
         pending_repo = PendingFlagRepository(self.db)
+        contact_repo = ContactRepository(self.db)
 
         self.accounts = AccountService(account_repo, cursor_repo, self.security,
                                        self.bus, pending_repo)
         self.mails = MailService(mail_repo, attach_repo, account_repo,
                                  self.security, self.bus, pending_repo)
+        # 通讯录用例：供「通讯录」对话框做 CRUD。
+        self.contacts = ContactService(contact_repo, self.bus)
         # 发信用例。邮件仓储传进去：回复/转发要读原邮件的线程头。
         self.compose = ComposeService(account_repo, OutboxRepository(self.db),
                                       self.security, self.bus, mails=mail_repo)
@@ -560,7 +566,8 @@ class AppContext:
         # 因此会话池由这里注入。
         self.mails.sessions = self.sessions
         self.pool = WorkerPool(self.accounts, mail_repo, cursor_repo,
-                               self.security, self.bus, sessions=self.sessions)
+                               self.security, self.bus, sessions=self.sessions,
+                               contacts=contact_repo)
         self.body_pool = BodyFetchPool(self.accounts, mail_repo, self.bus,
                                        sessions=self.sessions)
         self.scheduler = Scheduler(self.accounts, self.pool, self.bus,

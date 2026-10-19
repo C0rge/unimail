@@ -602,10 +602,10 @@ class _FakeAdapter:
     def disconnect(self, imap):
         pass
 
-    def uid_validity(self, imap):
+    def uid_validity(self, imap, folder="INBOX"):
         return self.validity
 
-    def search_new_uids(self, imap, since_uid, limit=200):
+    def search_new_uids(self, imap, since_uid, limit=200, folder="INBOX"):
         if self.delay:
             time.sleep(self.delay)
         self.searches.append((int(since_uid), int(limit)))
@@ -3192,7 +3192,7 @@ def test_worker_pool_callback_thread_affinity():
             super()._on_thread_done()
 
     class _BrokenAdapter(_FakeAdapter):
-        def uid_validity(self, imap):
+        def uid_validity(self, imap, folder="INBOX"):
             from unimail.platforms.base import ImapError
             raise ImapError("模拟服务端拒答")
 
@@ -4737,8 +4737,8 @@ def test_compose_and_outbox():
                         mails=ctx.mails.mails)
     ctx.compose = cs
 
-    # ---- v8 迁移与 SMTP 覆盖列 ----
-    check("数据库已迁移到 v8", ctx.db.get_meta("db_version") == "8",
+    # ---- v9 迁移与 SMTP 覆盖列 ----
+    check("数据库已迁移到 v9", ctx.db.get_meta("db_version") == "9",
           f"实际 {ctx.db.get_meta('db_version')}")
     row = ctx.db.query_one("SELECT smtp_host, smtp_port FROM accounts WHERE id = ?", (acc.id,))
     check("新库 accounts 带 smtp_host/smtp_port 列", row is not None)
@@ -4986,6 +4986,163 @@ def test_smtp_config_derivation():
           cfg3.password == "refresh-token")
 
 
+def test_contacts():
+    """通讯录：CRUD、email 唯一约束、自动学习去重、模糊搜索。"""
+    _tmp, _cfg, _ctxmod, _svc = setup_env("ct_")
+    from unimail.storage import ContactRepository
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    repo = ContactRepository(ctx.db)
+
+    # ---- 手动添加 + email 归一 ----
+    c1 = repo.create(" Alice@Example.COM ", name="Alice")
+    check("邮箱归一为小写去空格", c1.email == "alice@example.com", f"实际 {c1.email}")
+    check("名字保留", c1.name == "Alice")
+    check("created_at 有值", bool(c1.created_at))
+
+    # ---- email 唯一约束 ----
+    try:
+        repo.create("alice@example.com", name="Alice2")
+        check("重复 email 应被拒绝", False, "未抛异常")
+    except ValueError:
+        check("重复 email 应被拒绝", True)
+
+    # ---- 模糊搜索 ----
+    repo.create("bob@corp.com", name="Bob 经理")
+    repo.create("carol@corp.com")       # 无名字（模拟自动学习结果）
+    hits = repo.list("bob")
+    check("按名字搜索命中", len(hits) == 1 and hits[0].email == "bob@corp.com",
+          f"实际 {[(c.name, c.email) for c in hits]}")
+    hits2 = repo.list("corp.com")
+    check("按邮箱域名搜索命中", len(hits2) == 2, f"实际 {len(hits2)}")
+    # 无名字的排在后面（有名字优先）
+    all_contacts = repo.list()
+    check("有名字的联系人排在前面", all_contacts[0].name != "",
+          f"实际首条 name={all_contacts[0].name!r}")
+
+    # ---- 自动学习：去重 + 只长不短 ----
+    learned = repo.learn_from_senders(
+        [("Alice", "alice@example.com"),      # 已存在 → 应合并，不新增
+         ("A", "alice@example.com"),          # 更短 → 不覆盖 "Alice"
+         ("Alice Wang", "alice@example.com"), # 更长 → 覆盖 "Alice"
+         ("Eve", "eve@new.com"),              # 新地址 → 新增
+         ("", "not-an-email"),                # 非邮箱 → 丢弃
+         ("Self", "me@example.com")],         # skip 里的 → 丢弃
+        skip={"me@example.com"},
+    )
+    check("自动学习只新增 1 个", learned == 1, f"实际 {learned}")
+    alice = repo.find_by_email("alice@example.com")
+    check("更长的名字覆盖更短的", alice.name == "Alice Wang", f"实际 {alice.name}")
+    check("非邮箱地址被丢弃", repo.find_by_email("not-an-email") is None)
+    check("skip 集合里的地址不学", repo.find_by_email("me@example.com") is None)
+    check("新地址被学进去", repo.find_by_email("eve@new.com") is not None)
+
+    # ---- 更新与删除 ----
+    eve = repo.find_by_email("eve@new.com")
+    repo.update(eve.id, {"name": "Eve 修改", "note": "备注"})
+    check("更新生效", repo.get(eve.id).name == "Eve 修改"
+          and repo.get(eve.id).note == "备注")
+    repo.delete(eve.id)
+    check("删除后查不到", repo.get(eve.id) is None)
+
+
+def test_search_query_parser():
+    """搜索前缀语法解析：from:/to:/subject:/has:/is:/in:。"""
+    from unimail.core.search_query import has_structured, parse_query
+
+    q = parse_query("from:boss 报销")
+    check("from 前缀", q.from_addr == "boss", f"实际 {q.from_addr}")
+    check("剩余自由文本", q.keyword == "报销", f"实际 {q.keyword}")
+
+    q2 = parse_query("has:attachment 会议 from:张三")
+    check("has:attachment", q2.has_attachment is True)
+    check("多个前缀并存", q2.from_addr == "张三" and q2.keyword == "会议",
+          f"实际 from={q2.from_addr!r} kw={q2.keyword!r}")
+
+    q3 = parse_query("is:unread subject:周报")
+    check("is:unread", q3.unread_only is True)
+    check("subject 前缀", q3.subject == "周报", f"实际 {q3.subject}")
+
+    q4 = parse_query("is:read")
+    check("is:read 反向", q4.unread_only is False)
+
+    q5 = parse_query("is:starred")
+    check("is:starred", q5.starred_only is True)
+
+    q6 = parse_query("in:已删除 报告")
+    check("in: 文件夹", q6.folder == "已删除", f"实际 {q6.folder}")
+    check("in 后剩余文本", q6.keyword == "报告", f"实际 {q6.keyword}")
+
+    q7 = parse_query("普通关键词 而已")
+    check("无前缀时整体是 keyword", q7.keyword == "普通关键词 而已",
+          f"实际 {q7.keyword}")
+    check("无前缀时无结构化条件",
+          q7.from_addr == "" and q7.has_attachment is None and q7.unread_only is None)
+
+    q8 = parse_query("has:xyz")
+    check("不识别的 has 值进 errors", len(q8.errors) == 1, f"实际 {q8.errors}")
+    check("不识别的值不静默丢弃（有错误提示）", "has:xyz" in q8.errors[0])
+
+    q9 = parse_query("发件人:老板 主题:预算")
+    check("中文前缀别名 from", q9.from_addr == "老板", f"实际 {q9.from_addr}")
+    check("中文前缀别名 subject", q9.subject == "预算", f"实际 {q9.subject}")
+
+    check("has_structured 识别前缀", has_structured("from:x") is True)
+    check("has_structured 识别无前缀", has_structured("普通词") is False)
+
+
+def test_folder_sync_and_filter():
+    """文件夹维度：同步游标/清洗按 folder 隔离，筛选按 folder 过滤。"""
+    _tmp, _cfg, _ctxmod, _svc = setup_env("fld_")
+    from unimail.core.models import MailFilter, NormalizedMail
+    from unimail.ui.context import AppContext
+
+    ctx = AppContext()
+    ctx.bootstrap_new("pw-1234567890")
+    from unimail.core.models import AccountDraft
+    acc = ctx.accounts.add(AccountDraft(
+        platform="qq", email="f@qq.com", password="c",
+        imap_host="imap.qq.com", imap_port=993))
+
+    # 两个不同文件夹的邮件各插一封
+    m1 = NormalizedMail(uid="1", subject="收件箱邮件", from_addr="a@b.c",
+                        date=datetime.now(timezone.utc))
+    mid1 = ctx.mails.mails.insert_mail(acc.id, "qq", m1)   # folder 默认 INBOX
+    m2 = NormalizedMail(uid="1", subject="已发送邮件", from_addr="a@b.c",
+                        date=datetime.now(timezone.utc), folder="已发送")
+    mid2 = ctx.mails.mails.insert_mail(acc.id, "qq", m2)
+
+    # ---- list_folders 返回两个文件夹 ----
+    folders = ctx.mails.list_folders(acc.id)
+    names = {f for f, _ in folders}
+    check("list_folders 含 INBOX 与已发送",
+          "INBOX" in names and "已发送" in names, f"实际 {names}")
+
+    # ---- folder 过滤 ----
+    inbox_hits = ctx.mails.inbox(MailFilter(account_id=acc.id, folder="INBOX"))
+    check("按 INBOX 过滤只出收件箱邮件",
+          len(inbox_hits) == 1 and inbox_hits[0].id == mid1,
+          f"实际 {[m.id for m in inbox_hits]}")
+    sent_hits = ctx.mails.inbox(MailFilter(account_id=acc.id, folder="已发送"))
+    check("按已发送过滤只出已发送邮件",
+          len(sent_hits) == 1 and sent_hits[0].id == mid2,
+          f"实际 {[m.id for m in sent_hits]}")
+    all_hits = ctx.mails.inbox(MailFilter(account_id=acc.id))
+    check("不指定 folder 出全部", len(all_hits) == 2, f"实际 {len(all_hits)}")
+
+    # ---- 游标按 folder 隔离 ----
+    from unimail.storage import CursorRepository
+    cursors = CursorRepository(ctx.db)
+    cursors.upsert(acc.id, "INBOX", 10, 100)
+    cursors.upsert(acc.id, "已发送", 20, 100)
+    in_uid, _in_valid = cursors.get(acc.id, "INBOX")
+    sent_uid, _sent_valid = cursors.get(acc.id, "已发送")
+    check("游标按 folder 隔离", in_uid == 10 and sent_uid == 20,
+          f"实际 INBOX={in_uid} 已发送={sent_uid}")
+
+
 SUITES = [
     ("安全层", test_security),
     ("存储层", test_storage),
@@ -5053,6 +5210,10 @@ SUITES = [
     ("F-2 发信：撰写入队与 outbox 状态机", test_compose_and_outbox),
     ("F-2 发信：RFC 5322 构造与线程头", test_smtp_message_construction),
     ("F-2 发信：SMTP 连接参数派生", test_smtp_config_derivation),
+    # ---- 第八批（v1.7.0：文件夹可见性 + 搜索语法 + 通讯录）
+    ("F-4 文件夹：同步隔离与筛选", test_folder_sync_and_filter),
+    ("F-5 搜索前缀语法解析", test_search_query_parser),
+    ("F-6 通讯录：CRUD 与自动学习", test_contacts),
 ]
 
 

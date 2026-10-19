@@ -9,6 +9,7 @@ from .database import (
 from .repositories import (
     AccountRepository,
     AttachmentRepository,
+    ContactRepository,
     CursorRepository,
     MailRepository,
     OutboxRepository,
@@ -20,6 +21,7 @@ __all__ = [
     "SQLCIPHER_AVAILABLE",
     "AccountRepository",
     "AttachmentRepository",
+    "ContactRepository",
     "CursorRepository",
     "Database",
     "DatabaseError",

@@ -196,6 +196,23 @@ CREATE TABLE IF NOT EXISTS outbox (
     sent_at      TEXT,
     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+
+-- 通讯录（v9）。email 全局唯一：同一地址在不同账号、或「手动添加 / 自动学习」
+-- 两种来源下都只有一条记录——这是「自动学习去重 upsert」唯一键的依据。
+-- account_id 可空：手动添加的联系人可以不关联任何账号；外键 ON DELETE SET NULL
+-- 而不是 CASCADE——删账号**不**删联系人，只解除关联（历史往来的人不该随账号
+-- 一起消失）。note 是用户手记备注，自动学习路径不会写它。
+CREATE TABLE IF NOT EXISTS contacts (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    email        TEXT NOT NULL,
+    account_id   TEXT,
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE(email),
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+);
 """
 
 # 索引与表分开：老库在迁移补齐列之前，引用新列的索引是无法建立的，
@@ -525,6 +542,12 @@ class Database:
             )
             current = 8
             log.info("数据库已从 v%d 迁移到 v8（发件箱 outbox + SMTP 服务器覆盖列）", from_version)
+        if current < 9:
+            # v9：通讯录。表由 SCHEMA 的 `CREATE TABLE IF NOT EXISTS` 建好（幂等），
+            # 无需补列或回填——历史库没有联系人数据，自动学习会从下一次同步开始
+            # 从邮件发件人增量收集。
+            current = 9
+            log.info("数据库已从 v%d 迁移到 v9（通讯录 contacts）", from_version)
         if current != from_version:
             self.set_meta("db_version", str(current))
 

@@ -38,6 +38,7 @@ class EventBus(QObject):
     mail_updated = Signal(str)            # mail_id
     mail_deleted = Signal(str)            # mail_id
     accounts_changed = Signal()
+    contacts_changed = Signal()           # 通讯录增删改（UI 刷新联系人列表）
     filter_changed = Signal()
 
     # ---------------------------------------------------------- 状态

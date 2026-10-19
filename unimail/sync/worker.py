@@ -1,6 +1,7 @@
 """邮件同步工作线程：单账号一次增量同步（在 QThread 中执行）。"""
 from __future__ import annotations
 
+import imaplib
 import logging
 import threading
 import time
@@ -13,12 +14,10 @@ from ..core.models import Account, AccountStatus, NormalizedMail
 from ..core.security import SecurityError, SecurityService
 from ..core.services import AccountService, unlink_attachment_file
 from ..platforms import ImapError, get_adapter
-from ..storage import CursorRepository, MailRepository
+from ..storage import ContactRepository, CursorRepository, MailRepository
 from .session import SessionPool
 
 log = logging.getLogger(__name__)
-
-FOLDER = "INBOX"
 
 
 def sync_task_id(account_id: str) -> str:
@@ -50,7 +49,8 @@ class SyncWorker(QThread):
                  mails: MailRepository, cursors: CursorRepository,
                  security: SecurityService, bus: EventBus,
                  fetch_body_limit: int = 20, parent: QObject | None = None,
-                 sessions: SessionPool | None = None) -> None:
+                 sessions: SessionPool | None = None,
+                 contacts: ContactRepository | None = None) -> None:
         super().__init__(parent)
         self.account = account
         self.account_service = account_service
@@ -60,6 +60,9 @@ class SyncWorker(QThread):
         self.bus = bus
         self.fetch_body_limit = fetch_body_limit
         self.sessions = sessions
+        # 通讯录仓储可空：单元测试里构造 worker 时不传也照常工作。
+        # 非空时，每页邮件入库后顺手从发件人自动学习联系人。
+        self.contacts = contacts
         self._cancelled = False
         self._interrupted = False
 
@@ -117,22 +120,56 @@ class SyncWorker(QThread):
 
     def _sync(self, adapter, imap) -> None:
         account = self.account
-        # 任务 id 与 `run()` 里发 `task_started` 用的是同一个值。`_sync` 会被
-        # 会话池分支和一次性连接分支共用，因此在这里重新取一次而不是靠参数传递。
         task = sync_task_id(account.id)
 
         # ---- 先把离线期间攒下的服务端标记动作补齐（只读/星标双向同步）
         self._flush_pending_flags(adapter, imap)
 
-        server_validity = adapter.uid_validity(imap)
-        last_uid, cursor_validity = self.cursors.get(account.id, FOLDER)
+        # ---- 枚举文件夹：不再只同步 INBOX。
+        # 「多平台邮箱统一管理」的承诺里，垃圾箱/已发送/自定义文件夹长期缺席，
+        # 用户看到的是「收件箱之外的邮件凭空消失」。这里先 LIST 拿到服务器
+        # 的真实文件夹清单，逐个同步；LIST 失败时退回只同步 INBOX（宁可少
+        # 同步，也不能因为某个服务器的畸形 LIST 响应让整个同步失败）。
+        try:
+            folders = [f.name for f in adapter.list_folders(imap)
+                       if f.name and not f.has_flag("\\Noselect")]
+        except (ImapError, imaplib.IMAP4.error, OSError, AttributeError) as exc:
+            log.warning("账号 %s 获取文件夹列表失败，退回只同步 INBOX：%s",
+                        account.email, exc)
+            folders = ["INBOX"]
+        if not folders:
+            folders = ["INBOX"]
+        if "INBOX" not in folders:
+            folders.insert(0, "INBOX")
+
+        total_new = 0
+        for folder in folders:
+            if self._cancelled:
+                break
+            total_new += self._sync_folder(adapter, imap, folder, task)
+
+        self.account_service.accounts.set_last_synced(account.id)
+        self.account_service.set_status(account.id, AccountStatus.OK)
+        self.finished_ok.emit(account.id, total_new)
+        self.bus.sync_finished.emit(account.id, total_new)
+        self.bus.task_finished.emit(
+            sync_task_id(account.id), True,
+            f"新增 {total_new} 封" if total_new else "已是最新",
+        )
+
+    def _sync_folder(self, adapter, imap, folder: str, task: str) -> int:
+        """同步单个文件夹，返回新增邮件数。"""
+        account = self.account
+
+        server_validity = adapter.uid_validity(imap, folder)
+        last_uid, cursor_validity = self.cursors.get(account.id, folder)
 
         # ---- UIDVALIDITY 语义修正
         # 服务器端邮箱被重建时 UID 会复用。此时本地副本全部失效：
         # 若不清理，新邮件会因唯一键 (account_id, folder, uid) 冲突被静默丢弃。
         # 判定依据取「本地邮件的 uid_validity」而不是只看游标，这样即使
         # 游标表丢失也不会漏判。
-        stored_validities = self.mails.folder_uid_validities(account.id, FOLDER)
+        stored_validities = self.mails.folder_uid_validities(account.id, folder)
         invalidated = (
             bool(stored_validities) and server_validity is not None
             and server_validity not in stored_validities
@@ -141,7 +178,7 @@ class SyncWorker(QThread):
             and cursor_validity != server_validity and last_uid > 0
         )
         if invalidated:
-            removed, stale = self.mails.purge_folder(account.id, FOLDER)
+            removed, stale = self.mails.purge_folder(account.id, folder)
             for path in stale:
                 unlink_attachment_file(path)
             log.warning(
@@ -172,7 +209,7 @@ class SyncWorker(QThread):
 
         # 每页一次性取回已入库 UID 集合，用于内存去重（避免逐封 exists()）
         known_uids = self.mails.existing_uids(
-            account.id, FOLDER, uid_validity=server_validity
+            account.id, folder, uid_validity=server_validity
         )
 
         # 分页循环：始终取「最旧的一批」并推进游标，直到追平服务端。
@@ -185,7 +222,7 @@ class SyncWorker(QThread):
                 hit_budget = True
                 break
             limit = page_size if remaining is None else min(page_size, remaining)
-            uids = adapter.search_new_uids(imap, cursor_uid, limit=limit)
+            uids = adapter.search_new_uids(imap, cursor_uid, limit=limit, folder=folder)
             if not uids:
                 break
             # 兜底：账号可能在同步途中被删掉（UI 的「删除账号」会先取消并等待，
@@ -193,7 +230,7 @@ class SyncWorker(QThread):
             # 外键**，插入会成功，留下永远不会被清理的孤儿行 —— 所以宁可不写。
             if self.account_service.get(account.id) is None:
                 log.info("账号 %s 已在同步过程中被删除，中止本次同步", account.email)
-                return
+                return new_count
             log.info("账号 %s 本页发现 %d 封新邮件（游标 %s）",
                      account.email, len(uids), cursor_uid)
 
@@ -205,13 +242,13 @@ class SyncWorker(QThread):
             page_continuous = True
             fetch_many = getattr(adapter, "fetch_headers_many", None)
             if callable(fetch_many):
-                headers = fetch_many(imap, uids, FOLDER)
+                headers = fetch_many(imap, uids, folder)
             else:
                 headers = {}
                 for uid_probe in uids:
                     try:
                         headers[str(uid_probe)] = adapter.fetch_headers(
-                            imap, uid_probe, FOLDER)
+                            imap, uid_probe, folder)
                     except ImapError as exc:
                         log.warning("拉取邮件头 %s 失败，游标停在该封之前：%s",
                                     uid_probe, exc)
@@ -259,12 +296,21 @@ class SyncWorker(QThread):
                 # 阶段一补：BODYSTRUCTURE 一次拿到整页的附件元数据
                 # （只取邮件头是拿不到部件信息的，否则列表永远不会显示 📎）
                 self._attach_meta_for_page(
-                    adapter, imap, account.id, [uid for uid, _ in outcome.inserted]
+                    adapter, imap, account.id,
+                    [uid for uid, _ in outcome.inserted], folder,
                 )
+
+                # 通讯录自动学习：从本页**新入库**邮件的发件人收集联系人。
+                # 刻意只学 `outcome.inserted`（真正新增的），不学 `existing`——
+                # 那些是重复同步，学一遍就够了，重复学习只会产生无谓的 upsert。
+                # 自身账号地址从 skip 集合里剔除，避免把自己学成联系人。
+                inserted_uids = {uid for uid, _ in outcome.inserted}
+                new_mails = [m for m in page if m.uid in inserted_uids]
+                self._learn_contacts(new_mails, account)
 
             # 游标只推进到「连续已抓取区间」的最大 UID
             if cursor_uid > last_uid:
-                self.cursors.upsert(account.id, FOLDER, cursor_uid, server_validity)
+                self.cursors.upsert(account.id, folder, cursor_uid, server_validity)
                 last_uid = cursor_uid
 
             if not page_continuous or len(uids) < limit:
@@ -284,7 +330,7 @@ class SyncWorker(QThread):
             if self._cancelled:
                 break
             try:
-                full = adapter.fetch_message(imap, uid, FOLDER)
+                full = adapter.fetch_message(imap, uid, folder)
             except ImapError as exc:
                 log.warning("拉取正文 %s 失败：%s", uid, exc)
                 continue
@@ -295,14 +341,7 @@ class SyncWorker(QThread):
                     unlink_attachment_file(path)
         self.mails.update_bodies_batch(body_rows)
 
-        self.account_service.accounts.set_last_synced(account.id)
-        self.account_service.set_status(account.id, AccountStatus.OK)
-        self.finished_ok.emit(account.id, new_count)
-        self.bus.sync_finished.emit(account.id, new_count)
-        self.bus.task_finished.emit(
-            sync_task_id(account.id), True,
-            f"新增 {new_count} 封" if new_count else "已是最新",
-        )
+        return new_count
 
     # ------------------------------------------------------------ 服务端标记
     def _flush_pending_flags(self, adapter, imap) -> None:
@@ -336,7 +375,7 @@ class SyncWorker(QThread):
             log.info("已向服务器同步 %d 条标记变更", len(pending))
 
     def _attach_meta_for_page(self, adapter, imap, account_id: str,
-                              uids: list[str]) -> None:
+                              uids: list[str], folder: str = "INBOX") -> None:
         """用 BODYSTRUCTURE 为整页新入库的邮件补上附件元数据。
 
         这是「列表里能看到 📎、点开能下载」的前提：只取 `BODY.PEEK[HEADER]`
@@ -346,19 +385,37 @@ class SyncWorker(QThread):
         if not uids:
             return
         try:
-            metas_by_uid = adapter.fetch_attachment_meta(imap, uids, FOLDER)
+            metas_by_uid = adapter.fetch_attachment_meta(imap, uids, folder)
         except Exception as exc:  # noqa: BLE001 - 附加信息，不拖垮同步
             log.debug("获取附件元数据失败：%s", exc)
             return
         if not metas_by_uid:
             return
-        mail_ids = self.mails.ids_by_uid(account_id, FOLDER, list(metas_by_uid))
+        mail_ids = self.mails.ids_by_uid(account_id, folder, list(metas_by_uid))
         for uid, metas in metas_by_uid.items():
             mail_id = mail_ids.get(str(uid))
             if not mail_id:
                 continue
             for path in self.mails.replace_attachments(mail_id, metas):
                 unlink_attachment_file(path)
+
+    def _learn_contacts(self, page: list[NormalizedMail], account: Account) -> None:
+        """从本页邮件的发件人自动学习联系人（尽力而为，不阻塞同步）。
+
+        失败只记日志——通讯录是「顺手收集」的增强功能，任何数据库异常都不该
+        让一次本可成功的同步失败。`contacts` 仓储为空（未接线）时直接跳过。
+        """
+        if self.contacts is None:
+            return
+        senders = [(mail.from_name, mail.from_addr) for mail in page]
+        try:
+            self.contacts.learn_from_senders(
+                senders,
+                account_id=account.id,
+                skip={account.email.lower()},
+            )
+        except Exception as exc:  # noqa: BLE001 - 附加功能，不拖垮同步
+            log.debug("自动学习联系人失败：%s", exc)
 
     def _fail(self, message: str) -> None:
         self.account_service.set_status(self.account.id, AccountStatus.ERROR)
@@ -389,7 +446,8 @@ class WorkerPool(QObject):
 
     def __init__(self, account_service: AccountService, mails: MailRepository,
                  cursors: CursorRepository, security: SecurityService, bus: EventBus,
-                 sessions: SessionPool | None = None) -> None:
+                 sessions: SessionPool | None = None,
+                 contacts: ContactRepository | None = None) -> None:
         super().__init__()
         self.account_service = account_service
         self.mails = mails
@@ -397,6 +455,7 @@ class WorkerPool(QObject):
         self.security = security
         self.bus = bus
         self.sessions = sessions
+        self.contacts = contacts
         self._workers: dict[str, SyncWorker] = {}
         self._failures: dict[str, tuple[int, float]] = {}  # account_id -> (次数, 下次重试时间)
         self._lock = threading.Lock()
@@ -430,7 +489,7 @@ class WorkerPool(QObject):
             # 检查都通过之后才建对象：提前建了又不启动，就是一个泄漏的 QThread
             worker = SyncWorker(account, self.account_service, self.mails,
                                 self.cursors, self.security, self.bus,
-                                sessions=self.sessions)
+                                sessions=self.sessions, contacts=self.contacts)
             # 绑定方法 + 显式排队：回调一定在主线程执行，且 sender() 可辨身份。
             # 注意用 `Qt.ConnectionType.QueuedConnection` 而非 `Qt.QueuedConnection`：
             # 二者运行时是同一个枚举对象，但 PySide6 的 .pyi 存根只在嵌套枚举里
