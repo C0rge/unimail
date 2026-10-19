@@ -363,7 +363,7 @@ def _login(server: smtplib.SMTP, cfg: SmtpConfig) -> None:
     if cfg.oauth2:
         payload = xoauth2_string(cfg.username, cfg.password)
 
-        def _respond(_challenge):     # noqa: ANN001 - 签名由 smtplib 的协议决定
+        def _respond(_challenge):     # 签名由 smtplib 的协议决定，无类型标注
             # 不在 EHLO 阶段预发 initial response：部分服务器（尤其企业邮）
             # 对 `AUTH XOAUTH2 <initial>` 的处理与标准 SASL-IR 不一致，
             # 等服务器发出 334 挑战后再回同样的 payload，兼容性更好。
