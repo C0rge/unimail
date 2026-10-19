@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 APP_NAME = "UniMail"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 # ---------------------------------------------------------------- 数据目录
 def _data_dir() -> Path:
