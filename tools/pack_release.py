@@ -74,7 +74,7 @@ def main() -> int:
             archive.write(src, arcname=item, compress_type=method)
             print(f"    + {item}  ({src.stat().st_size / 1048576:.2f} MB)")
 
-    print(f"[✓] {out}  ({out.stat().st_size / 1048576:.1f} MB)")
+    print(f"[OK] {out}  ({out.stat().st_size / 1048576:.1f} MB)")
 
     # 回读复核：文件齐全，且中文文件名没有乱码（zipfile 写非 ASCII 名时会
     # 置 UTF-8 标志位，这里顺便验证一下确实如此）。
