@@ -4721,7 +4721,7 @@ def test_compose_and_outbox():
     真正的 SMTP 投递依赖网络，用假服务器验证协议交互（见下方 _FakeSmtp）。
     """
     _tmp, _cfg, _ctxmod, _svc = setup_env("cx_")
-    from unimail.core.models import AccountDraft, Mail, NormalizedMail
+    from unimail.core.models import AccountDraft, NormalizedMail
     from unimail.core.services import ComposeDraft, ComposeService
     from unimail.platforms import smtp as smtpmod
     from unimail.storage import OutboxRepository
@@ -4833,7 +4833,6 @@ def test_compose_and_outbox():
                         references=["<root@mail.com>", "<mid@mail.com>"],
                         date=datetime.now(timezone.utc))
     mail_id = ctx.mails.mails.insert_mail(acc.id, "qq", nm)
-    mail = ctx.mails.get(mail_id)
 
     rd = cs.build_reply(mail_id, reply_all=True)
     check("回复主题加 Re: 前缀", rd.subject == "Re: 原主题", f"实际 {rd.subject}")

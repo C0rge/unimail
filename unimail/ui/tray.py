@@ -89,7 +89,6 @@ class TrayIcon(QObject):
     # ------------------------------------------------------------ 主题
     def apply_theme(self, palette: dict) -> None:
         self._theme = dict(palette or {})
-        color = self._theme.get("text", "#e6edf3")
         accent = self._theme.get("accent", "#4c8dff")
         # 托盘用**应用标志**而不是通用的 mailbox 图标：托盘是应用的身份入口，
         # 用通用图标会让「这是 UniMail」在系统托盘里失去辨识度。

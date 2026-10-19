@@ -33,6 +33,7 @@ Thunderbird、Spark 全都把「写邮件」当作第一公民）。
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import smtplib
 import ssl
@@ -339,13 +340,13 @@ def send(cfg: SmtpConfig, message: EmailMessage) -> None:
     finally:
         # QUIT 失败不影响发送结论（邮件已经交给服务器），因此吞掉异常。
         # 但连接必须关闭：连接里带着解出的明文凭据，不能留着。
-        try:
+        # 用 contextlib.suppress 而不是 try/except/pass：后者的两个层次
+        # 都会被 ruff 记（S110「该记日志」+ SIM105「该用 suppress」），
+        # 而这里确实没有任何可做的补救动作，suppress 正是它的语义。
+        with contextlib.suppress(Exception):
             server.quit()
-        except Exception:          # noqa: BLE001 - 关闭失败无补救动作，不能盖掉真正的错误
-            try:
-                server.close()
-            except Exception:      # noqa: BLE001
-                pass
+        with contextlib.suppress(Exception):
+            server.close()
 
 
 def _login(server: smtplib.SMTP, cfg: SmtpConfig) -> None:
@@ -411,8 +412,11 @@ def _proxy_hint(proxy: ProxyConfig | None, host: str) -> str:
     except Exception:            # noqa: BLE001 - 探测失败不该影响主流程
         detected = ""
     if detected:
+        # 这里刻意不写出具体代理地址：`describe_active_proxy()` 返回的是
+        # 供人读的描述串，把它拼进提示会让同一段文案在不同机器上长短不一，
+        # 而用户需要的是「怎么配」这个动作，不是「我检测到了什么」。
         hint.append(
-            f"\n检测到系统里已启用代理。如果你正需要靠它才能访问外网，"
+            "\n检测到系统里已启用代理。如果你正需要靠它才能访问外网，"
             "可以这样让本程序也走它：\n"
             "    设置环境变量 UNIMAIL_PROXY=<代理地址>\n"
             "或把代理客户端切到「TUN / 增强 / 全局路由」模式。"

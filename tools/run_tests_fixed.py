@@ -69,10 +69,13 @@ def main() -> int:
             fn()
             passed += 1
             print(f"[ok] {name}")
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - 测试替身要的是「哪一组挂了」
+            # 单个测试组失败不能中断其余组：这份报告的价值在于一次跑完看到
+            # 全貌，而不是撞到第一个失败就停。打印限定的栈帧，避免把
+            # SQLCipher 的 VirtualLock 噪音全倒出来。
             failed += 1
             failed_names.append(name)
-            print(f"[FAIL] {name}")
+            print(f"[FAIL] {name}: {type(exc).__name__}: {exc}")
             traceback.print_exc(limit=3)
 
     print()

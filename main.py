@@ -260,12 +260,6 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)     # 托盘常驻：关掉窗口不等于退出
 
-    # 应用图标：设置在这里而不是 MainWindow 里，是为了让「登录框、消息框、
-    # 关于对话框」这些 parent 为 None 的顶层窗口以及任务栏分组都拿到同一枚
-    # 标志。窗口自身再设一次是必须的：setWindowIcon 只影响该窗口及其子窗口，
-    # 不会自动继承 application 级设置以外的部分。
-    app.setWindowIcon(app_icon(theme.palette.accent))
-
     # 主题必须在**登录框之前**就绪：登录框本身也要按当前主题着色。
     # 这正是界面偏好存在明文 JSON（而不是加密库）里的原因。
     settings = UiSettings.load()
@@ -273,6 +267,12 @@ def main() -> int:
         settings.theme_mode = args.theme
     theme = ThemeManager(settings.theme_mode, settings.font_scale)
     theme.apply(app)
+
+    # 应用图标：设置在这里（主题就绪之后）而不是 MainWindow 里，是为了让
+    # 「登录框、消息框、关于对话框」这些 parent 为 None 的顶层窗口以及
+    # 任务栏分组都拿到同一枚标志。取当前主题的 accent 色——托盘与标题栏的
+    # 背景由系统决定，accent 在深浅两种背景下都能保持可辨。
+    app.setWindowIcon(app_icon(theme.palette.accent))
 
     ctx = AppContext()
 

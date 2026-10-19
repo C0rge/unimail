@@ -41,6 +41,7 @@ from ..storage import (
 )
 from .events import EventBus
 from .models import (
+    OUTBOX_SENT,
     Account,
     AccountDraft,
     AccountStatus,
@@ -48,10 +49,6 @@ from .models import (
     Mail,
     MailFilter,
     MailSummary,
-    OUTBOX_FAILED,
-    OUTBOX_PENDING,
-    OUTBOX_SENDING,
-    OUTBOX_SENT,
     OutboxMessage,
     ThreadSummary,
 )
@@ -1203,8 +1200,14 @@ class ComposeService:
 
     # ------------------------------------------------------------ 队列
     def queue(self, draft: ComposeDraft) -> str:
-        """把一封邮件写入 outbox（完整原文），返回 outbox id。"""
-        account, secret = self._account_and_secret(draft.account_id)
+        """把一封邮件写入 outbox（完整原文），返回 outbox id。
+
+        入队时**解一次凭据**：这是「账号是否还能发信」最早的检查点。
+        等到发送阶段才发现凭据解不开，用户已经写完一封信了；而这里失败
+        至少还在撰写对话框里，改起来没有成本。解出来的 secret 本身用不到
+        （构造 MIME 不需要它），因此显式忽略。
+        """
+        account, _secret = self._account_and_secret(draft.account_id)
         if not draft.to:
             raise ValueError("请填写收件人")
         if not draft.subject.strip() and not draft.body.strip():
@@ -1304,8 +1307,6 @@ class ComposeService:
         引用原文刻意**不**在此处拼进 body：顶部引用 vs 底部引用、
         是否带「在 … 写道：」前缀，是见仁见智的界面选择，属于 UI 层的决策。
         """
-        from .models import load_str_list
-
         mail = self.mails_get(mail_id)
         if mail is None:
             raise ValueError("找不到该邮件")

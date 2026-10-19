@@ -42,6 +42,17 @@ import struct
 import sys
 from pathlib import Path
 
+# 必须在 import PySide6 之前设置：offscreen 让脚本在无显示环境（CI、
+# 打包机、SSH 会话）里也能跑，且不会闪现窗口。放在模块顶部而不是
+# 各函数内部，是为了让 PySide6 的 import 能提到模块级——函数内 import
+# 会被 ruff 的 I001 当作独立块反复挑刺，而且同一个符号在两个函数里
+# 各 import 一遍本来就是重复。
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtGui import QGuiApplication, QImage, QPainter
+from PySide6.QtSvg import QSvgRenderer
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # ICO 内嵌的尺寸档。顺序即写入顺序；Windows 取图不依赖顺序，但按升序写
@@ -61,14 +72,10 @@ def _svg_bytes(path: Path) -> bytes:
 
 def render_png(svg: bytes, size: int, out: Path) -> None:
     """把 SVG 光栅化成一个正方形 PNG。"""
-    # 必须在 import QtGui 之前设置：offscreen 让脚本在无显示环境（CI、
-    # 打包机、SSH 会话）里也能跑，且不会闪现窗口。
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QByteArray, Qt
-    from PySide6.QtGui import QGuiApplication, QImage, QPainter
-    from PySide6.QtSvg import QSvgRenderer
-
-    app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    # 必须有一个 QGuiApplication 实例才能建 QImage / QSvgRenderer。
+    # 刻意不接收返回值：它是进程级的，这里只负责「确保它存在」，
+    # 拿到引用反而会被 ruff 记 F841（赋值后未使用）。
+    _ensure_app()
 
     # 先用 4 倍超采样渲染、再缩小：SVG 里全是直线与圆，超采样能让 16px
     # 这种极小尺寸的边缘保持干净，避免直接按 16px 渲染时出现的锯齿与
@@ -90,17 +97,21 @@ def render_png(svg: bytes, size: int, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     if not final.save(str(out), "PNG"):
         raise SystemExit(f"[x] 写 PNG 失败：{out}")
-    del app
+
+
+def _ensure_app():
+    """确保进程里有一个 QGuiApplication（Qt 离屏渲染的前置条件）。
+
+    单独成函数而不是在两个渲染函数里各写一遍：`instance() or QGuiApplication(...)`
+    这个惯用法出现两次就会漂移（比如一处忘了 `or` 分支，另一处忘了传 argv），
+    而它失败时的症状是「QSvgRenderer 静默画不出东西」，极难排查。
+    """
+    return QGuiApplication.instance() or QGuiApplication(sys.argv)
 
 
 def build_ico(svg: bytes, out: Path, sizes: tuple[int, ...] = ICO_SIZES) -> None:
     """把 SVG 渲染成各尺寸 PNG 后合成一个 ICO。"""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QByteArray, QBuffer, QIODevice, Qt
-    from PySide6.QtGui import QGuiApplication, QImage, QPainter
-    from PySide6.QtSvg import QSvgRenderer
-
-    app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    _ensure_app()
 
     renderer = QSvgRenderer(QByteArray(svg))
     if not renderer.isValid():
@@ -123,8 +134,6 @@ def build_ico(svg: bytes, out: Path, sizes: tuple[int, ...] = ICO_SIZES) -> None
         if not img.save(buf, "PNG"):
             raise SystemExit(f"[x] 渲染 {size}px 失败")
         entries.append((size, bytes(buf.data())))
-
-    del app
 
     # ICO 文件结构：ICONDIR + N×ICONDIRENTRY + N×图像数据。
     # ICONDIRENTRY 对 PNG 条目：宽高用 0 表示 256（字节装不下 256），
