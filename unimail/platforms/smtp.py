@@ -367,7 +367,10 @@ def _login(server: smtplib.SMTP, cfg: SmtpConfig) -> None:
         # `xoauth2_string()` 的 bytes 结果，必须解码成 str。
         payload = xoauth2_string(cfg.username, cfg.password).decode("utf-8")
 
-        def _respond(_challenge: bytes) -> str:
+        def _respond(_challenge: bytes | None = None) -> str:
+            # 参数声明成 `bytes | None = None` 以同时满足 typeshed `_AuthObject`
+            # Protocol 的两个 overload（无参调用返回 str|None、传 bytes 返回 str）：
+            # 本回调不管收到什么挑战都回同一份 payload，参数本身用不到。
             # 不在 EHLO 阶段预发 initial response：部分服务器（尤其企业邮）
             # 对 `AUTH XOAUTH2 <initial>` 的处理与标准 SASL-IR 不一致，
             # 等服务器发出 334 挑战后再回同样的 payload，兼容性更好。
